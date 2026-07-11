@@ -3083,6 +3083,7 @@ def inject_tool_search_deferral(
     out: list[Any] = [search_tool]
     deferred = 0
     dropped_cache_control = False
+    dropped_cache_ttl: str | None = None
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
@@ -3099,8 +3100,15 @@ def inject_tool_search_deferral(
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        if new_tool.pop("cache_control", None) is not None:
+        popped_cc = new_tool.pop("cache_control", None)
+        if popped_cc is not None:
             dropped_cache_control = True
+            # remember the client's TTL so the relocated breakpoint does not
+            # silently downgrade a 1h block to the 5m default (write cost is
+            # the lesser issue, the early expiry re-write on the next >5min
+            # pause is the real one)
+            if isinstance(popped_cc, dict) and isinstance(popped_cc.get("ttl"), str):
+                dropped_cache_ttl = popped_cc["ttl"]
         out.append(new_tool)
         deferred += 1
 
@@ -3110,7 +3118,10 @@ def inject_tool_search_deferral(
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).
     if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
-        last_resident_real["cache_control"] = {"type": "ephemeral"}
+        relocated_cc: dict[str, Any] = {"type": "ephemeral"}
+        if dropped_cache_ttl is not None:
+            relocated_cc["ttl"] = dropped_cache_ttl
+        last_resident_real["cache_control"] = relocated_cc
     return out
 
 

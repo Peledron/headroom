@@ -1050,6 +1050,10 @@ class AnthropicHandlerMixin:
 
             # Get prefix cache tracker for this session
             session_id = self.session_tracker_store.compute_session_id(request, model, messages)
+            # #856 P3b: read the idle gap BEFORE get_or_create refreshes
+            # _last_activity, otherwise the gap is always ~0 and the
+            # idle-derived P_alive never decays.
+            netcost_idle_seconds = self.session_tracker_store.peek_idle_seconds(session_id)
             prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             if is_cache_mode(self.config.mode):
@@ -1094,6 +1098,26 @@ class AnthropicHandlerMixin:
                 # Sticky value can only equal "" when both client and
                 # session are empty; preserve the (absent) client state.
                 pass
+            # HR_FORCE_BETA (2026-07-11, local fork): re-append beta tokens the
+            # client is entitled to but silently dropped. Observed: after a 429
+            # Claude Code removes context-1m-2025-08-07 for the rest of the
+            # session even once the rate window recovers, capping a 250k
+            # conversation at 200k. Comma-separated env value, each token
+            # appended only if absent.
+            _force_beta = os.environ.get("HR_FORCE_BETA", "")
+            if _force_beta:
+                _cur = headers.get("anthropic-beta", "")
+                _cur_set = {t.strip() for t in _cur.split(",") if t.strip()}
+                _missing = [
+                    t.strip()
+                    for t in _force_beta.split(",")
+                    if t.strip() and t.strip() not in _cur_set
+                ]
+                if _missing:
+                    headers["anthropic-beta"] = (
+                        (_cur + "," if _cur else "") + ",".join(_missing)
+                    )
+                    logger.info(f"[{request_id}] HR_FORCE_BETA: appended {_missing}")
             log_beta_header_merge(
                 provider="anthropic",
                 session_id=session_id,
@@ -1276,6 +1300,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        idle_seconds=netcost_idle_seconds,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     lambda bg_result: comp_cache.update_from_result(
@@ -1305,6 +1330,7 @@ class AnthropicHandlerMixin:
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
+                                            idle_seconds=netcost_idle_seconds,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
                                         timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1355,6 +1381,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        idle_seconds=netcost_idle_seconds,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1438,6 +1465,7 @@ class AnthropicHandlerMixin:
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
+                                            idle_seconds=netcost_idle_seconds,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
                                         timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -2484,6 +2512,172 @@ class AnthropicHandlerMixin:
             )
             if upstream_base_url and request.url.query:
                 url = f"{url}?{request.url.query}"
+
+            # HR_STRIP_DEEP_REMINDERS (2026-07-11, local fork, experiment):
+            # Claude Code injects hook additionalContext as <system-reminder>
+            # text blocks, then adds or drops them nondeterministically on
+            # later turns. Measured live: a dropped reminder at msg 56 collapsed
+            # a warm 246k-token read to the 5,632-token head (242k cold write).
+            # Deterministically removing these blocks from every message EXCEPT
+            # the last makes deep history byte-stable regardless of the client's
+            # churn, so the whole class stops busting. The current-turn reminder
+            # is preserved (only already-acted deep ones go, and only when other
+            # content remains so a message is never emptied). Off by default.
+            if os.environ.get("HR_STRIP_DEEP_REMINDERS") == "1":
+                try:
+                    _msgs = body.get("messages") or []
+                    if len(_msgs) > 1:
+                        _last = len(_msgs) - 1
+                        _out = []
+                        _changed = False
+                        for _idx, _m in enumerate(_msgs):
+                            _c = _m.get("content")
+                            if _idx < _last and isinstance(_c, list) and len(_c) > 1:
+                                _f = [
+                                    _b for _b in _c
+                                    if not (
+                                        isinstance(_b, dict)
+                                        and _b.get("type") == "text"
+                                        and isinstance(_b.get("text"), str)
+                                        and _b["text"].lstrip().startswith("<system-reminder>")
+                                        and "hook additional context" in _b["text"]
+                                    )
+                                ]
+                                if len(_f) != len(_c) and _f:
+                                    _out.append({**_m, "content": _f})
+                                    _changed = True
+                                    continue
+                            _out.append(_m)
+                        if _changed:
+                            body["messages"] = _out
+                            logger.info(
+                                f"[{request_id}] HR_STRIP_DEEP_REMINDERS: "
+                                f"normalized deep hook reminders"
+                            )
+                except Exception:
+                    logger.warning("HR_STRIP_DEEP_REMINDERS failed", exc_info=True)
+
+            # HR_MID_ANCHOR (2026-07-11, local fork): mid-history 1h cache
+            # anchor. Claude Code history is not byte-stable (hook-context
+            # restructuring, message form flips, measured 2026-07-11), and
+            # forwarded requests carry only head breakpoints plus one fragile
+            # tail breakpoint, so any churn collapses cache reads to the
+            # head. A quantized mid-depth anchor bounds the damage to the
+            # segment after it. Quantizing to 64 keeps the anchor byte-stable
+            # between growth jumps. Copy-on-write when attaching the marker:
+            # in-place mutation would leak into tracker or compression-cache
+            # state that is compared against next turn's client bytes.
+            if os.environ.get("HR_MID_ANCHOR") == "1":
+                try:
+                    _msgs = body.get("messages") or []
+
+                    def _count_cc(_obj, _limit=4):
+                        # Count cache_control breakpoints ANYWHERE: bare-dict
+                        # content, blocks nested inside a tool_result's own
+                        # content, and list blocks. The old counter only looked
+                        # at list-shaped content, so a bare-dict or nested
+                        # breakpoint was invisible and the anchor could push the
+                        # request past Anthropic's hard cap of 4 (a 400). Early
+                        # exit at the cap keeps the walk bounded.
+                        _stack = [_obj]
+                        _n = 0
+                        while _stack:
+                            _cur = _stack.pop()
+                            if isinstance(_cur, dict):
+                                if _cur.get("cache_control"):
+                                    _n += 1
+                                    if _n >= _limit:
+                                        return _n
+                                _stack.extend(_cur.values())
+                            elif isinstance(_cur, list):
+                                _stack.extend(_cur)
+                        return _n
+
+                    _existing = _count_cc([body.get("system"), body.get("tools"), _msgs])
+                    if len(_msgs) >= 80 and _existing < 4:
+                        _anchor = max(32, (len(_msgs) - 16) // 64 * 64)
+                        _anchor = min(_anchor, len(_msgs) - 16)
+                        for _i in range(_anchor, max(_anchor - 24, 0), -1):
+                            _c = _msgs[_i].get("content")
+                            # Accept both list content (anchor the last block)
+                            # and bare-dict content (anchor the dict itself), so
+                            # a client list<->dict shape flip on the target
+                            # message does not make the scan skip it and drift
+                            # the anchor to a neighbour.
+                            _tail = None
+                            if isinstance(_c, list) and _c and isinstance(_c[-1], dict):
+                                _tail = _c[-1]
+                            elif isinstance(_c, dict):
+                                _tail = _c
+                            if (
+                                _tail is not None
+                                and not _tail.get("cache_control")
+                                and _tail.get("type") in ("text", "tool_result")
+                            ):
+                                _new_tail = {
+                                    **_tail,
+                                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                                }
+                                if isinstance(_c, list):
+                                    _new_content = list(_c[:-1]) + [_new_tail]
+                                else:
+                                    _new_content = _new_tail
+                                _new_msg = {**_msgs[_i], "content": _new_content}
+                                body["messages"] = (
+                                    list(_msgs[:_i]) + [_new_msg] + list(_msgs[_i + 1 :])
+                                )
+                                logger.info(
+                                    f"[{request_id}] HR_MID_ANCHOR: 1h anchor at "
+                                    f"msg {_i}/{len(_msgs)}"
+                                )
+                                break
+                except Exception:
+                    logger.warning("HR_MID_ANCHOR failed", exc_info=True)
+
+            # HR_CANON_MODEL_ID (2026-07-11, local fork, R4-prime): Claude Code
+            # spawns subagents WITHOUT the context-1m beta, so the system-prompt
+            # model-id line renders "claude-opus-4-8[1m]" on the main agent and
+            # "claude-opus-4-8" on a subagent. That 4-byte "[1m]" token forks the
+            # ~24.4k-token system+tools head cache (W2, IMPROVEMENTS.md), so every
+            # subagent first request cold-writes the head instead of reading the
+            # parent's warm copy. Canonicalizing the string to one form (strip
+            # "[1m]") on every forwarded request lets same-model agents share the
+            # head. It is informational text: the real 1m context is set by the
+            # beta header, not this string, so normalizing the display is
+            # behavior-neutral. Idempotent, so byte-stable across turns. Off by
+            # default. Full cross-agent KV reuse is not possible (needs control
+            # of the serving stack); this only dedups the head-id fork.
+            if os.environ.get("HR_CANON_MODEL_ID") == "1":
+                try:
+                    import re as _re
+
+                    _sysb = body.get("system")
+                    if isinstance(_sysb, list):
+                        _out = []
+                        _changed = False
+                        for _b in _sysb:
+                            if (
+                                isinstance(_b, dict)
+                                and _b.get("type") == "text"
+                                and isinstance(_b.get("text"), str)
+                                and "[1m]" in _b["text"]
+                            ):
+                                _canon = _re.sub(
+                                    r"(claude-[a-z0-9.\-]+)\[1m\]", r"\1", _b["text"]
+                                )
+                                if _canon != _b["text"]:
+                                    _out.append({**_b, "text": _canon})
+                                    _changed = True
+                                    continue
+                            _out.append(_b)
+                        if _changed:
+                            body["system"] = _out
+                            logger.info(
+                                f"[{request_id}] HR_CANON_MODEL_ID: "
+                                f"canonicalized [1m] model-id in system head"
+                            )
+                except Exception:
+                    logger.warning("HR_CANON_MODEL_ID failed", exc_info=True)
 
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)
