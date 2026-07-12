@@ -561,12 +561,20 @@ class PrefixCacheTracker:
         (nothing learned from them). The first accepted sample seeds the EWMA
         directly, so a single-observation session reports that sample exactly.
         """
-        if (
-            math.isfinite(tokens_before)
-            and math.isfinite(tokens_after)
-            and tokens_before > 0
-            and 0 < tokens_after <= tokens_before
-        ):
+        # ``math.isfinite`` raises OverflowError on a Python int too large for a
+        # float (e.g. a corrupted or adversarial counter), so guard it like
+        # ``record_turn_gap`` does: an oversized value is just another invalid
+        # sample to ignore, never a crash on the request path.
+        try:
+            valid = (
+                math.isfinite(tokens_before)
+                and math.isfinite(tokens_after)
+                and tokens_before > 0
+                and 0 < tokens_after <= tokens_before
+            )
+        except (TypeError, OverflowError):
+            return
+        if valid:
             sample = tokens_after / tokens_before
             self._last_compression_kept = sample
             if self._kept_ewma is None:
