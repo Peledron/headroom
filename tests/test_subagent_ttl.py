@@ -316,3 +316,88 @@ def test_1h_tier_charges_more_so_needs_more_reads():
     g_5m = _gate_decision(p, orig=50000, cached=48000, kept=0.8, R=120, ttl="5m", idle=0)
     g_1h = _gate_decision(p, orig=50000, cached=48000, kept=0.8, R=120, ttl="1h", idle=0)
     assert g_1h < g_5m
+
+
+# ── EWMA compression-ratio predictor + confidence discount ────────────────────
+
+
+def test_ewma_seeds_on_first_sample():
+    # A single-observation session reports that sample exactly (EWMA seed), so
+    # the estimator is a drop-in for the old last-sample behaviour.
+    t = PrefixCacheTracker("anthropic")
+    t.note_compression(1000, 650)
+    assert abs(t.recent_compression_ratio() - 0.65) < 1e-9
+    assert t.compression_ratio_stddev() == 0.0
+
+
+def test_ewma_smooths_a_spike():
+    # After a stable run, one anomalous sample moves the estimate by only alpha,
+    # not all the way. Old last-sample logic would have jumped to the spike.
+    t = PrefixCacheTracker("anthropic")
+    for _ in range(6):
+        t.note_compression(1000, 700)  # steady 0.70
+    assert abs(t.recent_compression_ratio() - 0.70) < 1e-9
+    t.note_compression(1000, 300)  # spike to 0.30
+    # EWMA moves 0.3 of the way: 0.7 + 0.3 * (0.3 - 0.7) = 0.58
+    assert abs(t.recent_compression_ratio() - 0.58) < 1e-9
+
+
+def test_ewma_converges_to_a_regime_change():
+    # A sustained shift is tracked within a few turns (not stuck on the old mean).
+    t = PrefixCacheTracker("anthropic")
+    t.note_compression(1000, 700)
+    for _ in range(10):
+        t.note_compression(1000, 400)  # new steady regime 0.40
+    assert abs(t.recent_compression_ratio() - 0.40) < 0.02
+
+
+def test_confidence_discount_widens_saving_estimate_downward():
+    # A noisy session has stddev > 0, so the conservative kept fraction sits
+    # above the mean (assume LESS saving), and 1-kept is a lower bound.
+    t = PrefixCacheTracker("anthropic")
+    t.note_compression(1000, 700)
+    t.note_compression(1000, 300)
+    t.note_compression(1000, 800)
+    mean = t.recent_compression_ratio()
+    cons = t.conservative_compression_ratio(k=1.0)
+    assert t.compression_ratio_stddev() > 0.0
+    assert cons > mean  # discounted toward "keeps more, saves less"
+    assert cons <= 1.0  # capped
+
+
+def test_confidence_discount_noop_on_stable_session():
+    # Zero variance -> conservative estimate equals the mean (no penalty).
+    t = PrefixCacheTracker("anthropic")
+    for _ in range(5):
+        t.note_compression(1000, 700)
+    assert abs(t.conservative_compression_ratio(k=1.0) - t.recent_compression_ratio()) < 1e-9
+
+
+def test_confidence_discount_prior_before_any_sample():
+    t = PrefixCacheTracker("anthropic")
+    assert t.conservative_compression_ratio(default=0.8, k=1.0) == 0.8
+
+
+def test_confidence_discount_capped_at_one():
+    # Large k on a high-variance session must not exceed a 1.0 kept fraction
+    # (which would make est_dt negative in the gate).
+    t = PrefixCacheTracker("anthropic")
+    t.note_compression(1000, 950)
+    t.note_compression(1000, 100)
+    assert t.conservative_compression_ratio(k=100.0) == 1.0
+
+
+def test_high_variance_blocks_latch_that_mean_would_allow():
+    # End-to-end: the confidence discount can flip a borderline compress to a
+    # forward-original when the ratio estimate is unreliable.
+    p = policy_default_payg()
+    t = PrefixCacheTracker("anthropic")
+    # Alternating extreme samples -> high stddev, mean around 0.55.
+    for a in (900, 100, 900, 100, 900):
+        t.note_compression(1000, a)
+    mean_kept = t.recent_compression_ratio()
+    cons_kept = t.conservative_compression_ratio(k=1.0)
+    g_mean = _gate_decision(p, orig=60000, cached=55000, kept=mean_kept, R=90, ttl="5m", idle=0)
+    g_cons = _gate_decision(p, orig=60000, cached=55000, kept=cons_kept, R=90, ttl="5m", idle=0)
+    # Discounted saving yields a strictly smaller (more cautious) gain.
+    assert g_cons < g_mean

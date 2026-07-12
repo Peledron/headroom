@@ -43,6 +43,15 @@ _PROVIDER_WRITE_PENALTY = {
     "bedrock": 0.25,
 }
 
+# Smoothing factor for the compression-ratio predictor. The cost gate has to
+# estimate how many tokens the NEXT compression will remove before running it,
+# which is the same shape as an OS scheduler predicting the next CPU burst from
+# past bursts. The textbook answer is exponential averaging: weight the newest
+# observation by alpha and decay the running estimate by (1 - alpha), so one
+# anomalous turn cannot yank the estimate the way a single last-sample can.
+# 0.3 tracks a genuine regime change within a few turns without chasing noise.
+_KEPT_EWMA_ALPHA = 0.3
+
 # Default prompt-cache lifetime per provider, in seconds. Used by
 # `classify_cache_miss` to decide whether a miss is most likely a TTL
 # lapse (idle longer than this) versus a prefix-content change. Anthropic's
@@ -440,6 +449,13 @@ class PrefixCacheTracker:
         # estimate the next turn's saving before actually running compression.
         self._compress_latched: bool = False
         self._last_compression_kept: float | None = None
+        # Exponentially-weighted estimate of the KEPT fraction and its variance.
+        # ``_kept_ewma`` is the smoothed prediction the cost gate reads;
+        # ``_kept_var`` is an EWMA of the squared deviation, so its square root
+        # is a confidence spread the gate discounts by (assume less saving when
+        # the estimate is noisy). Both stay None/0 until the first observation.
+        self._kept_ewma: float | None = None
+        self._kept_var: float = 0.0
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -539,9 +555,11 @@ class PrefixCacheTracker:
     def note_compression(self, tokens_before: int, tokens_after: int) -> None:
         """Record the fraction of tokens the last compression kept.
 
-        Feeds ``recent_compression_ratio`` so the next turn's break-even can
-        estimate its saving without first running compression. Ignores
-        non-positive or inflating results (nothing learned from them).
+        Feeds the exponentially-weighted predictor ``recent_compression_ratio``
+        reads, so the next turn's break-even can estimate its saving without
+        first running compression. Ignores non-positive or inflating results
+        (nothing learned from them). The first accepted sample seeds the EWMA
+        directly, so a single-observation session reports that sample exactly.
         """
         if (
             math.isfinite(tokens_before)
@@ -549,16 +567,59 @@ class PrefixCacheTracker:
             and tokens_before > 0
             and 0 < tokens_after <= tokens_before
         ):
-            self._last_compression_kept = tokens_after / tokens_before
+            sample = tokens_after / tokens_before
+            self._last_compression_kept = sample
+            if self._kept_ewma is None:
+                self._kept_ewma = sample
+                self._kept_var = 0.0
+            else:
+                prev = self._kept_ewma
+                self._kept_ewma = _KEPT_EWMA_ALPHA * sample + (1.0 - _KEPT_EWMA_ALPHA) * prev
+                dev = sample - prev
+                self._kept_var = (
+                    _KEPT_EWMA_ALPHA * (dev * dev) + (1.0 - _KEPT_EWMA_ALPHA) * self._kept_var
+                )
 
     def recent_compression_ratio(self, default: float = 0.8) -> float:
         """Fraction of tokens compression is expected to KEEP (after/before).
 
-        Returns the last observed ratio, or ``default`` before any compression
-        has run. ``1 - ratio`` is the estimated saving fraction the cost gate
-        applies to the current token count.
+        Returns the exponentially-weighted estimate of the kept fraction, or
+        ``default`` before any compression has run. ``1 - ratio`` is the mean
+        saving fraction; the cost gate uses ``conservative_compression_ratio``
+        for the actual decision so a noisy estimate does not over-commit.
         """
-        return self._last_compression_kept if self._last_compression_kept is not None else default
+        return self._kept_ewma if self._kept_ewma is not None else default
+
+    def compression_ratio_stddev(self) -> float:
+        """Spread of the kept-fraction estimate (root of the EWMA variance).
+
+        Zero before the second observation. The cost gate widens its saving
+        estimate downward by this much per unit of confidence ``k``.
+        """
+        return math.sqrt(self._kept_var) if self._kept_var > 0.0 else 0.0
+
+    def conservative_compression_ratio(self, *, default: float = 0.8, k: float = 1.0) -> float:
+        """Confidence-discounted KEPT fraction for the irreversible latch.
+
+        The gate commits to compression before it can measure the real saving,
+        and the commit is one-way (forwarding original again busts the
+        compressed cache). So instead of the mean estimate it uses a lower
+        confidence bound on the SAVING: assume compression keeps
+        ``mean + k * stddev`` of the tokens, capped at 1.0. A high-variance
+        session therefore under-estimates its own saving and waits for the
+        estimate to settle before latching, while a session with a stable
+        ratio behaves like the plain mean. This is the UCB-style pessimism
+        that pairs with the EWMA smoothing.
+        """
+        if self._kept_ewma is None:
+            return default
+        # The discount is one-directional: it may only assume LESS saving than
+        # the mean, never more. A negative k (e.g. a mis-set env override) would
+        # invert that and make the irreversible latch MORE aggressive, so clamp
+        # it out. NaN k collapses to 0 (no discount) for the same reason.
+        if not math.isfinite(k) or k < 0.0:
+            k = 0.0
+        return min(1.0, self._kept_ewma + k * self.compression_ratio_stddev())
 
     def cached_token_count(self) -> int:
         """Tokens the provider currently has cached for this session's prefix.

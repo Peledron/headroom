@@ -1442,7 +1442,19 @@ class AnthropicHandlerMixin:
                                 write_multiplier_for_ttl,
                             )
 
-                            _kept = prefix_tracker.recent_compression_ratio()
+                            try:
+                                _conf_k = float(
+                                    os.environ.get("HR_TOKEN_RATIO_CONFIDENCE_K", "") or 1.0
+                                )
+                            except ValueError:
+                                _conf_k = 1.0
+                            # Confidence-discounted kept fraction: the latch is
+                            # one-way and the estimate is noisy, so use a lower
+                            # bound on the saving (assume compression keeps more
+                            # than the mean when the estimate is uncertain), which
+                            # keeps a high-variance session from committing on a
+                            # single lucky sample.
+                            _kept = prefix_tracker.conservative_compression_ratio(k=_conf_k)
                             _est_dt = max(0, int(original_tokens * (1.0 - _kept)))
                             _S = prefix_tracker.cached_token_count()
                             try:
