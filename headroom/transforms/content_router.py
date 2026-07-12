@@ -3424,19 +3424,29 @@ class ContentRouter(Transform):
         # pipeline, where the P2 break-even gate (_net_cost_allows) decides
         # per candidate: its S is the full invalidated suffix after the slot,
         # so the deep edit proceeds only when ΔT·(w+r(R-1)) still beats the
-        # cache-bust penalty. Block-list and non-string frozen content stay
-        # frozen — the gate is wired into the string and parallel-merge paths
-        # only, and the per-block cache_control contract in
-        # _process_content_blocks is not net-cost aware, so opening them here
-        # would mutate cached blocks ungated.
+        # cache-bust penalty. #856 P2b-block: block-list frozen content
+        # (Anthropic tool_result arrays — the dominant frozen shape on Claude)
+        # is ALSO unlocked here. It runs through the normal block compressor,
+        # then the whole message is admitted or rejected by ONE message-level
+        # break-even gate (below, in the list-content branch): total ΔT for the
+        # message versus the suffix it invalidates. Per-block cache_control
+        # breakpoints remain untouched inside _process_content_blocks, so the
+        # message-level gate never bypasses an explicit provider breakpoint.
+        # Non-list, non-string frozen content stays frozen.
         frozen_unlock_slots: set[int] = set()
         for i, message in enumerate(messages):
             if i < frozen_message_count:
-                if netcost_enabled and isinstance(message.get("content", ""), str):
+                _frozen_content = message.get("content", "")
+                if netcost_enabled and isinstance(_frozen_content, str):
                     # Defer to the break-even gate below instead of skipping.
                     frozen_unlock_slots.add(i)
                     route_counts.setdefault("netcost_frozen_considered", 0)
                     route_counts["netcost_frozen_considered"] += 1
+                elif netcost_enabled and isinstance(_frozen_content, list):
+                    # Defer to the message-level block gate in the list branch.
+                    frozen_unlock_slots.add(i)
+                    route_counts.setdefault("netcost_frozen_block_considered", 0)
+                    route_counts["netcost_frozen_block_considered"] += 1
                 else:
                     # Frozen — byte-identical to preserve the prefix cache.
                     result_slots[i] = message
@@ -3468,6 +3478,40 @@ class ContentRouter(Transform):
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
                 )
+                # #856 P2b-block: a frozen block message sits in the provider's
+                # cached prefix. The block compressor produced a candidate;
+                # admit it only when the token saving for the whole message
+                # beats the cache-bust penalty for the suffix it invalidates.
+                # Same break-even gate (_net_cost_allows) as the string path,
+                # applied once per message on total ΔT. Non-frozen block
+                # messages (i not in frozen_unlock_slots) are unaffected and
+                # compress freely, exactly as before.
+                if (
+                    netcost_enabled
+                    and i in frozen_unlock_slots
+                    and transformed_message is not message
+                ):
+                    _orig_tok = _netcost_message_tokens(message, tokenizer)
+                    _new_tok = _netcost_message_tokens(transformed_message, tokenizer)
+                    _admit = _new_tok < _orig_tok and self._net_cost_allows(
+                        slot_idx=i,
+                        original_tokens=_orig_tok,
+                        compressed_tokens=_new_tok,
+                        suffix_tokens=netcost_suffix_tokens,
+                        route_counts=route_counts,
+                        transforms_applied=transforms_applied,
+                        batch_state=netcost_batch_state,
+                        p_alive_override=netcost_p_alive_override,
+                    )
+                    if not _admit:
+                        # Gate rejected — keep the frozen bytes intact.
+                        result_slots[i] = message
+                        route_counts.setdefault("netcost_frozen_block_skipped", 0)
+                        route_counts["netcost_frozen_block_skipped"] += 1
+                        continue
+                    transforms_applied.append("router:netcost_frozen_block_unlock")
+                    route_counts.setdefault("netcost_frozen_block_unlocked", 0)
+                    route_counts["netcost_frozen_block_unlocked"] += 1
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
                 continue
