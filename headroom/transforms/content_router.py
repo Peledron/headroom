@@ -3005,6 +3005,7 @@ class ContentRouter(Transform):
         transforms_applied: list[str],
         batch_state: dict[str, int | None] | None = None,
         p_alive_override: float | None = None,
+        write_multiplier: float | None = None,
     ) -> bool:
         """Break-even gate for one candidate mutation (#856 P2, flag-gated).
 
@@ -3089,16 +3090,27 @@ class ContentRouter(Transform):
                 p_alive = _p_alive
             except ValueError:
                 logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
-        gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
+        # Charge the cache-write tier of the suffix this mutation would bust.
+        # 1h-cached suffixes cost 2x, not 1.25x, so under-counting them lets the
+        # gate admit mutations that actually lose. Priority: explicit arg, then
+        # HEADROOM_NET_COST_WRITE_TTL ("1h"/"5m", set to the session's chosen
+        # tier), else the 5m default (unchanged behaviour when unset).
+        _wmult = write_multiplier
+        if _wmult is None:
+            from .compression_policy import write_multiplier_for_ttl
+
+            _wmult = write_multiplier_for_ttl(os.environ.get("HEADROOM_NET_COST_WRITE_TTL"))
+        gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive, _wmult))
         allowed = gain > 0.0
         logger.info(
             "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
-            "idle_derived=%s gain=%.0f batch_reclaim=%s -> %s",
+            "w=%.2f idle_derived=%s gain=%.0f batch_reclaim=%s -> %s",
             slot_idx,
             delta_t,
             suffix,
             reads,
             p_alive,
+            _wmult,
             idle_derived,
             gain,
             batch_reclaim,

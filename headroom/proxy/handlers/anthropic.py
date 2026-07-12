@@ -65,6 +65,106 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _flatten_system_text(system: Any) -> str:
+    """Join the text of an Anthropic ``system`` field (str or block list)."""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts = [
+            block["text"]
+            for block in system
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(parts)
+    return ""
+
+
+def _system_looks_subagent(system: Any, model_id: Any) -> bool:
+    """Detect a Claude Code SUB-AGENT request from its system head.
+
+    Headroom's ``claude ... --context-1m`` wrap sets ``ANTHROPIC_MODEL=<id>[1m]``
+    on the main process, so Claude Code renders the model-id line in the system
+    prompt as ``<id>[1m]`` for the main agent. Sub-agents spawned by the Task
+    tool run WITHOUT the 1M beta, so their model-id line renders the bare ``<id>``
+    (the same signal HR_CANON_MODEL_ID keys off). This returns True only for a
+    Claude-Code-shaped head — the sanitized model id appears in the system text —
+    that carries no ``<id>[1m]`` marker, so non-Claude-Code traffic (no model id
+    in the head) and the main 1M session (``<id>[1m]`` present) are never matched.
+    Detection is a pure cost signal for TTL selection: a false positive only
+    mis-prices a cache write, never changes a response.
+    """
+    if not isinstance(model_id, str) or not model_id:
+        return False
+    text = _flatten_system_text(system)
+    if not text:
+        return False
+    import re
+
+    esc = re.escape(model_id)
+    # A model id present anywhere with the 1M marker means the main session.
+    if re.search(esc + r"\[1m\]", text):
+        return False
+    # Sub-agent iff the EXACT id appears as a complete token (not merely a
+    # prefix of a longer id) with no 1M marker. The boundary guards prevent a
+    # short family id (e.g. "claude-opus-4") from matching inside a longer
+    # rendered id ("claude-opus-4-8[1m]") and misclassifying a main session as
+    # a sub-agent, since Anthropic model ids are literal prefixes of each other.
+    return re.search(r"(?<![a-z0-9\-])" + esc + r"(?![a-z0-9\-])", text) is not None
+
+
+def _system_lacks_1m_marker(system: Any) -> bool:
+    """True when a non-empty system head carries NO ``[1m]`` 1M-context marker.
+
+    Broader than ``_system_looks_subagent`` (which also requires the model id to
+    appear in the head). In a Claude Code deployment using the ``--context-1m``
+    wrap, the main session's model-id line always renders ``<id>[1m]``, so a
+    non-empty head WITHOUT any ``[1m]`` marker is a sub-agent or a short non-1M
+    session. Used to gate the cache-safe sub-agent freeze: the A/B measured that
+    some sub-agents carry a system head that does not name the model id, so the
+    stricter detector missed them and they busted under token compression. A
+    false positive here (a main session that dropped ``[1m]`` after a 429) only
+    forwards the original prefix, which is a cache hit, never a wrong response,
+    and it self-corrects once ``HR_FORCE_BETA`` restores the marker.
+    """
+    text = _flatten_system_text(system)
+    return bool(text) and "[1m]" not in text
+
+
+def _token_prefix_mutation_worth_it(
+    *,
+    context_pressure: float,
+    p_alive: float,
+    pressure_threshold: float = 0.85,
+    p_alive_floor: float = 0.25,
+) -> bool:
+    """Whether aggressively mutating a warm cached prefix pays in token mode.
+
+    Aggressive (message-count-changing) token-mode compression cannot use the
+    position-based ``overlay_cached_prefix`` replay: that guard requires one
+    forwarded message per original (line ~294), and dropping/merging messages
+    breaks it, so the prefix re-writes EVERY turn instead of amortizing to one
+    bust (measured 12 busts / 8 min, IMPROVEMENTS.md). Re-writing a warm prefix
+    trades 0.1x cache reads for 1.25-2x writes and loses in steady state. It only
+    pays in two regimes, both captured by signals the request already carries:
+
+    - ``p_alive`` at/under ``p_alive_floor``: the cached prefix is about to lapse
+      (long idle relative to the cache TTL), so the write is coming regardless and
+      the mutation is close to free.
+    - ``context_pressure`` at/over ``pressure_threshold``: the context is near the
+      model limit, so NOT compressing forces an overflow or a client-side
+      compaction that costs more than the one bust.
+
+    Returns False otherwise, meaning token mode should leave the prefix untouched
+    (a cache hit) rather than pay repeated write premiums for a warm cache. This
+    is why ``_net_cost_allows`` reads flat-zero on a warm token-mode canary: the
+    economics correctly say "do not mutate", but the whole-prefix compression path
+    never consulted a gate, so it mutated (and busted) anyway.
+    """
+    if p_alive <= p_alive_floor:
+        return True
+    return context_pressure >= pressure_threshold
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -706,6 +806,14 @@ class AnthropicHandlerMixin:
             if isinstance(body_model, str) and model != body_model:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
+            # Capture the sub-agent signal from the PRISTINE system head, before
+            # any later transform (HR_CANON_MODEL_ID) strips the "[1m]" marker it
+            # depends on. "No [1m] marker" = not the 1M main session; this is the
+            # broad detector that the A/B showed is needed (some sub-agents omit
+            # the model id from their head, so the stricter _system_looks_subagent
+            # missed them and they busted). Drives both the 5m ttl prior and the
+            # token-mode sub-agent freeze below.
+            _is_subagent_request = _system_lacks_1m_marker(body.get("system"))
             messages = body.get("messages", [])
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
@@ -1055,6 +1163,11 @@ class AnthropicHandlerMixin:
             # idle-derived P_alive never decays.
             netcost_idle_seconds = self.session_tracker_store.peek_idle_seconds(session_id)
             prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
+            # Record this session's request-to-request cadence (measured BEFORE
+            # get_or_create refreshed activity) so adaptive-TTL selection below
+            # has recent gaps to reason about. Pure bookkeeping, no forwarding
+            # effect, so it always runs and builds the signal even flags-off.
+            prefix_tracker.record_turn_gap(netcost_idle_seconds)
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             if is_cache_mode(self.config.mode):
                 frozen_message_count = self._strict_previous_turn_frozen_count(
@@ -1271,6 +1384,28 @@ class AnthropicHandlerMixin:
                         skip_ccr_request_compression = should_skip_ccr_request_compression(
                             frozen_message_count
                         )
+                        # HR_SUBAGENT_FREEZE (2026-07-12, local fork): a controlled
+                        # token-vs-cache A/B on the same prompt proved token-mode
+                        # compression BUSTS sub-agent traffic hard (158k tokens lost
+                        # to cache re-writes vs 0 in cache mode). A sub-agent is a
+                        # 2-message conversation (large cached system head + one
+                        # turn) with frozen=0, so token mode recompresses the cached
+                        # head and busts it, and overlay can't replay a non-append-
+                        # only 2-message turn. Sub-agents are short and never fill
+                        # context, so they gain nothing from compression headroom.
+                        # Forward the original (freeze, like cache mode) to keep the
+                        # cached head a hit; the main 1M agent keeps token compression
+                        # for its headroom. Off by default.
+                        if (
+                            os.environ.get("HR_SUBAGENT_FREEZE") == "1"
+                            and _is_subagent_request
+                            and not skip_ccr_request_compression
+                        ):
+                            skip_ccr_request_compression = True
+                            logger.info(
+                                f"[{request_id}] SUBAGENT_FREEZE: token-mode sub-agent "
+                                "-> forwarding original to preserve the cached head"
+                            )
                         if skip_ccr_request_compression:
                             logger.info(
                                 f"[{request_id}] CCR: skipping request-side compression "
@@ -1369,7 +1504,41 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] CCR: skipping request-side compression "
                                 f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
                             )
-                        if not skip_ccr_request_compression:
+                        # HEADROOM_TOKEN_PREFIX_GATE (2026-07-12, local fork): aggressive
+                        # token-mode compression changes the message count, which breaks
+                        # overlay_cached_prefix's 1:1 replay guard, so the prefix re-writes
+                        # EVERY turn (measured 12 busts / 8 min) instead of amortizing to one.
+                        # That trades 0.1x reads for 1.25-2x writes and loses on a warm
+                        # cache. Only mutate when the prefix is near lapse (write is coming
+                        # anyway) or context pressure is high (compression averts an overflow);
+                        # otherwise forward the original so it stays a hit. Off by default so
+                        # live token-mode behaviour is unchanged until canary-validated.
+                        _token_mutate = True
+                        if os.environ.get("HEADROOM_TOKEN_PREFIX_GATE") == "1":
+                            try:
+                                _ttl_s = float(
+                                    os.environ.get("HEADROOM_TOKEN_PREFIX_TTL_S", "") or 300.0
+                                )
+                                _p_alive = (
+                                    max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s)
+                                    if _ttl_s > 0
+                                    else 0.0
+                                )
+                                _pressure = (
+                                    original_tokens / context_limit if context_limit else 0.0
+                                )
+                                _token_mutate = _token_prefix_mutation_worth_it(
+                                    context_pressure=_pressure, p_alive=_p_alive
+                                )
+                                if not _token_mutate:
+                                    logger.info(
+                                        f"[{request_id}] TOKEN_PREFIX_GATE: warm prefix "
+                                        f"(p_alive={_p_alive:.2f} pressure={_pressure:.2f}); "
+                                        "forwarding original to preserve cache"
+                                    )
+                            except Exception:
+                                logger.warning("TOKEN_PREFIX_GATE failed", exc_info=True)
+                        if not skip_ccr_request_compression and _token_mutate:
                             async with stage_timer.measure("compression_first_stage"):
                                 result = await self._run_compression_in_executor(
                                     lambda: self.anthropic_pipeline.apply(
@@ -1515,12 +1684,28 @@ class AnthropicHandlerMixin:
                 overlay_cached_prefix,
             )
 
+            _prev_orig_diag = prefix_tracker.get_last_original_messages()
+            _prev_fwd_diag = prefix_tracker.get_last_forwarded_messages()
             _ov = overlay_cached_prefix(
                 optimized_messages,
                 original_client_messages,
-                prefix_tracker.get_last_original_messages(),
-                prefix_tracker.get_last_forwarded_messages(),
+                _prev_orig_diag,
+                _prev_fwd_diag,
             )
+            # TOKEN_DIAG (2026-07-12, temporary): trace token-mode partial busts.
+            # overlay replays the prior forwarded prefix byte-stable ONLY when it
+            # append-only-extends the prior turn AND there is one forwarded msg per
+            # original (len(prev_fwd)==len(prev_orig)). If token compression changed
+            # the message count, prev_fwd!=prev_orig, overlay bails, and the tail
+            # busts. This logs exactly that so the cause is measured, not guessed.
+            if is_token_mode(self.config.mode):
+                logger.info(
+                    f"[{request_id}] TOKEN_DIAG: client_msgs={len(original_client_messages)} "
+                    f"opt_msgs={len(optimized_messages)} "
+                    f"prev_orig={len(_prev_orig_diag or [])} prev_fwd={len(_prev_fwd_diag or [])} "
+                    f"count_ok={len(_prev_orig_diag or []) == len(_prev_fwd_diag or [])} "
+                    f"overlay_applied={_ov != optimized_messages} frozen={frozen_message_count}"
+                )
             if _ov != optimized_messages:
                 optimized_messages = _ov
                 optimized_tokens = tokenizer.count_messages(optimized_messages)
@@ -1531,9 +1716,39 @@ class AnthropicHandlerMixin:
             # a single breakpoint on the last block (caches the whole prefix;
             # content-keyed cache so re-placing never busts). Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages)
+            #
+            # Adaptive cache-TTL tier for the single message-prefix breakpoint.
+            # Anthropic sells only 5m (1.25x write) and 1h (2x write); the 1h
+            # premium pays off only when a gap between requests exceeds 5 minutes.
+            # Two flag-gated signals pick the cheaper tier, measured first:
+            #
+            # HEADROOM_ADAPTIVE_TTL: the session's own recent inter-turn cadence
+            #   (recommended_ttl). A fast-cadence conversation gets 5m; one that
+            #   has idled past 5 min flips back to 1h. This generalizes the
+            #   sub-agent case to any short-cadence session and needs no marker.
+            # HR_SUBAGENT_TTL_5M: a cold-start prior for a Claude Code sub-agent
+            #   (measured median ~3 min, never resumes) before enough gap history
+            #   exists, via the [1m]-absence signal captured at request start.
+            #
+            # The system/tools HEAD is left untouched (still 1h) so it stays
+            # cache-shared with the main 1M session (HR_CANON_MODEL_ID / W2). ttl
+            # is a pure cost knob, so a wrong tier only re-prices a write (and at
+            # worst forces one re-write on a surprise >5 min idle), never a wrong
+            # response. Both flags off by default.
+            _force_ttl = None
+            if os.environ.get("HEADROOM_ADAPTIVE_TTL") == "1":
+                _force_ttl = prefix_tracker.recommended_ttl()
+            if (
+                _force_ttl is None
+                and os.environ.get("HR_SUBAGENT_TTL_5M") == "1"
+                and _is_subagent_request
+            ):
+                _force_ttl = "5m"
+            _norm = normalize_message_cache_control(optimized_messages, force_ttl=_force_ttl)
             if _norm is not optimized_messages:
                 optimized_messages = _norm
+                if _force_ttl:
+                    body_mutation_tracker.mark_mutated(f"adaptive_ttl_{_force_ttl}")
 
             # Guard: if "optimization" inflated tokens, revert to originals.
             # Skip in cache mode where prefix-stability may legitimately shift counts.

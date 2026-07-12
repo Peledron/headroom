@@ -1,0 +1,249 @@
+"""HR_SUBAGENT_TTL_5M: sub-agent detection + 5m message-prefix ttl override.
+
+Covers the deterministic sub-agent signal (system-head "[1m]" marker) and the
+force_ttl path in normalize_message_cache_control that downgrades a short-lived
+sub-agent's single message breakpoint from the client's 1h (2x write) to 5m
+(1.25x), while leaving the shared system/tools head untouched.
+"""
+
+from headroom.cache.prefix_tracker import (
+    _strip_cache_control,
+    normalize_message_cache_control,
+)
+from headroom.proxy.handlers.anthropic import (
+    _flatten_system_text,
+    _system_looks_subagent,
+)
+
+
+def _blk(role, text, ttl=None):
+    b = {"type": "text", "text": text}
+    if ttl is not None:
+        b["cache_control"] = {"type": "ephemeral", "ttl": ttl}
+    return {"role": role, "content": [b]}
+
+
+def _sole_ttl(messages):
+    ttls = [
+        b["cache_control"].get("ttl")
+        for m in messages
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and isinstance(b.get("cache_control"), dict)
+    ]
+    assert len(ttls) == 1, f"expected exactly one breakpoint, got {len(ttls)}"
+    return ttls[0]
+
+
+# ── force_ttl override in normalize_message_cache_control ─────────────────────
+
+def test_default_preserves_client_1h():
+    msgs = [_blk("user", "a", ttl="1h"), _blk("user", "b", ttl="1h")]
+    out = normalize_message_cache_control(msgs)
+    assert _sole_ttl(out) == "1h"  # long-lived main keeps 1h retention
+    assert _strip_cache_control(out) == _strip_cache_control(msgs)
+
+
+def test_force_5m_downgrades_client_1h():
+    msgs = [_blk("user", "a", ttl="1h"), _blk("user", "b", ttl="1h")]
+    out = normalize_message_cache_control(msgs, force_ttl="5m")
+    assert _sole_ttl(out) == "5m"  # sub-agent pays 1.25x, not 2x
+    # content is byte-identical; only the ttl knob changed
+    assert _strip_cache_control(out) == _strip_cache_control(msgs)
+
+
+def test_force_5m_when_client_sent_no_breakpoint():
+    msgs = [_blk("user", "a"), _blk("assistant", "b")]
+    out = normalize_message_cache_control(msgs, force_ttl="5m")
+    assert _sole_ttl(out) == "5m"
+
+
+def test_force_5m_idempotent_across_turns():
+    # A sub-agent forwards force_ttl every turn; the ttl stays 5m (byte-stable),
+    # so the rewrite never self-busts the growing prefix.
+    conv = []
+    for t in range(1, 6):
+        conv = conv + [_blk("user", f"turn-{t}", ttl="1h")]
+        conv = normalize_message_cache_control(conv, force_ttl="5m")
+        assert _sole_ttl(conv) == "5m"
+
+
+# ── sub-agent detection from the system head ──────────────────────────────────
+
+MODEL = "claude-opus-4-8"
+
+
+def test_main_1m_head_is_not_subagent():
+    system = [{"type": "text", "text": f"The exact model ID is {MODEL}[1m]."}]
+    assert _system_looks_subagent(system, MODEL) is False
+
+
+def test_bare_model_head_is_subagent():
+    system = [{"type": "text", "text": f"The exact model ID is {MODEL}."}]
+    assert _system_looks_subagent(system, MODEL) is True
+
+
+def test_non_claude_code_head_not_matched():
+    system = [{"type": "text", "text": "You are a helpful assistant."}]
+    assert _system_looks_subagent(system, MODEL) is False
+
+
+def test_string_system_head():
+    assert _system_looks_subagent(f"model {MODEL}[1m] here", MODEL) is False
+    assert _system_looks_subagent(f"model {MODEL} here", MODEL) is True
+
+
+def test_empty_and_missing():
+    assert _system_looks_subagent(None, MODEL) is False
+    assert _system_looks_subagent([], MODEL) is False
+    assert _system_looks_subagent("anything", None) is False
+
+
+def test_flatten_joins_blocks():
+    system = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    assert _flatten_system_text(system) == "a\nb"
+    assert _flatten_system_text("raw") == "raw"
+    assert _flatten_system_text(None) == ""
+
+
+# ── token-mode prefix-mutation gate ───────────────────────────────────────────
+
+from headroom.proxy.handlers.anthropic import _token_prefix_mutation_worth_it  # noqa: E402
+
+
+def test_warm_roomy_prefix_not_mutated():
+    # p_alive high (fresh cache), low context pressure -> re-writing a warm prefix
+    # loses (0.1x reads traded for 1.25-2x writes). Do not mutate.
+    assert _token_prefix_mutation_worth_it(context_pressure=0.30, p_alive=1.0) is False
+
+
+def test_near_lapse_prefix_mutated():
+    # cache about to expire: the write is coming regardless, so mutation is ~free.
+    assert _token_prefix_mutation_worth_it(context_pressure=0.30, p_alive=0.10) is True
+
+
+def test_high_pressure_prefix_mutated():
+    # near the context limit: compressing averts a forced overflow/compaction.
+    assert _token_prefix_mutation_worth_it(context_pressure=0.90, p_alive=1.0) is True
+
+
+def test_thresholds_are_boundaries():
+    assert _token_prefix_mutation_worth_it(context_pressure=0.85, p_alive=1.0) is True
+    assert _token_prefix_mutation_worth_it(context_pressure=0.84, p_alive=1.0) is False
+    assert _token_prefix_mutation_worth_it(context_pressure=0.0, p_alive=0.25) is True
+    assert _token_prefix_mutation_worth_it(context_pressure=0.0, p_alive=0.26) is False
+
+
+# ── adaptive TTL tier selection from observed inter-turn cadence ───────────────
+
+from headroom.cache.prefix_tracker import PrefixCacheTracker  # noqa: E402
+
+
+def _tracker_with_gaps(gaps):
+    t = PrefixCacheTracker("anthropic")
+    for g in gaps:
+        t.record_turn_gap(g)
+    return t
+
+
+def test_no_recommendation_without_history():
+    assert PrefixCacheTracker("anthropic").recommended_ttl() is None
+    assert _tracker_with_gaps([30.0]).recommended_ttl() is None  # need >= 2 samples
+
+
+def test_fast_cadence_picks_5m():
+    # all gaps well under the 5-min boundary (with the 60s margin -> 240s)
+    assert _tracker_with_gaps([20.0, 45.0, 90.0]).recommended_ttl() == "5m"
+
+
+def test_long_gap_picks_1h():
+    # a single breach past 5 min flips the session to 1h (decide on recent MAX)
+    assert _tracker_with_gaps([20.0, 400.0]).recommended_ttl() == "1h"
+
+
+def test_ambiguous_band_holds_previous():
+    t = _tracker_with_gaps([20.0, 30.0])  # -> 5m
+    assert t.recommended_ttl() == "5m"
+    t.record_turn_gap(270.0)  # in (240, 300] ambiguous band -> hold 5m
+    assert t.recommended_ttl() == "5m"
+    t.record_turn_gap(500.0)  # clear breach -> 1h
+    assert t.recommended_ttl() == "1h"
+
+
+def test_record_ignores_bad_values():
+    t = PrefixCacheTracker("anthropic")
+    t.record_turn_gap(None)
+    t.record_turn_gap(-5.0)
+    t.record_turn_gap(float("nan"))
+    t.record_turn_gap(float("inf"))
+    assert t.recommended_ttl() is None  # nothing valid recorded
+
+
+def test_ring_buffer_ages_out_old_gaps():
+    # maxlen 8: once eight fast gaps push an old long gap out, tier returns to 5m
+    t = _tracker_with_gaps([600.0] + [30.0] * 8)
+    assert t.recommended_ttl() == "5m"
+
+
+# ── ttl-aware net-cost calculation ────────────────────────────────────────────
+
+from headroom.transforms.compression_policy import (  # noqa: E402
+    policy_default_payg,
+    write_multiplier_for_ttl,
+)
+
+
+def test_write_multiplier_for_ttl():
+    assert write_multiplier_for_ttl("1h") == 2.0
+    assert write_multiplier_for_ttl("5m") == 1.25
+    assert write_multiplier_for_ttl(None) == 1.25
+    assert write_multiplier_for_ttl("bogus") == 1.25
+
+
+def test_break_even_reads_scales_with_tier():
+    p = policy_default_payg()
+    dt, s = 1000, 50000
+    be_5m = p.break_even_reads(dt, s)
+    be_1h = p.break_even_reads(dt, s, write_multiplier=2.0)
+    assert round(be_5m, 1) == round(11.5 * s / dt, 1)
+    assert round(be_1h, 1) == round(19.0 * s / dt, 1)
+    assert be_1h > be_5m  # a 1h bust needs more remaining reads to pay off
+
+
+def test_net_gain_charges_1h_more():
+    p = policy_default_payg()
+    # warm cache (p_alive=1), modest reads: busting a 1h suffix should score
+    # strictly worse (lower gain) than a 5m one for the same mutation.
+    args = dict(delta_t=2000, suffix_tokens=50000, expected_reads=10.0, p_alive=1.0)
+    g_5m = p.net_mutation_gain(**args)
+    g_1h = p.net_mutation_gain(**args, write_multiplier=2.0)
+    assert g_1h < g_5m
+
+
+def test_default_multiplier_unchanged():
+    p = policy_default_payg()
+    args = dict(delta_t=2000, suffix_tokens=50000, expected_reads=10.0, p_alive=1.0)
+    assert p.net_mutation_gain(**args) == p.net_mutation_gain(**args, write_multiplier=1.25)
+
+
+# ── broadened sub-agent detection: "no [1m] marker" ───────────────────────────
+
+from headroom.proxy.handlers.anthropic import _system_lacks_1m_marker  # noqa: E402
+
+
+def test_lacks_1m_marker_main_session_false():
+    # main 1M session carries <id>[1m] -> not a sub-agent
+    assert _system_lacks_1m_marker([{"type": "text", "text": "model claude-opus-4-8[1m]."}]) is False
+    assert _system_lacks_1m_marker("...claude-opus-4-8[1m]...") is False
+
+
+def test_lacks_1m_marker_subagent_true_even_without_model_id():
+    # the gap case the A/B exposed: sub-agent head with NO model id and no [1m]
+    assert _system_lacks_1m_marker([{"type": "text", "text": "You are a subagent."}]) is True
+    assert _system_lacks_1m_marker("some system prompt without the marker") is True
+
+
+def test_lacks_1m_marker_empty_is_false():
+    assert _system_lacks_1m_marker(None) is False
+    assert _system_lacks_1m_marker([]) is False
+    assert _system_lacks_1m_marker("") is False

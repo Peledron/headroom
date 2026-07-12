@@ -60,10 +60,46 @@ _MAX_LOSSY_RATIO_SUBSCRIPTION: float = 0.25
 #: net-cost mutation formula (#856). Mirrors the Rust ``pub const``.
 CACHE_WRITE_MULTIPLIER: float = 1.25
 
+#: Anthropic prompt-cache write multiplier for the 1-hour TTL tier: a
+#: ``cache_creation`` token in the extended-cache-ttl breakpoint costs 2x a
+#: plain input token. A mutation that busts a suffix cached at 1h therefore
+#: wastes 2x, not 1.25x, so the break-even needs ~65% more remaining reads
+#: than the 5m tier. Selected per call via ``write_multiplier_for_ttl``.
+CACHE_WRITE_MULTIPLIER_1H: float = 2.0
+
 #: Anthropic prompt-cache read multiplier: a ``cache_read`` token costs
 #: 0.1x a plain input token. Input to the net-cost mutation formula
 #: (#856). Mirrors the Rust ``pub const``.
 CACHE_READ_MULTIPLIER: float = 0.1
+
+
+def _clamp_write_multiplier(write_multiplier: float | None) -> float:
+    """Resolve the write multiplier, clamping absurd inputs to a real tier.
+
+    ``None`` selects the 5-minute default. Otherwise the value is clamped to the
+    two real Anthropic tiers ``[1.25, 2.0]``: a value at or below zero would
+    invert the sign of the ``(w - r)`` penalty term and force a busting admit, so
+    it must never reach the formula. NaN is passed through untouched so the
+    downstream ``isnan`` guard fails the decision closed (no admit).
+    """
+    if write_multiplier is None:
+        return CACHE_WRITE_MULTIPLIER
+    if math.isnan(write_multiplier):
+        return write_multiplier
+    return min(max(write_multiplier, CACHE_WRITE_MULTIPLIER), CACHE_WRITE_MULTIPLIER_1H)
+
+
+def write_multiplier_for_ttl(ttl: str | None) -> float:
+    """Cache-write multiplier for a breakpoint's TTL tier.
+
+    Anthropic prices the two ephemeral tiers differently: the 1-hour
+    (extended) tier writes at 2x a plain input token, the 5-minute (default)
+    tier at 1.25x. The net-cost gate must charge the tier of the suffix it
+    would invalidate, or it under-counts the cost of busting a 1h cache by
+    ~60%. Anything other than the literal ``"1h"`` (including ``"5m"`` and
+    ``None``) uses the default 5-minute multiplier.
+    """
+    return CACHE_WRITE_MULTIPLIER_1H if ttl == "1h" else CACHE_WRITE_MULTIPLIER
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,10 +165,17 @@ class CompressionPolicy:
         suffix_tokens: int,
         expected_reads: float,
         p_alive: float,
+        write_multiplier: float | None = None,
     ) -> float:
         """Net gain (in plain-input-token cost units) of a mutation that
         removes ``delta_t`` tokens from a message whose cached suffix is
         ``suffix_tokens`` long (#856).
+
+        ``write_multiplier`` overrides ``w`` with the actual TTL tier of the
+        cache being written/invalidated (``write_multiplier_for_ttl``): 2.0 for
+        the 1-hour tier, 1.25 (the default when ``None``) for 5-minute. Charging
+        the true tier is load-bearing, a mutation that busts a 1h suffix costs
+        2x, so its break-even sits ~65% deeper than the 5m formula assumed.
 
         Mirrors ``CompressionPolicy::net_mutation_gain`` in the Rust
         crate (source of truth — see its docstring for the derivation)::
@@ -149,7 +192,7 @@ class CompressionPolicy:
         ``>= 0`` (NaN → 0), ``p_alive`` to ``[0, 1]`` (NaN → 1, the
         conservative full-penalty assumption — same as Rust).
         """
-        w = CACHE_WRITE_MULTIPLIER
+        w = _clamp_write_multiplier(write_multiplier)
         r = CACHE_READ_MULTIPLIER
         dt = max(0, delta_t)
         suffix = max(0, suffix_tokens)
@@ -165,19 +208,32 @@ class CompressionPolicy:
         suffix_tokens: int,
         expected_reads: float,
         p_alive: float,
+        write_multiplier: float | None = None,
     ) -> bool:
         """Decision form of :meth:`net_mutation_gain`: mutate iff the
         gain is strictly positive."""
-        return self.net_mutation_gain(delta_t, suffix_tokens, expected_reads, p_alive) > 0.0
+        return (
+            self.net_mutation_gain(
+                delta_t, suffix_tokens, expected_reads, p_alive, write_multiplier
+            )
+            > 0.0
+        )
 
-    def break_even_reads(self, delta_t: int, suffix_tokens: int) -> float:
+    def break_even_reads(
+        self,
+        delta_t: int,
+        suffix_tokens: int,
+        write_multiplier: float | None = None,
+    ) -> float:
         """Remaining-read count at which a warm-cache (``p_alive=1``)
         mutation breaks even::
 
             R = ((w - r) / r) * (S/dT)   = 11.5 * S/dT  (Anthropic 5-min)
+                                        = 19.0 * S/dT  (Anthropic 1-hour)
 
         With the corrected penalty this reproduces the #856 anchors
-        exactly: 2K/50K -> 287.5, 50K/10K -> 2.3.
+        exactly: 2K/50K -> 287.5, 50K/10K -> 2.3 (at the 5m tier).
+        ``write_multiplier`` selects the tier (1h roughly ``19 * S/dT``).
 
         Returns 0 when ``delta_t`` is ``<= 0`` (no savings — callers
         gate on ``delta_t > 0``; the Rust signature takes ``u32``).
@@ -185,7 +241,7 @@ class CompressionPolicy:
         """
         if delta_t <= 0:
             return 0.0
-        w = CACHE_WRITE_MULTIPLIER
+        w = _clamp_write_multiplier(write_multiplier)
         r = CACHE_READ_MULTIPLIER
         return ((w - r) / r) * (float(max(0, suffix_tokens)) / float(delta_t))
 

@@ -20,7 +20,9 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -314,6 +316,8 @@ def overlay_cached_prefix(
 
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
+    *,
+    force_ttl: str | None = None,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -332,9 +336,26 @@ def normalize_message_cache_control(
     ``messages`` and are left untouched (they still count toward the 4 limit, so
     holding messages to one breakpoint leaves room for them).
 
+    ``force_ttl`` overrides the ttl written onto that single re-placed breakpoint.
+    The default (None) preserves the client's ttl (see ``kept_ttl`` below), which
+    is right for a long-lived main session that may idle past 5 minutes. A caller
+    that knows the request is short-lived and non-resuming (a Claude Code
+    sub-agent, measured median ~3 min) passes ``force_ttl="5m"`` so the
+    message-prefix writes land in the 1.25x tier instead of the 2x 1h tier the
+    client would otherwise pay for retention the sub-agent never uses. ttl is a
+    pure retention/cost knob and the provider keys the cache on content not ttl,
+    so this only changes write price and retention, never the response or a hit.
+
     Only block-style (list) content can carry cache_control; string content is
     left as-is. Returns the input unchanged when there is nothing to normalize.
     """
+    # Anthropic accepts only "5m"/"1h" as a ttl; forwarding anything else 400s
+    # the live request. force_ttl is a cost knob, never a correctness lever, so
+    # an unrecognized value is ignored (fall back to the client's kept_ttl)
+    # rather than propagated. "" is not a pass-through for "provider default"
+    # here; it is treated as unset.
+    if force_ttl not in ("5m", "1h", None):
+        force_ttl = None
     changed = False
     out: list[dict[str, Any]] = []
     last_block_idx = -1
@@ -368,8 +389,9 @@ def normalize_message_cache_control(
         msg = out[last_block_idx]
         content = list(msg["content"])
         replaced_cc: dict[str, Any] = {"type": "ephemeral"}
-        if kept_ttl:
-            replaced_cc["ttl"] = kept_ttl
+        _ttl = force_ttl if force_ttl is not None else kept_ttl
+        if _ttl:
+            replaced_cc["ttl"] = _ttl
         content[-1] = {**content[-1], "cache_control": replaced_cc}
         out[last_block_idx] = {**msg, "content": content}
         changed = True
@@ -404,6 +426,12 @@ class PrefixCacheTracker:
         self._last_activity: float = time.time()
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
+        # Recent observed inter-turn gaps (seconds between this session's
+        # successive requests), for adaptive cache-TTL tier selection. A short,
+        # bounded ring: only the recent cadence matters and old gaps should age
+        # out. Fed by the handler with the pre-refresh idle gap each turn.
+        self._turn_gaps: deque[float] = deque(maxlen=8)
+        self._ttl_recommendation: str | None = None
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -427,6 +455,63 @@ class PrefixCacheTracker:
         if self._cached_token_count < self.config.min_cached_tokens:
             return 0
         return self._cached_message_count
+
+    def record_turn_gap(self, gap_seconds: float | None) -> None:
+        """Record the observed gap since this session's previous request.
+
+        The handler peeks the idle gap BEFORE ``get_or_create`` refreshes
+        ``_last_activity``, so ``gap_seconds`` is the real request-to-request
+        cadence (assistant generation time plus user think time), which is
+        exactly what decides whether the prompt cache is still warm when the
+        next request lands. ``None`` (unknown session, first turn) and
+        non-finite/negative values are ignored.
+        """
+        # Reject None and bool (a bool is an int subclass, so `float(True)` is a
+        # silent 1.0 that would poison the cadence with a flag mistaken for a
+        # duration). OverflowError covers a Python int too large for a float.
+        if gap_seconds is None or isinstance(gap_seconds, bool):
+            return
+        try:
+            g = float(gap_seconds)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not math.isfinite(g) or g < 0.0:
+            return
+        self._turn_gaps.append(g)
+
+    def recommended_ttl(
+        self,
+        *,
+        tier_boundary_seconds: float = 300.0,
+        margin_seconds: float = 60.0,
+    ) -> str | None:
+        """Pick the cheaper cache TTL tier this session can safely use.
+
+        Anthropic sells exactly two ephemeral tiers: 5m (1.25x write) and 1h
+        (2x write). The 1h premium only pays off when a gap between requests
+        exceeds 5 minutes, so a fast-cadence session (the common case, measured
+        median ~3 min per sub-agent turn) that pins 1h burns the 2x premium for
+        retention it never uses. This reads the session's recent inter-turn gaps
+        and returns ``"5m"`` when the cadence stays safely inside the 5-minute
+        window, ``"1h"`` when a recent gap has already breached it, or ``None``
+        when there is not enough history (or the cadence sits in the ambiguous
+        band) to change the client's own choice.
+
+        The decision is on the recent MAX gap, not the mean: the risk is a single
+        long idle lapsing a 5m cache, so one breach flips the session back to 1h.
+        ``margin_seconds`` keeps a safety buffer below the 5-minute boundary, and
+        a one-tier hysteresis (the ambiguous band holds the last recommendation)
+        stops the tier from flapping turn to turn.
+        """
+        if len(self._turn_gaps) < 2:
+            return None
+        recent_max = max(self._turn_gaps)
+        if recent_max <= tier_boundary_seconds - margin_seconds:
+            self._ttl_recommendation = "5m"
+        elif recent_max > tier_boundary_seconds:
+            self._ttl_recommendation = "1h"
+        # else: ambiguous band -> keep the previous recommendation (hysteresis).
+        return self._ttl_recommendation
 
     def update_from_response(
         self,
