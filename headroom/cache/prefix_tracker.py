@@ -432,6 +432,14 @@ class PrefixCacheTracker:
         # out. Fed by the handler with the pre-refresh idle gap each turn.
         self._turn_gaps: deque[float] = deque(maxlen=8)
         self._ttl_recommendation: str | None = None
+        # Token-mode cost-aware prefix gate state. Once the break-even math
+        # decides to compress this session, it latches on: pressure and expected
+        # reads only grow, so re-deciding every turn could flip compressed back to
+        # original and bust the compressed cache. ``_last_compression_kept`` is the
+        # fraction of tokens the last compression KEPT (after/before), used to
+        # estimate the next turn's saving before actually running compression.
+        self._compress_latched: bool = False
+        self._last_compression_kept: float | None = None
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -512,6 +520,57 @@ class PrefixCacheTracker:
             self._ttl_recommendation = "1h"
         # else: ambiguous band -> keep the previous recommendation (hysteresis).
         return self._ttl_recommendation
+
+    @property
+    def compress_latched(self) -> bool:
+        """Whether the cost gate has already committed this session to compress."""
+        return self._compress_latched
+
+    def latch_compress(self) -> None:
+        """Commit this session to compression for the rest of its life.
+
+        The break-even inputs (expected reads, context pressure) only grow, so a
+        session that crosses into "compress" never economically returns to
+        "forward original". Latching makes that explicit and prevents an
+        oscillation that would bust the compressed cache.
+        """
+        self._compress_latched = True
+
+    def note_compression(self, tokens_before: int, tokens_after: int) -> None:
+        """Record the fraction of tokens the last compression kept.
+
+        Feeds ``recent_compression_ratio`` so the next turn's break-even can
+        estimate its saving without first running compression. Ignores
+        non-positive or inflating results (nothing learned from them).
+        """
+        if (
+            math.isfinite(tokens_before)
+            and math.isfinite(tokens_after)
+            and tokens_before > 0
+            and 0 < tokens_after <= tokens_before
+        ):
+            self._last_compression_kept = tokens_after / tokens_before
+
+    def recent_compression_ratio(self, default: float = 0.8) -> float:
+        """Fraction of tokens compression is expected to KEEP (after/before).
+
+        Returns the last observed ratio, or ``default`` before any compression
+        has run. ``1 - ratio`` is the estimated saving fraction the cost gate
+        applies to the current token count.
+        """
+        return self._last_compression_kept if self._last_compression_kept is not None else default
+
+    def cached_token_count(self) -> int:
+        """Tokens the provider currently has cached for this session's prefix.
+
+        This is the suffix a fresh compression would invalidate, i.e. the S term
+        in the net-cost break-even.
+        """
+        return self._cached_token_count
+
+    def turn_number(self) -> int:
+        """Turns seen so far, a proxy for expected remaining reads of the cache."""
+        return self._turn_number
 
     def update_from_response(
         self,

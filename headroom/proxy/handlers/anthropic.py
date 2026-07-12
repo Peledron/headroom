@@ -112,22 +112,31 @@ def _system_looks_subagent(system: Any, model_id: Any) -> bool:
     return re.search(r"(?<![a-z0-9\-])" + esc + r"(?![a-z0-9\-])", text) is not None
 
 
-def _system_lacks_1m_marker(system: Any) -> bool:
-    """True when a non-empty system head carries NO ``[1m]`` 1M-context marker.
+def _system_lacks_1m_marker(system: Any, model_id: Any = None) -> bool:
+    """True when the system head does NOT render the main 1M model-id marker.
 
-    Broader than ``_system_looks_subagent`` (which also requires the model id to
-    appear in the head). In a Claude Code deployment using the ``--context-1m``
-    wrap, the main session's model-id line always renders ``<id>[1m]``, so a
-    non-empty head WITHOUT any ``[1m]`` marker is a sub-agent or a short non-1M
-    session. Used to gate the cache-safe sub-agent freeze: the A/B measured that
-    some sub-agents carry a system head that does not name the model id, so the
-    stricter detector missed them and they busted under token compression. A
-    false positive here (a main session that dropped ``[1m]`` after a 429) only
-    forwards the original prefix, which is a cache hit, never a wrong response,
-    and it self-corrects once ``HR_FORCE_BETA`` restores the marker.
+    In a Claude Code deployment using the ``--context-1m`` wrap, the main
+    session's model-id line renders ``<model_id>[1m]``; a sub-agent renders the
+    bare id or omits it. This anchors on that exact ``<model_id>[1m]`` pattern
+    rather than a bare ``[1m]`` substring, so a sub-agent whose own system text
+    merely QUOTES ``[1m]`` (referencing the main model id in docs or task
+    instructions) is NOT misclassified as the main session and correctly freezes
+    (a breaker found the bare-substring form let such sub-agents escape the
+    freeze and bust). Broader than ``_system_looks_subagent`` in that it does not
+    require the id to appear as a standalone token, only that the ``<id>[1m]``
+    rendering is ABSENT. When ``model_id`` is missing it falls back to bare
+    ``[1m]`` absence. A false positive (a main session rendering a different id,
+    a marker split across blocks, or a 429-dropped ``[1m]``) only forwards the
+    original prefix, a cache hit, never a wrong response.
     """
     text = _flatten_system_text(system)
-    return bool(text) and "[1m]" not in text
+    if not text:
+        return False
+    if not isinstance(model_id, str) or not model_id:
+        return "[1m]" not in text
+    import re
+
+    return re.search(re.escape(model_id) + r"\[1m\]", text) is None
 
 
 def _token_prefix_mutation_worth_it(
@@ -813,7 +822,7 @@ class AnthropicHandlerMixin:
             # the model id from their head, so the stricter _system_looks_subagent
             # missed them and they busted). Drives both the 5m ttl prior and the
             # token-mode sub-agent freeze below.
-            _is_subagent_request = _system_lacks_1m_marker(body.get("system"))
+            _is_subagent_request = _system_lacks_1m_marker(body.get("system"), model)
             messages = body.get("messages", [])
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
@@ -1406,6 +1415,77 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] SUBAGENT_FREEZE: token-mode sub-agent "
                                 "-> forwarding original to preserve the cached head"
                             )
+                        # HR_TOKEN_PREFIX_GATE (2026-07-12): cost-aware decision on
+                        # whether to compress the prefix this turn or forward it
+                        # original. Compressing busts the cached prefix once, so it
+                        # only pays when the per-turn read savings amortize that bust
+                        # over the session's expected remaining reads. This calls the
+                        # SAME net_mutation_gain break-even the frozen-unlock gate uses,
+                        # with this session's numbers: estimated saving dT (from the
+                        # last compression ratio), the cached suffix S it would
+                        # invalidate, expected reads R (turns so far, a lower bound on
+                        # reads ahead), the tier-aware write multiplier w (from the
+                        # adaptive TTL), and an idle-derived p_alive. A pressure override
+                        # still compresses near the context limit, because averting a
+                        # forced compaction is worth more than the bust and the pure
+                        # cache math does not see it. Once it decides to compress it
+                        # latches: pressure and reads only grow, so re-deciding could
+                        # flip back to original and bust the compressed cache. Off by
+                        # default.
+                        if (
+                            os.environ.get("HR_TOKEN_PREFIX_GATE") == "1"
+                            and not skip_ccr_request_compression
+                            and not prefix_tracker.compress_latched
+                            and context_limit
+                        ):
+                            from headroom.transforms.compression_policy import (
+                                write_multiplier_for_ttl,
+                            )
+
+                            _kept = prefix_tracker.recent_compression_ratio()
+                            _est_dt = max(0, int(original_tokens * (1.0 - _kept)))
+                            _S = prefix_tracker.cached_token_count()
+                            try:
+                                _R = float(
+                                    os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0
+                                )
+                            except ValueError:
+                                _R = 10.0
+                            _ttl = prefix_tracker.recommended_ttl() or "5m"
+                            _w = write_multiplier_for_ttl(_ttl)
+                            _ttl_s = 3600.0 if _ttl == "1h" else 300.0
+                            _p_alive = max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s)
+                            _gain = compression_policy.net_mutation_gain(
+                                _est_dt, _S, _R, _p_alive, _w
+                            )
+                            try:
+                                _thr = float(
+                                    os.environ.get("HR_TOKEN_PRESSURE_THRESHOLD", "") or 0.85
+                                )
+                            except ValueError:
+                                _thr = 0.85
+                            _pressure = original_tokens / context_limit
+                            _floor = 0.5
+                            # Latch is irreversible and the dT/R estimate is noisy, so
+                            # never commit a ROOMY session to compression on the estimate
+                            # alone (a bad sample would lock it into net-negative
+                            # compression). Require the context to be at least half full
+                            # for the cost path; the pressure override still forces a
+                            # compress near the limit to avert a compaction.
+                            if (_pressure >= _floor and _gain > 0.0) or _pressure >= _thr:
+                                prefix_tracker.latch_compress()
+                                logger.info(
+                                    f"[{request_id}] TOKEN_PREFIX_GATE: compress "
+                                    f"(gain={_gain:.0f} pressure={_pressure:.2f} R={_R:.0f} "
+                                    f"dT~{_est_dt} S={_S} w={_w:.2f}); latched"
+                                )
+                            else:
+                                skip_ccr_request_compression = True
+                                logger.info(
+                                    f"[{request_id}] TOKEN_PREFIX_GATE: forward original "
+                                    f"(gain={_gain:.0f}<=0 pressure={_pressure:.2f}<{_thr:.2f}); "
+                                    "compression does not yet pay"
+                                )
                         if skip_ccr_request_compression:
                             logger.info(
                                 f"[{request_id}] CCR: skipping request-side compression "
@@ -1495,6 +1575,10 @@ class AnthropicHandlerMixin:
                             # request) is paid once per request and is dwarfed by
                             # the upstream call latency.
                             optimized_tokens = tokenizer.count_messages(optimized_messages)
+                            # Feed the observed compression ratio back so the cost
+                            # gate's next-turn saving estimate self-corrects off real
+                            # data instead of the static prior.
+                            prefix_tracker.note_compression(original_tokens, optimized_tokens)
                     elif not is_cache_mode(self.config.mode):
                         skip_ccr_request_compression = should_skip_ccr_request_compression(
                             frozen_message_count
@@ -1504,41 +1588,7 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] CCR: skipping request-side compression "
                                 f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
                             )
-                        # HEADROOM_TOKEN_PREFIX_GATE (2026-07-12, local fork): aggressive
-                        # token-mode compression changes the message count, which breaks
-                        # overlay_cached_prefix's 1:1 replay guard, so the prefix re-writes
-                        # EVERY turn (measured 12 busts / 8 min) instead of amortizing to one.
-                        # That trades 0.1x reads for 1.25-2x writes and loses on a warm
-                        # cache. Only mutate when the prefix is near lapse (write is coming
-                        # anyway) or context pressure is high (compression averts an overflow);
-                        # otherwise forward the original so it stays a hit. Off by default so
-                        # live token-mode behaviour is unchanged until canary-validated.
-                        _token_mutate = True
-                        if os.environ.get("HEADROOM_TOKEN_PREFIX_GATE") == "1":
-                            try:
-                                _ttl_s = float(
-                                    os.environ.get("HEADROOM_TOKEN_PREFIX_TTL_S", "") or 300.0
-                                )
-                                _p_alive = (
-                                    max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s)
-                                    if _ttl_s > 0
-                                    else 0.0
-                                )
-                                _pressure = (
-                                    original_tokens / context_limit if context_limit else 0.0
-                                )
-                                _token_mutate = _token_prefix_mutation_worth_it(
-                                    context_pressure=_pressure, p_alive=_p_alive
-                                )
-                                if not _token_mutate:
-                                    logger.info(
-                                        f"[{request_id}] TOKEN_PREFIX_GATE: warm prefix "
-                                        f"(p_alive={_p_alive:.2f} pressure={_pressure:.2f}); "
-                                        "forwarding original to preserve cache"
-                                    )
-                            except Exception:
-                                logger.warning("TOKEN_PREFIX_GATE failed", exc_info=True)
-                        if not skip_ccr_request_compression and _token_mutate:
+                        if not skip_ccr_request_compression:
                             async with stage_timer.measure("compression_first_stage"):
                                 result = await self._run_compression_in_executor(
                                     lambda: self.anthropic_pipeline.apply(

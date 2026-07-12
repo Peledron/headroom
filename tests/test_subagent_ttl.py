@@ -233,17 +233,86 @@ from headroom.proxy.handlers.anthropic import _system_lacks_1m_marker  # noqa: E
 
 def test_lacks_1m_marker_main_session_false():
     # main 1M session carries <id>[1m] -> not a sub-agent
-    assert _system_lacks_1m_marker([{"type": "text", "text": "model claude-opus-4-8[1m]."}]) is False
-    assert _system_lacks_1m_marker("...claude-opus-4-8[1m]...") is False
+    assert _system_lacks_1m_marker([{"type": "text", "text": "model claude-opus-4-8[1m]."}], "claude-opus-4-8") is False
+    assert _system_lacks_1m_marker("...claude-opus-4-8[1m]...", "claude-opus-4-8") is False
 
 
 def test_lacks_1m_marker_subagent_true_even_without_model_id():
     # the gap case the A/B exposed: sub-agent head with NO model id and no [1m]
-    assert _system_lacks_1m_marker([{"type": "text", "text": "You are a subagent."}]) is True
-    assert _system_lacks_1m_marker("some system prompt without the marker") is True
+    assert _system_lacks_1m_marker([{"type": "text", "text": "You are a subagent."}], "claude-opus-4-8") is True
+    assert _system_lacks_1m_marker("some system prompt without the marker", "claude-opus-4-8") is True
 
 
 def test_lacks_1m_marker_empty_is_false():
-    assert _system_lacks_1m_marker(None) is False
-    assert _system_lacks_1m_marker([]) is False
-    assert _system_lacks_1m_marker("") is False
+    assert _system_lacks_1m_marker(None, "claude-opus-4-8") is False
+    assert _system_lacks_1m_marker([], "claude-opus-4-8") is False
+    assert _system_lacks_1m_marker("", "claude-opus-4-8") is False
+
+
+def test_lacks_1m_subagent_quoting_marker_still_frozen():
+    # a sub-agent that merely QUOTES [1m] (no <model>[1m] rendering) is still a sub-agent
+    sys = [{"type": "text", "text": "The main model id is claude-opus-4-8[1m], but you are a helper."}]
+    # exact <model>[1m] present -> looks like main (rare paste case)
+    assert _system_lacks_1m_marker(sys, "claude-opus-4-8") is False
+    sys2 = [{"type": "text", "text": "Note: the 1M marker is written [1m] in the id line."}]
+    # generic [1m] mention, no <model>[1m] -> still a sub-agent, gets frozen
+    assert _system_lacks_1m_marker(sys2, "claude-opus-4-8") is True
+
+
+# ── cost-aware prefix gate: tracker state + break-even decision ────────────────
+
+from headroom.transforms.compression_policy import (  # noqa: E402
+    write_multiplier_for_ttl as _wmt,
+)
+
+
+def test_compress_latch_and_ratio_tracking():
+    t = PrefixCacheTracker("anthropic")
+    assert t.compress_latched is False
+    assert t.recent_compression_ratio() == 0.8  # prior before any compression
+    t.note_compression(1000, 700)  # kept 70%
+    assert abs(t.recent_compression_ratio() - 0.7) < 1e-9
+    t.note_compression(1000, 0)  # non-positive after -> ignored
+    t.note_compression(1000, 1200)  # inflation -> ignored
+    assert abs(t.recent_compression_ratio() - 0.7) < 1e-9
+    t.latch_compress()
+    assert t.compress_latched is True
+
+
+def _gate_decision(policy, *, orig, cached, kept, R, ttl, idle):
+    """Replicate the handler gate's break-even to test the decision boundary."""
+    est_dt = max(0, int(orig * (1.0 - kept)))
+    w = _wmt(ttl)
+    ttl_s = 3600.0 if ttl == "1h" else 300.0
+    p_alive = max(0.0, 1.0 - idle / ttl_s)
+    gain = policy.net_mutation_gain(est_dt, cached, R, p_alive, w)
+    return gain
+
+
+def test_short_warm_session_does_not_compress():
+    p = policy_default_payg()
+    # few expected reads, warm cache, whole prefix cached: busting it loses
+    g = _gate_decision(p, orig=50000, cached=48000, kept=0.8, R=10, ttl="5m", idle=0)
+    assert g <= 0.0  # forward original
+
+
+def test_long_warm_session_compresses():
+    p = policy_default_payg()
+    # many expected reads amortize the one-time bust -> compress
+    g = _gate_decision(p, orig=50000, cached=48000, kept=0.8, R=400, ttl="5m", idle=0)
+    assert g > 0.0
+
+
+def test_ttl_lapsed_cache_makes_compression_free():
+    p = policy_default_payg()
+    # idle beyond the 5m tier -> p_alive 0 -> no bust penalty -> compress even short
+    g = _gate_decision(p, orig=50000, cached=48000, kept=0.8, R=10, ttl="5m", idle=600)
+    assert g > 0.0
+
+
+def test_1h_tier_charges_more_so_needs_more_reads():
+    p = policy_default_payg()
+    # same session, 1h tier (w=2.0) is more conservative than 5m (w=1.25)
+    g_5m = _gate_decision(p, orig=50000, cached=48000, kept=0.8, R=120, ttl="5m", idle=0)
+    g_1h = _gate_decision(p, orig=50000, cached=48000, kept=0.8, R=120, ttl="1h", idle=0)
+    assert g_1h < g_5m
