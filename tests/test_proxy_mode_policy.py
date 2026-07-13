@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from headroom.proxy.proxy_mode_policy import (
     PROXY_MODE_CACHE,
+    PROXY_MODE_HYBRID,
     PROXY_MODE_TOKEN,
     normalize_proxy_mode_decision,
     normalize_proxy_mode_value,
@@ -21,6 +22,10 @@ def test_decision_normalizes_canonical_modes() -> None:
     assert cache.alias_used is False
     assert cache.unknown is False
 
+    hybrid = normalize_proxy_mode_decision("hybrid")
+    assert hybrid.normalized == PROXY_MODE_HYBRID
+    assert hybrid.alias_used is False
+
 
 def test_decision_normalizes_aliases_and_marks_alias_used() -> None:
     token = normalize_proxy_mode_decision(" token_headroom ")
@@ -31,6 +36,10 @@ def test_decision_normalizes_aliases_and_marks_alias_used() -> None:
     cache = normalize_proxy_mode_decision("cost_savings")
     assert cache.normalized == PROXY_MODE_CACHE
     assert cache.alias_used is True
+
+    hybrid = normalize_proxy_mode_decision("cache_hybrid")
+    assert hybrid.normalized == PROXY_MODE_HYBRID
+    assert hybrid.alias_used is True
 
 
 def test_decision_uses_default_for_blank_mode() -> None:

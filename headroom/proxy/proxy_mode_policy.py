@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 PROXY_MODE_TOKEN = "token"
 PROXY_MODE_CACHE = "cache"
+PROXY_MODE_HYBRID = "hybrid"
 
 MODE_ALIASES = {
     "token": PROXY_MODE_TOKEN,
@@ -15,6 +16,9 @@ MODE_ALIASES = {
     "cache": PROXY_MODE_CACHE,
     "cache_mode": PROXY_MODE_CACHE,
     "cost_savings": PROXY_MODE_CACHE,
+    "hybrid": PROXY_MODE_HYBRID,
+    "hybrid_mode": PROXY_MODE_HYBRID,
+    "cache_hybrid": PROXY_MODE_HYBRID,
 }
 
 

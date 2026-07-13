@@ -65,6 +65,115 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _flatten_system_text(system: Any) -> str:
+    """Join the text of an Anthropic ``system`` field (str or block list)."""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts = [
+            block["text"]
+            for block in system
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(parts)
+    return ""
+
+
+def _system_looks_subagent(system: Any, model_id: Any) -> bool:
+    """Detect a Claude Code SUB-AGENT request from its system head.
+
+    Headroom's ``claude ... --context-1m`` wrap sets ``ANTHROPIC_MODEL=<id>[1m]``
+    on the main process, so Claude Code renders the model-id line in the system
+    prompt as ``<id>[1m]`` for the main agent. Sub-agents spawned by the Task
+    tool run WITHOUT the 1M beta, so their model-id line renders the bare ``<id>``
+    (the same signal HR_CANON_MODEL_ID keys off). This returns True only for a
+    Claude-Code-shaped head — the sanitized model id appears in the system text —
+    that carries no ``<id>[1m]`` marker, so non-Claude-Code traffic (no model id
+    in the head) and the main 1M session (``<id>[1m]`` present) are never matched.
+    Detection is a pure cost signal for TTL selection: a false positive only
+    mis-prices a cache write, never changes a response.
+    """
+    if not isinstance(model_id, str) or not model_id:
+        return False
+    text = _flatten_system_text(system)
+    if not text:
+        return False
+    import re
+
+    esc = re.escape(model_id)
+    # A model id present anywhere with the 1M marker means the main session.
+    if re.search(esc + r"\[1m\]", text):
+        return False
+    # Sub-agent iff the EXACT id appears as a complete token (not merely a
+    # prefix of a longer id) with no 1M marker. The boundary guards prevent a
+    # short family id (e.g. "claude-opus-4") from matching inside a longer
+    # rendered id ("claude-opus-4-8[1m]") and misclassifying a main session as
+    # a sub-agent, since Anthropic model ids are literal prefixes of each other.
+    return re.search(r"(?<![a-z0-9\-])" + esc + r"(?![a-z0-9\-])", text) is not None
+
+
+def _system_lacks_1m_marker(system: Any, model_id: Any = None) -> bool:
+    """True when the system head does NOT render the main 1M model-id marker.
+
+    In a Claude Code deployment using the ``--context-1m`` wrap, the main
+    session's model-id line renders ``<model_id>[1m]``; a sub-agent renders the
+    bare id or omits it. This anchors on that exact ``<model_id>[1m]`` pattern
+    rather than a bare ``[1m]`` substring, so a sub-agent whose own system text
+    merely QUOTES ``[1m]`` (referencing the main model id in docs or task
+    instructions) is NOT misclassified as the main session and correctly freezes
+    (a breaker found the bare-substring form let such sub-agents escape the
+    freeze and bust). Broader than ``_system_looks_subagent`` in that it does not
+    require the id to appear as a standalone token, only that the ``<id>[1m]``
+    rendering is ABSENT. When ``model_id`` is missing it falls back to bare
+    ``[1m]`` absence. A false positive (a main session rendering a different id,
+    a marker split across blocks, or a 429-dropped ``[1m]``) only forwards the
+    original prefix, a cache hit, never a wrong response.
+    """
+    text = _flatten_system_text(system)
+    if not text:
+        return False
+    if not isinstance(model_id, str) or not model_id:
+        return "[1m]" not in text
+    import re
+
+    return re.search(re.escape(model_id) + r"\[1m\]", text) is None
+
+
+def _token_prefix_mutation_worth_it(
+    *,
+    context_pressure: float,
+    p_alive: float,
+    pressure_threshold: float = 0.85,
+    p_alive_floor: float = 0.25,
+) -> bool:
+    """Whether aggressively mutating a warm cached prefix pays in token mode.
+
+    Aggressive (message-count-changing) token-mode compression cannot use the
+    position-based ``overlay_cached_prefix`` replay: that guard requires one
+    forwarded message per original (line ~294), and dropping/merging messages
+    breaks it, so the prefix re-writes EVERY turn instead of amortizing to one
+    bust (measured 12 busts / 8 min, IMPROVEMENTS.md). Re-writing a warm prefix
+    trades 0.1x cache reads for 1.25-2x writes and loses in steady state. It only
+    pays in two regimes, both captured by signals the request already carries:
+
+    - ``p_alive`` at/under ``p_alive_floor``: the cached prefix is about to lapse
+      (long idle relative to the cache TTL), so the write is coming regardless and
+      the mutation is close to free.
+    - ``context_pressure`` at/over ``pressure_threshold``: the context is near the
+      model limit, so NOT compressing forces an overflow or a client-side
+      compaction that costs more than the one bust.
+
+    Returns False otherwise, meaning token mode should leave the prefix untouched
+    (a cache hit) rather than pay repeated write premiums for a warm cache. This
+    is why ``_net_cost_allows`` reads flat-zero on a warm token-mode canary: the
+    economics correctly say "do not mutate", but the whole-prefix compression path
+    never consulted a gate, so it mutated (and busted) anyway.
+    """
+    if p_alive <= p_alive_floor:
+        return True
+    return context_pressure >= pressure_threshold
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -540,7 +649,11 @@ class AnthropicHandlerMixin:
             compute_turn_id,
             read_request_json_with_bytes,
         )
-        from headroom.proxy.modes import is_cache_mode, is_token_mode
+        from headroom.proxy.modes import (
+            is_hybrid_mode,
+            is_token_mode,
+            preserves_warm_prefix,
+        )
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -706,6 +819,14 @@ class AnthropicHandlerMixin:
             if isinstance(body_model, str) and model != body_model:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
+            # Capture the sub-agent signal from the PRISTINE system head, before
+            # any later transform (HR_CANON_MODEL_ID) strips the "[1m]" marker it
+            # depends on. "No [1m] marker" = not the 1M main session; this is the
+            # broad detector that the A/B showed is needed (some sub-agents omit
+            # the model id from their head, so the stricter _system_looks_subagent
+            # missed them and they busted). Drives both the 5m ttl prior and the
+            # token-mode sub-agent freeze below.
+            _is_subagent_request = _system_lacks_1m_marker(body.get("system"), model)
             messages = body.get("messages", [])
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
@@ -1026,7 +1147,7 @@ class AnthropicHandlerMixin:
 
             # Hook: pre_compress — let hooks modify messages before compression
 
-            if self.config.hooks and not is_cache_mode(self.config.mode):
+            if self.config.hooks and not preserves_warm_prefix(self.config.mode):
                 from headroom.hooks import CompressContext
 
                 _hook_ctx = CompressContext(
@@ -1047,16 +1168,87 @@ class AnthropicHandlerMixin:
             waste_signals_dict: dict[str, int] | None = None
             optimized_messages = messages
             optimized_tokens = original_tokens
+            request_messages_for_retry = messages
 
             # Get prefix cache tracker for this session
             session_id = self.session_tracker_store.compute_session_id(request, model, messages)
+            # #856 P3b: read the idle gap BEFORE get_or_create refreshes
+            # _last_activity, otherwise the gap is always ~0 and the
+            # idle-derived P_alive never decays.
+            netcost_idle_seconds = self.session_tracker_store.peek_idle_seconds(session_id)
             prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
+            # Record this session's request-to-request cadence (measured BEFORE
+            # get_or_create refreshed activity) so adaptive-TTL selection below
+            # has recent gaps to reason about. Pure bookkeeping, no forwarding
+            # effect, so it always runs and builds the signal even flags-off.
+            prefix_tracker.record_turn_gap(netcost_idle_seconds)
             frozen_message_count = prefix_tracker.get_frozen_message_count()
-            if is_cache_mode(self.config.mode):
+            _hybrid_should_rebase = False
+            if preserves_warm_prefix(self.config.mode):
                 frozen_message_count = self._strict_previous_turn_frozen_count(
                     original_client_messages,
                     frozen_message_count,
                 )
+            if is_hybrid_mode(self.config.mode):
+                _hybrid_limit = self.anthropic_provider.get_context_limit(model)
+                _hybrid_ttl = prefix_tracker.recommended_ttl() or "5m"
+                _hybrid_ttl_seconds = 3600.0 if _hybrid_ttl == "1h" else 300.0
+                _hybrid_alive = max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _hybrid_ttl_seconds)
+                _hybrid_kept = prefix_tracker.conservative_compression_ratio(k=1.0)
+                try:
+                    _hybrid_reads = float(
+                        os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0
+                    )
+                except ValueError:
+                    _hybrid_reads = 10.0
+                _hybrid_decision = prefix_tracker.hybrid_controller.decide(
+                    frozen_message_count=frozen_message_count,
+                    message_count=len(messages),
+                    total_tokens=original_tokens,
+                    estimated_savings_tokens=max(0, int(original_tokens * (1.0 - _hybrid_kept))),
+                    cached_suffix_tokens=prefix_tracker.cached_token_count(),
+                    expected_reads=_hybrid_reads,
+                    p_alive=_hybrid_alive,
+                    context_pressure=(original_tokens / _hybrid_limit if _hybrid_limit else 0.0),
+                    write_multiplier=2.0 if _hybrid_ttl == "1h" else 1.25,
+                )
+                frozen_message_count = _hybrid_decision.frozen_message_count
+                _hybrid_should_rebase = _hybrid_decision.should_rebase
+                tags["hybrid_phase"] = _hybrid_decision.phase.value
+                tags["hybrid_generation"] = _hybrid_decision.generation
+                if _hybrid_decision.should_rebase:
+                    logger.info(
+                        "[%s] HYBRID_REBASE: generation=%d gain=%.0f reason=%s",
+                        request_id,
+                        _hybrid_decision.generation,
+                        _hybrid_decision.net_gain_tokens,
+                        _hybrid_decision.reason,
+                    )
+                if os.environ.get("HEADROOM_OPTICAL_TEXT") == "1" and frozen_message_count == 0:
+                    from headroom.transforms.text_optical import TextOpticalCompressor
+
+                    _optical_cache = os.path.expanduser(
+                        os.environ.get(
+                            "HEADROOM_OPTICAL_CACHE_DIR", "~/.cache/headroom/text-optical"
+                        )
+                    )
+                    messages, _optical_count = TextOpticalCompressor(
+                        _optical_cache,
+                        count_tokens=tokenizer.count_text,
+                    ).compress_anthropic_messages(
+                        messages,
+                        model=model,
+                        generation=_hybrid_decision.generation,
+                    )
+                    if _optical_count:
+                        tags["optical_text_outputs"] = _optical_count
+                        logger.info(
+                            "[%s] HYBRID_OPTICAL: rendered %d immutable prose output(s) "
+                            "for generation=%d",
+                            request_id,
+                            _optical_count,
+                            _hybrid_decision.generation,
+                        )
 
             # PR-A6 (P5-50, preps P0-6): session-sticky `anthropic-beta` merge.
             # Read the client's beta value (note: anthropic-beta is NOT
@@ -1094,6 +1286,24 @@ class AnthropicHandlerMixin:
                 # Sticky value can only equal "" when both client and
                 # session are empty; preserve the (absent) client state.
                 pass
+            # HR_FORCE_BETA (2026-07-11, local fork): re-append beta tokens the
+            # client is entitled to but silently dropped. Observed: after a 429
+            # Claude Code removes context-1m-2025-08-07 for the rest of the
+            # session even once the rate window recovers, capping a 250k
+            # conversation at 200k. Comma-separated env value, each token
+            # appended only if absent.
+            _force_beta = os.environ.get("HR_FORCE_BETA", "")
+            if _force_beta:
+                _cur = headers.get("anthropic-beta", "")
+                _cur_set = {t.strip() for t in _cur.split(",") if t.strip()}
+                _missing = [
+                    t.strip()
+                    for t in _force_beta.split(",")
+                    if t.strip() and t.strip() not in _cur_set
+                ]
+                if _missing:
+                    headers["anthropic-beta"] = (_cur + "," if _cur else "") + ",".join(_missing)
+                    logger.info(f"[{request_id}] HR_FORCE_BETA: appended {_missing}")
             log_beta_header_merge(
                 provider="anthropic",
                 session_id=session_id,
@@ -1119,7 +1329,7 @@ class AnthropicHandlerMixin:
                 headers=request.headers, config=self.config, messages=messages
             )
             _image_decision.apply_to_tags(tags)
-            if _image_decision.should_compress and not is_cache_mode(self.config.mode):
+            if _image_decision.should_compress and not preserves_warm_prefix(self.config.mode):
                 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
                 compressor = None
@@ -1149,7 +1359,7 @@ class AnthropicHandlerMixin:
                         compressor.close()
 
             _compression_failed = False
-            original_messages = messages  # Preserve for 400-retry fallback
+            original_messages = request_messages_for_retry  # Preserve for 400-retry fallback
             _decision = CompressionDecision.decide(
                 headers=request.headers,
                 config=self.config,
@@ -1247,6 +1457,111 @@ class AnthropicHandlerMixin:
                         skip_ccr_request_compression = should_skip_ccr_request_compression(
                             frozen_message_count
                         )
+                        # HR_SUBAGENT_FREEZE (2026-07-12, local fork): a controlled
+                        # token-vs-cache A/B on the same prompt proved token-mode
+                        # compression BUSTS sub-agent traffic hard (158k tokens lost
+                        # to cache re-writes vs 0 in cache mode). A sub-agent is a
+                        # 2-message conversation (large cached system head + one
+                        # turn) with frozen=0, so token mode recompresses the cached
+                        # head and busts it, and overlay can't replay a non-append-
+                        # only 2-message turn. Sub-agents are short and never fill
+                        # context, so they gain nothing from compression headroom.
+                        # Forward the original (freeze, like cache mode) to keep the
+                        # cached head a hit; the main 1M agent keeps token compression
+                        # for its headroom. Off by default.
+                        if (
+                            os.environ.get("HR_SUBAGENT_FREEZE") == "1"
+                            and _is_subagent_request
+                            and not skip_ccr_request_compression
+                        ):
+                            skip_ccr_request_compression = True
+                            logger.info(
+                                f"[{request_id}] SUBAGENT_FREEZE: token-mode sub-agent "
+                                "-> forwarding original to preserve the cached head"
+                            )
+                        # HR_TOKEN_PREFIX_GATE (2026-07-12): cost-aware decision on
+                        # whether to compress the prefix this turn or forward it
+                        # original. Compressing busts the cached prefix once, so it
+                        # only pays when the per-turn read savings amortize that bust
+                        # over the session's expected remaining reads. This calls the
+                        # SAME net_mutation_gain break-even the frozen-unlock gate uses,
+                        # with this session's numbers: estimated saving dT (from the
+                        # last compression ratio), the cached suffix S it would
+                        # invalidate, expected reads R (turns so far, a lower bound on
+                        # reads ahead), the tier-aware write multiplier w (from the
+                        # adaptive TTL), and an idle-derived p_alive. A pressure override
+                        # still compresses near the context limit, because averting a
+                        # forced compaction is worth more than the bust and the pure
+                        # cache math does not see it. Once it decides to compress it
+                        # latches: pressure and reads only grow, so re-deciding could
+                        # flip back to original and bust the compressed cache. Off by
+                        # default.
+                        if (
+                            os.environ.get("HR_TOKEN_PREFIX_GATE") == "1"
+                            and not skip_ccr_request_compression
+                            and not prefix_tracker.compress_latched
+                            and context_limit
+                        ):
+                            from headroom.transforms.compression_policy import (
+                                write_multiplier_for_ttl,
+                            )
+
+                            try:
+                                _conf_k = float(
+                                    os.environ.get("HR_TOKEN_RATIO_CONFIDENCE_K", "") or 1.0
+                                )
+                            except ValueError:
+                                _conf_k = 1.0
+                            # Confidence-discounted kept fraction: the latch is
+                            # one-way and the estimate is noisy, so use a lower
+                            # bound on the saving (assume compression keeps more
+                            # than the mean when the estimate is uncertain), which
+                            # keeps a high-variance session from committing on a
+                            # single lucky sample.
+                            _kept = prefix_tracker.conservative_compression_ratio(k=_conf_k)
+                            _est_dt = max(0, int(original_tokens * (1.0 - _kept)))
+                            _S = prefix_tracker.cached_token_count()
+                            try:
+                                _R = float(
+                                    os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0
+                                )
+                            except ValueError:
+                                _R = 10.0
+                            _ttl = prefix_tracker.recommended_ttl() or "5m"
+                            _w = write_multiplier_for_ttl(_ttl)
+                            _ttl_s = 3600.0 if _ttl == "1h" else 300.0
+                            _p_alive = max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s)
+                            _gain = compression_policy.net_mutation_gain(
+                                _est_dt, _S, _R, _p_alive, _w
+                            )
+                            try:
+                                _thr = float(
+                                    os.environ.get("HR_TOKEN_PRESSURE_THRESHOLD", "") or 0.85
+                                )
+                            except ValueError:
+                                _thr = 0.85
+                            _pressure = original_tokens / context_limit
+                            _floor = 0.5
+                            # Latch is irreversible and the dT/R estimate is noisy, so
+                            # never commit a ROOMY session to compression on the estimate
+                            # alone (a bad sample would lock it into net-negative
+                            # compression). Require the context to be at least half full
+                            # for the cost path; the pressure override still forces a
+                            # compress near the limit to avert a compaction.
+                            if (_pressure >= _floor and _gain > 0.0) or _pressure >= _thr:
+                                prefix_tracker.latch_compress()
+                                logger.info(
+                                    f"[{request_id}] TOKEN_PREFIX_GATE: compress "
+                                    f"(gain={_gain:.0f} pressure={_pressure:.2f} R={_R:.0f} "
+                                    f"dT~{_est_dt} S={_S} w={_w:.2f}); latched"
+                                )
+                            else:
+                                skip_ccr_request_compression = True
+                                logger.info(
+                                    f"[{request_id}] TOKEN_PREFIX_GATE: forward original "
+                                    f"(gain={_gain:.0f}<=0 pressure={_pressure:.2f}<{_thr:.2f}); "
+                                    "compression does not yet pay"
+                                )
                         if skip_ccr_request_compression:
                             logger.info(
                                 f"[{request_id}] CCR: skipping request-side compression "
@@ -1276,6 +1591,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        idle_seconds=netcost_idle_seconds,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     lambda bg_result: comp_cache.update_from_result(
@@ -1305,6 +1621,7 @@ class AnthropicHandlerMixin:
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
+                                            idle_seconds=netcost_idle_seconds,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
                                         timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1334,7 +1651,11 @@ class AnthropicHandlerMixin:
                             # request) is paid once per request and is dwarfed by
                             # the upstream call latency.
                             optimized_tokens = tokenizer.count_messages(optimized_messages)
-                    elif not is_cache_mode(self.config.mode):
+                            # Feed the observed compression ratio back so the cost
+                            # gate's next-turn saving estimate self-corrects off real
+                            # data instead of the static prior.
+                            prefix_tracker.note_compression(original_tokens, optimized_tokens)
+                    elif not preserves_warm_prefix(self.config.mode) or _hybrid_should_rebase:
                         skip_ccr_request_compression = should_skip_ccr_request_compression(
                             frozen_message_count
                         )
@@ -1355,6 +1676,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        idle_seconds=netcost_idle_seconds,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1438,6 +1760,7 @@ class AnthropicHandlerMixin:
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
+                                            idle_seconds=netcost_idle_seconds,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
                                         timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1487,12 +1810,32 @@ class AnthropicHandlerMixin:
                 overlay_cached_prefix,
             )
 
-            _ov = overlay_cached_prefix(
-                optimized_messages,
-                original_client_messages,
-                prefix_tracker.get_last_original_messages(),
-                prefix_tracker.get_last_forwarded_messages(),
+            _prev_orig_diag = prefix_tracker.get_last_original_messages()
+            _prev_fwd_diag = prefix_tracker.get_last_forwarded_messages()
+            _ov = (
+                optimized_messages
+                if _hybrid_should_rebase
+                else overlay_cached_prefix(
+                    optimized_messages,
+                    original_client_messages,
+                    _prev_orig_diag,
+                    _prev_fwd_diag,
+                )
             )
+            # TOKEN_DIAG (2026-07-12, temporary): trace token-mode partial busts.
+            # overlay replays the prior forwarded prefix byte-stable ONLY when it
+            # append-only-extends the prior turn AND there is one forwarded msg per
+            # original (len(prev_fwd)==len(prev_orig)). If token compression changed
+            # the message count, prev_fwd!=prev_orig, overlay bails, and the tail
+            # busts. This logs exactly that so the cause is measured, not guessed.
+            if is_token_mode(self.config.mode):
+                logger.info(
+                    f"[{request_id}] TOKEN_DIAG: client_msgs={len(original_client_messages)} "
+                    f"opt_msgs={len(optimized_messages)} "
+                    f"prev_orig={len(_prev_orig_diag or [])} prev_fwd={len(_prev_fwd_diag or [])} "
+                    f"count_ok={len(_prev_orig_diag or []) == len(_prev_fwd_diag or [])} "
+                    f"overlay_applied={_ov != optimized_messages} frozen={frozen_message_count}"
+                )
             if _ov != optimized_messages:
                 optimized_messages = _ov
                 optimized_tokens = tokenizer.count_messages(optimized_messages)
@@ -1503,13 +1846,43 @@ class AnthropicHandlerMixin:
             # a single breakpoint on the last block (caches the whole prefix;
             # content-keyed cache so re-placing never busts). Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages)
+            #
+            # Adaptive cache-TTL tier for the single message-prefix breakpoint.
+            # Anthropic sells only 5m (1.25x write) and 1h (2x write); the 1h
+            # premium pays off only when a gap between requests exceeds 5 minutes.
+            # Two flag-gated signals pick the cheaper tier, measured first:
+            #
+            # HEADROOM_ADAPTIVE_TTL: the session's own recent inter-turn cadence
+            #   (recommended_ttl). A fast-cadence conversation gets 5m; one that
+            #   has idled past 5 min flips back to 1h. This generalizes the
+            #   sub-agent case to any short-cadence session and needs no marker.
+            # HR_SUBAGENT_TTL_5M: a cold-start prior for a Claude Code sub-agent
+            #   (measured median ~3 min, never resumes) before enough gap history
+            #   exists, via the [1m]-absence signal captured at request start.
+            #
+            # The system/tools HEAD is left untouched (still 1h) so it stays
+            # cache-shared with the main 1M session (HR_CANON_MODEL_ID / W2). ttl
+            # is a pure cost knob, so a wrong tier only re-prices a write (and at
+            # worst forces one re-write on a surprise >5 min idle), never a wrong
+            # response. Both flags off by default.
+            _force_ttl = None
+            if os.environ.get("HEADROOM_ADAPTIVE_TTL") == "1":
+                _force_ttl = prefix_tracker.recommended_ttl()
+            if (
+                _force_ttl is None
+                and os.environ.get("HR_SUBAGENT_TTL_5M") == "1"
+                and _is_subagent_request
+            ):
+                _force_ttl = "5m"
+            _norm = normalize_message_cache_control(optimized_messages, force_ttl=_force_ttl)
             if _norm is not optimized_messages:
                 optimized_messages = _norm
+                if _force_ttl:
+                    body_mutation_tracker.mark_mutated(f"adaptive_ttl_{_force_ttl}")
 
             # Guard: if "optimization" inflated tokens, revert to originals.
             # Skip in cache mode where prefix-stability may legitimately shift counts.
-            if optimized_tokens > original_tokens and not is_cache_mode(self.config.mode):
+            if optimized_tokens > original_tokens and not preserves_warm_prefix(self.config.mode):
                 logger.warning(
                     f"[{request_id}] Optimization inflated tokens "
                     f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
@@ -1519,6 +1892,8 @@ class AnthropicHandlerMixin:
                 transforms_applied = []
 
             tokens_saved = max(0, original_tokens - optimized_tokens)
+            if is_hybrid_mode(self.config.mode) and tokens_saved > 0:
+                prefix_tracker.note_compression(original_tokens, optimized_tokens)
             optimization_latency = (time.time() - start_time) * 1000
 
             routing_markers = summarize_routing_markers(transforms_applied)
@@ -1856,7 +2231,7 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] CCR: Proactively expanded {len(expansions)} context(s) "
                                 f"based on query relevance"
                             )
-                            if is_cache_mode(self.config.mode):
+                            if preserves_warm_prefix(self.config.mode):
                                 logger.info(
                                     f"[{request_id}] CCR: skipping proactive expansion append "
                                     "in cache mode to preserve next-turn prefix stability"
@@ -1947,7 +2322,7 @@ class AnthropicHandlerMixin:
                                     bytes_injected=0,
                                     query=user_query,
                                 )
-                            elif is_cache_mode(self.config.mode):
+                            elif preserves_warm_prefix(self.config.mode):
                                 # Cache mode: skip injection entirely so the next-turn
                                 # prefix bytes remain byte-equal to this turn's bytes.
                                 log_memory_injection(
@@ -2484,6 +2859,171 @@ class AnthropicHandlerMixin:
             )
             if upstream_base_url and request.url.query:
                 url = f"{url}?{request.url.query}"
+
+            # HR_STRIP_DEEP_REMINDERS (2026-07-11, local fork, experiment):
+            # Claude Code injects hook additionalContext as <system-reminder>
+            # text blocks, then adds or drops them nondeterministically on
+            # later turns. Measured live: a dropped reminder at msg 56 collapsed
+            # a warm 246k-token read to the 5,632-token head (242k cold write).
+            # Deterministically removing these blocks from every message EXCEPT
+            # the last makes deep history byte-stable regardless of the client's
+            # churn, so the whole class stops busting. The current-turn reminder
+            # is preserved (only already-acted deep ones go, and only when other
+            # content remains so a message is never emptied). Off by default.
+            if os.environ.get("HR_STRIP_DEEP_REMINDERS") == "1":
+                try:
+                    _msgs = body.get("messages") or []
+                    if len(_msgs) > 1:
+                        _last = len(_msgs) - 1
+                        _out = []
+                        _changed = False
+                        for _idx, _m in enumerate(_msgs):
+                            _c = _m.get("content")
+                            if _idx < _last and isinstance(_c, list) and len(_c) > 1:
+                                _f = [
+                                    _b
+                                    for _b in _c
+                                    if not (
+                                        isinstance(_b, dict)
+                                        and _b.get("type") == "text"
+                                        and isinstance(_b.get("text"), str)
+                                        and _b["text"].lstrip().startswith("<system-reminder>")
+                                        and "hook additional context" in _b["text"]
+                                    )
+                                ]
+                                if len(_f) != len(_c) and _f:
+                                    _out.append({**_m, "content": _f})
+                                    _changed = True
+                                    continue
+                            _out.append(_m)
+                        if _changed:
+                            body["messages"] = _out
+                            logger.info(
+                                f"[{request_id}] HR_STRIP_DEEP_REMINDERS: "
+                                f"normalized deep hook reminders"
+                            )
+                except Exception:
+                    logger.warning("HR_STRIP_DEEP_REMINDERS failed", exc_info=True)
+
+            # HR_MID_ANCHOR (2026-07-11, local fork): mid-history 1h cache
+            # anchor. Claude Code history is not byte-stable (hook-context
+            # restructuring, message form flips, measured 2026-07-11), and
+            # forwarded requests carry only head breakpoints plus one fragile
+            # tail breakpoint, so any churn collapses cache reads to the
+            # head. A quantized mid-depth anchor bounds the damage to the
+            # segment after it. Quantizing to 64 keeps the anchor byte-stable
+            # between growth jumps. Copy-on-write when attaching the marker:
+            # in-place mutation would leak into tracker or compression-cache
+            # state that is compared against next turn's client bytes.
+            if os.environ.get("HR_MID_ANCHOR") == "1":
+                try:
+                    _msgs = body.get("messages") or []
+
+                    def _count_cc(_obj, _limit=4):
+                        # Count cache_control breakpoints ANYWHERE: bare-dict
+                        # content, blocks nested inside a tool_result's own
+                        # content, and list blocks. The old counter only looked
+                        # at list-shaped content, so a bare-dict or nested
+                        # breakpoint was invisible and the anchor could push the
+                        # request past Anthropic's hard cap of 4 (a 400). Early
+                        # exit at the cap keeps the walk bounded.
+                        _stack = [_obj]
+                        _n = 0
+                        while _stack:
+                            _cur = _stack.pop()
+                            if isinstance(_cur, dict):
+                                if _cur.get("cache_control"):
+                                    _n += 1
+                                    if _n >= _limit:
+                                        return _n
+                                _stack.extend(_cur.values())
+                            elif isinstance(_cur, list):
+                                _stack.extend(_cur)
+                        return _n
+
+                    _existing = _count_cc([body.get("system"), body.get("tools"), _msgs])
+                    if len(_msgs) >= 80 and _existing < 4:
+                        _anchor = max(32, (len(_msgs) - 16) // 64 * 64)
+                        _anchor = min(_anchor, len(_msgs) - 16)
+                        for _i in range(_anchor, max(_anchor - 24, 0), -1):
+                            _c = _msgs[_i].get("content")
+                            # Accept both list content (anchor the last block)
+                            # and bare-dict content (anchor the dict itself), so
+                            # a client list<->dict shape flip on the target
+                            # message does not make the scan skip it and drift
+                            # the anchor to a neighbour.
+                            _tail = None
+                            if isinstance(_c, list) and _c and isinstance(_c[-1], dict):
+                                _tail = _c[-1]
+                            elif isinstance(_c, dict):
+                                _tail = _c
+                            if (
+                                _tail is not None
+                                and not _tail.get("cache_control")
+                                and _tail.get("type") in ("text", "tool_result")
+                            ):
+                                _new_tail = {
+                                    **_tail,
+                                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                                }
+                                if isinstance(_c, list):
+                                    _new_content = list(_c[:-1]) + [_new_tail]
+                                else:
+                                    _new_content = _new_tail
+                                _new_msg = {**_msgs[_i], "content": _new_content}
+                                body["messages"] = (
+                                    list(_msgs[:_i]) + [_new_msg] + list(_msgs[_i + 1 :])
+                                )
+                                logger.info(
+                                    f"[{request_id}] HR_MID_ANCHOR: 1h anchor at "
+                                    f"msg {_i}/{len(_msgs)}"
+                                )
+                                break
+                except Exception:
+                    logger.warning("HR_MID_ANCHOR failed", exc_info=True)
+
+            # HR_CANON_MODEL_ID (2026-07-11, local fork, R4-prime): Claude Code
+            # spawns subagents WITHOUT the context-1m beta, so the system-prompt
+            # model-id line renders "claude-opus-4-8[1m]" on the main agent and
+            # "claude-opus-4-8" on a subagent. That 4-byte "[1m]" token forks the
+            # ~24.4k-token system+tools head cache (W2, IMPROVEMENTS.md), so every
+            # subagent first request cold-writes the head instead of reading the
+            # parent's warm copy. Canonicalizing the string to one form (strip
+            # "[1m]") on every forwarded request lets same-model agents share the
+            # head. It is informational text: the real 1m context is set by the
+            # beta header, not this string, so normalizing the display is
+            # behavior-neutral. Idempotent, so byte-stable across turns. Off by
+            # default. Full cross-agent KV reuse is not possible (needs control
+            # of the serving stack); this only dedups the head-id fork.
+            if os.environ.get("HR_CANON_MODEL_ID") == "1":
+                try:
+                    import re as _re
+
+                    _sysb = body.get("system")
+                    if isinstance(_sysb, list):
+                        _out = []
+                        _changed = False
+                        for _b in _sysb:
+                            if (
+                                isinstance(_b, dict)
+                                and _b.get("type") == "text"
+                                and isinstance(_b.get("text"), str)
+                                and "[1m]" in _b["text"]
+                            ):
+                                _canon = _re.sub(r"(claude-[a-z0-9.\-]+)\[1m\]", r"\1", _b["text"])
+                                if _canon != _b["text"]:
+                                    _out.append({**_b, "text": _canon})
+                                    _changed = True
+                                    continue
+                            _out.append(_b)
+                        if _changed:
+                            body["system"] = _out
+                            logger.info(
+                                f"[{request_id}] HR_CANON_MODEL_ID: "
+                                f"canonicalized [1m] model-id in system head"
+                            )
+                except Exception:
+                    logger.warning("HR_CANON_MODEL_ID failed", exc_info=True)
 
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)
@@ -3411,7 +3951,10 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
+                        lambda messages=messages,
+                        model=model,
+                        context_limit=context_limit,
+                        frozen_message_count=frozen_message_count: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,

@@ -55,6 +55,10 @@ def _get_litellm_module() -> Any | None:
 # OpenAI model to tiktoken encoding mappings
 _MODEL_ENCODINGS: dict[str, str] = {
     # GPT-4o and newer use o200k_base
+    "gpt-5.6": "o200k_base",
+    "gpt-5.6-sol": "o200k_base",
+    "gpt-5.6-terra": "o200k_base",
+    "gpt-5.6-luna": "o200k_base",
     "gpt-4o": "o200k_base",
     "gpt-4o-mini": "o200k_base",
     "gpt-4o-2024": "o200k_base",
@@ -71,6 +75,13 @@ _MODEL_ENCODINGS: dict[str, str] = {
 
 # OpenAI context window limits
 _CONTEXT_LIMITS: dict[str, int] = {
+    # Public API model cards. Codex product clients advertise a smaller
+    # 272K window for these same slugs, so the proxy handler overrides this
+    # provider-level API limit when the caller is identified as Codex.
+    "gpt-5.6": 1_050_000,
+    "gpt-5.6-sol": 1_050_000,
+    "gpt-5.6-terra": 1_050_000,
+    "gpt-5.6-luna": 1_050_000,
     # GPT-4o series
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,

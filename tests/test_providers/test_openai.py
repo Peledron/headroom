@@ -63,6 +63,13 @@ class TestOpenAIModelLimits:
     def test_get_context_limit_o1(self, openai_provider):
         assert openai_provider.get_context_limit("o1") == 200000
 
+    @pytest.mark.parametrize(
+        "model",
+        ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+    )
+    def test_get_context_limit_gpt56_api(self, openai_provider, model):
+        assert openai_provider.get_context_limit(model) == 1_050_000
+
     def test_get_context_limit_unknown_model(self, openai_provider):
         # Unknown models now get a fallback value instead of raising
         limit = openai_provider.get_context_limit("unknown-model")

@@ -20,9 +20,13 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
+
+from headroom.proxy.hybrid_mode import HybridModeController
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,15 @@ _PROVIDER_WRITE_PENALTY = {
     "gemini": 0.0,
     "bedrock": 0.25,
 }
+
+# Smoothing factor for the compression-ratio predictor. The cost gate has to
+# estimate how many tokens the NEXT compression will remove before running it,
+# which is the same shape as an OS scheduler predicting the next CPU burst from
+# past bursts. The textbook answer is exponential averaging: weight the newest
+# observation by alpha and decay the running estimate by (1 - alpha), so one
+# anomalous turn cannot yank the estimate the way a single last-sample can.
+# 0.3 tracks a genuine regime change within a few turns without chasing noise.
+_KEPT_EWMA_ALPHA = 0.3
 
 # Default prompt-cache lifetime per provider, in seconds. Used by
 # `classify_cache_miss` to decide whether a miss is most likely a TTL
@@ -314,6 +327,8 @@ def overlay_cached_prefix(
 
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
+    *,
+    force_ttl: str | None = None,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -332,16 +347,44 @@ def normalize_message_cache_control(
     ``messages`` and are left untouched (they still count toward the 4 limit, so
     holding messages to one breakpoint leaves room for them).
 
+    ``force_ttl`` overrides the ttl written onto that single re-placed breakpoint.
+    The default (None) preserves the client's ttl (see ``kept_ttl`` below), which
+    is right for a long-lived main session that may idle past 5 minutes. A caller
+    that knows the request is short-lived and non-resuming (a Claude Code
+    sub-agent, measured median ~3 min) passes ``force_ttl="5m"`` so the
+    message-prefix writes land in the 1.25x tier instead of the 2x 1h tier the
+    client would otherwise pay for retention the sub-agent never uses. ttl is a
+    pure retention/cost knob and the provider keys the cache on content not ttl,
+    so this only changes write price and retention, never the response or a hit.
+
     Only block-style (list) content can carry cache_control; string content is
     left as-is. Returns the input unchanged when there is nothing to normalize.
     """
+    # Anthropic accepts only "5m"/"1h" as a ttl; forwarding anything else 400s
+    # the live request. force_ttl is a cost knob, never a correctness lever, so
+    # an unrecognized value is ignored (fall back to the client's kept_ttl)
+    # rather than propagated. "" is not a pass-through for "provider default"
+    # here; it is treated as unset.
+    if force_ttl not in ("5m", "1h", None):
+        force_ttl = None
     changed = False
     out: list[dict[str, Any]] = []
     last_block_idx = -1
+    # Preserve the client's cache TTL across normalization: re-placing a bare
+    # ephemeral marker silently downgrades a 1h client breakpoint to the 5m
+    # tier, so any idle gap over 5 minutes lapses a cache the client paid 2x
+    # write premium to keep for an hour. Last stripped marker wins (the
+    # client's newest intent).
+    kept_ttl: str | None = None
     for i, msg in enumerate(messages):
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list):
             had = any(isinstance(b, dict) and "cache_control" in b for b in content)
+            for b in content:
+                if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                    ttl = b["cache_control"].get("ttl")
+                    if ttl:
+                        kept_ttl = ttl
             stripped = [
                 {k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b
                 for b in content
@@ -356,7 +399,11 @@ def normalize_message_cache_control(
     if last_block_idx >= 0:
         msg = out[last_block_idx]
         content = list(msg["content"])
-        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+        replaced_cc: dict[str, Any] = {"type": "ephemeral"}
+        _ttl = force_ttl if force_ttl is not None else kept_ttl
+        if _ttl:
+            replaced_cc["ttl"] = _ttl
+        content[-1] = {**content[-1], "cache_control": replaced_cc}
         out[last_block_idx] = {**msg, "content": content}
         changed = True
     return out if changed else messages
@@ -390,6 +437,31 @@ class PrefixCacheTracker:
         self._last_activity: float = time.time()
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
+        # Recent observed inter-turn gaps (seconds between this session's
+        # successive requests), for adaptive cache-TTL tier selection. A short,
+        # bounded ring: only the recent cadence matters and old gaps should age
+        # out. Fed by the handler with the pre-refresh idle gap each turn.
+        self._turn_gaps: deque[float] = deque(maxlen=8)
+        self._ttl_recommendation: str | None = None
+        # Token-mode cost-aware prefix gate state. Once the break-even math
+        # decides to compress this session, it latches on: pressure and expected
+        # reads only grow, so re-deciding every turn could flip compressed back to
+        # original and bust the compressed cache. ``_last_compression_kept`` is the
+        # fraction of tokens the last compression KEPT (after/before), used to
+        # estimate the next turn's saving before actually running compression.
+        self._compress_latched: bool = False
+        self._last_compression_kept: float | None = None
+        # Exponentially-weighted estimate of the KEPT fraction and its variance.
+        # ``_kept_ewma`` is the smoothed prediction the cost gate reads;
+        # ``_kept_var`` is an EWMA of the squared deviation, so its square root
+        # is a confidence spread the gate discounts by (assume less saving when
+        # the estimate is noisy). Both stay None/0 until the first observation.
+        self._kept_ewma: float | None = None
+        self._kept_var: float = 0.0
+        # First-class hybrid mode owns its prefix generation and rebase
+        # hysteresis here so it follows the same session affinity and expiry as
+        # provider cache observations.
+        self.hybrid_controller = HybridModeController(provider)
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -413,6 +485,167 @@ class PrefixCacheTracker:
         if self._cached_token_count < self.config.min_cached_tokens:
             return 0
         return self._cached_message_count
+
+    def record_turn_gap(self, gap_seconds: float | None) -> None:
+        """Record the observed gap since this session's previous request.
+
+        The handler peeks the idle gap BEFORE ``get_or_create`` refreshes
+        ``_last_activity``, so ``gap_seconds`` is the real request-to-request
+        cadence (assistant generation time plus user think time), which is
+        exactly what decides whether the prompt cache is still warm when the
+        next request lands. ``None`` (unknown session, first turn) and
+        non-finite/negative values are ignored.
+        """
+        # Reject None and bool (a bool is an int subclass, so `float(True)` is a
+        # silent 1.0 that would poison the cadence with a flag mistaken for a
+        # duration). OverflowError covers a Python int too large for a float.
+        if gap_seconds is None or isinstance(gap_seconds, bool):
+            return
+        try:
+            g = float(gap_seconds)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not math.isfinite(g) or g < 0.0:
+            return
+        self._turn_gaps.append(g)
+
+    def recommended_ttl(
+        self,
+        *,
+        tier_boundary_seconds: float = 300.0,
+        margin_seconds: float = 60.0,
+    ) -> str | None:
+        """Pick the cheaper cache TTL tier this session can safely use.
+
+        Anthropic sells exactly two ephemeral tiers: 5m (1.25x write) and 1h
+        (2x write). The 1h premium only pays off when a gap between requests
+        exceeds 5 minutes, so a fast-cadence session (the common case, measured
+        median ~3 min per sub-agent turn) that pins 1h burns the 2x premium for
+        retention it never uses. This reads the session's recent inter-turn gaps
+        and returns ``"5m"`` when the cadence stays safely inside the 5-minute
+        window, ``"1h"`` when a recent gap has already breached it, or ``None``
+        when there is not enough history (or the cadence sits in the ambiguous
+        band) to change the client's own choice.
+
+        The decision is on the recent MAX gap, not the mean: the risk is a single
+        long idle lapsing a 5m cache, so one breach flips the session back to 1h.
+        ``margin_seconds`` keeps a safety buffer below the 5-minute boundary, and
+        a one-tier hysteresis (the ambiguous band holds the last recommendation)
+        stops the tier from flapping turn to turn.
+        """
+        if len(self._turn_gaps) < 2:
+            return None
+        recent_max = max(self._turn_gaps)
+        if recent_max <= tier_boundary_seconds - margin_seconds:
+            self._ttl_recommendation = "5m"
+        elif recent_max > tier_boundary_seconds:
+            self._ttl_recommendation = "1h"
+        # else: ambiguous band -> keep the previous recommendation (hysteresis).
+        return self._ttl_recommendation
+
+    @property
+    def compress_latched(self) -> bool:
+        """Whether the cost gate has already committed this session to compress."""
+        return self._compress_latched
+
+    def latch_compress(self) -> None:
+        """Commit this session to compression for the rest of its life.
+
+        The break-even inputs (expected reads, context pressure) only grow, so a
+        session that crosses into "compress" never economically returns to
+        "forward original". Latching makes that explicit and prevents an
+        oscillation that would bust the compressed cache.
+        """
+        self._compress_latched = True
+
+    def note_compression(self, tokens_before: int, tokens_after: int) -> None:
+        """Record the fraction of tokens the last compression kept.
+
+        Feeds the exponentially-weighted predictor ``recent_compression_ratio``
+        reads, so the next turn's break-even can estimate its saving without
+        first running compression. Ignores non-positive or inflating results
+        (nothing learned from them). The first accepted sample seeds the EWMA
+        directly, so a single-observation session reports that sample exactly.
+        """
+        # ``math.isfinite`` raises OverflowError on a Python int too large for a
+        # float (e.g. a corrupted or adversarial counter), so guard it like
+        # ``record_turn_gap`` does: an oversized value is just another invalid
+        # sample to ignore, never a crash on the request path.
+        try:
+            valid = (
+                math.isfinite(tokens_before)
+                and math.isfinite(tokens_after)
+                and tokens_before > 0
+                and 0 < tokens_after <= tokens_before
+            )
+        except (TypeError, OverflowError):
+            return
+        if valid:
+            sample = tokens_after / tokens_before
+            self._last_compression_kept = sample
+            if self._kept_ewma is None:
+                self._kept_ewma = sample
+                self._kept_var = 0.0
+            else:
+                prev = self._kept_ewma
+                self._kept_ewma = _KEPT_EWMA_ALPHA * sample + (1.0 - _KEPT_EWMA_ALPHA) * prev
+                dev = sample - prev
+                self._kept_var = (
+                    _KEPT_EWMA_ALPHA * (dev * dev) + (1.0 - _KEPT_EWMA_ALPHA) * self._kept_var
+                )
+
+    def recent_compression_ratio(self, default: float = 0.8) -> float:
+        """Fraction of tokens compression is expected to KEEP (after/before).
+
+        Returns the exponentially-weighted estimate of the kept fraction, or
+        ``default`` before any compression has run. ``1 - ratio`` is the mean
+        saving fraction; the cost gate uses ``conservative_compression_ratio``
+        for the actual decision so a noisy estimate does not over-commit.
+        """
+        return self._kept_ewma if self._kept_ewma is not None else default
+
+    def compression_ratio_stddev(self) -> float:
+        """Spread of the kept-fraction estimate (root of the EWMA variance).
+
+        Zero before the second observation. The cost gate widens its saving
+        estimate downward by this much per unit of confidence ``k``.
+        """
+        return math.sqrt(self._kept_var) if self._kept_var > 0.0 else 0.0
+
+    def conservative_compression_ratio(self, *, default: float = 0.8, k: float = 1.0) -> float:
+        """Confidence-discounted KEPT fraction for the irreversible latch.
+
+        The gate commits to compression before it can measure the real saving,
+        and the commit is one-way (forwarding original again busts the
+        compressed cache). So instead of the mean estimate it uses a lower
+        confidence bound on the SAVING: assume compression keeps
+        ``mean + k * stddev`` of the tokens, capped at 1.0. A high-variance
+        session therefore under-estimates its own saving and waits for the
+        estimate to settle before latching, while a session with a stable
+        ratio behaves like the plain mean. This is the UCB-style pessimism
+        that pairs with the EWMA smoothing.
+        """
+        if self._kept_ewma is None:
+            return default
+        # The discount is one-directional: it may only assume LESS saving than
+        # the mean, never more. A negative k (e.g. a mis-set env override) would
+        # invert that and make the irreversible latch MORE aggressive, so clamp
+        # it out. NaN k collapses to 0 (no discount) for the same reason.
+        if not math.isfinite(k) or k < 0.0:
+            k = 0.0
+        return min(1.0, self._kept_ewma + k * self.compression_ratio_stddev())
+
+    def cached_token_count(self) -> int:
+        """Tokens the provider currently has cached for this session's prefix.
+
+        This is the suffix a fresh compression would invalidate, i.e. the S term
+        in the net-cost break-even.
+        """
+        return self._cached_token_count
+
+    def turn_number(self) -> int:
+        """Turns seen so far, a proxy for expected remaining reads of the cache."""
+        return self._turn_number
 
     def update_from_response(
         self,
@@ -743,6 +976,19 @@ class SessionTrackerStore:
         tracker = PrefixCacheTracker(provider, self._default_config)
         self._trackers[session_id] = tracker
         return tracker
+
+    def peek_idle_seconds(self, session_id: str) -> float | None:
+        """Idle gap for an existing session without refreshing activity.
+
+        ``get_or_create`` stamps ``_last_activity`` on access, so the
+        net-cost gate (#856 P3b) must read the gap before fetching the
+        tracker for the current request. Returns None for an unknown
+        session, in which case the gate keeps its env-constant P_alive.
+        """
+        tracker = self._trackers.get(session_id)
+        if tracker is None:
+            return None
+        return tracker.seconds_since_activity()
 
     def compute_session_id(
         self,

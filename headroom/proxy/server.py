@@ -147,6 +147,7 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
+    PROXY_MODE_HYBRID,
     PROXY_MODE_TOKEN,
     is_token_mode,
     normalize_proxy_mode,
@@ -1417,6 +1418,9 @@ class HeadroomProxy(
         if self.config.mode == PROXY_MODE_CACHE:
             logger.info("  Prefix freeze: strict (all prior turns immutable)")
             logger.info("  Mutations: latest turn only")
+        if self.config.mode == PROXY_MODE_HYBRID:
+            logger.info("  Prefix freeze: stable compressed generations")
+            logger.info("  Mutations: live delta plus cost-gated rebases")
         logger.info(f"Caching: {'ENABLED' if self.config.cache_enabled else 'DISABLED'}")
         logger.info(f"Rate Limiting: {'ENABLED' if self.config.rate_limit_enabled else 'DISABLED'}")
         logger.info(
