@@ -1248,7 +1248,7 @@ class OpenAIHandlerMixin:
             )
             return payload, False, 0, [], {}, [], 0
 
-        def _slot_text(item: dict[str, Any]) -> tuple[str, tuple[str, int | None]] | None:
+        def _text_slots(item: dict[str, Any]) -> list[tuple[str, tuple[str, int | None]]]:
             # Only tool-output items are eligible for in-place compression.
             # Message items (user/system/assistant) sit inside the request's
             # cacheable prefix; mutating them busts prefix caching on every
@@ -1258,17 +1258,31 @@ class OpenAIHandlerMixin:
             if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 output = item.get("output")
                 if isinstance(output, str):
-                    return output, ("output", None)
-            return None
+                    return [(output, ("output", None))]
+                if isinstance(output, list):
+                    return [
+                        (part["text"], ("output_part", part_idx))
+                        for part_idx, part in enumerate(output)
+                        if isinstance(part, dict)
+                        and part.get("type") == "input_text"
+                        and isinstance(part.get("text"), str)
+                    ]
+            return []
 
         def _set_slot_text(
             item: dict[str, Any],
             slot: tuple[str, int | None],
             replacement: str,
         ) -> None:
-            kind, _ = slot
+            kind, part_idx = slot
             if kind == "output":
                 item["output"] = replacement
+            elif kind == "output_part" and part_idx is not None:
+                output = item.get("output")
+                if isinstance(output, list) and part_idx < len(output):
+                    part = output[part_idx]
+                    if isinstance(part, dict):
+                        part["text"] = replacement
 
         headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to
@@ -1381,9 +1395,8 @@ class OpenAIHandlerMixin:
                             }
                         )
                     continue
-                slot = _slot_text(item)
-                if slot is not None:
-                    text, slot_ref = slot
+                slots = _text_slots(item)
+                for text, slot_ref in slots:
                     candidates.append((idx, slot_ref, text))
                     if debug_enabled:
                         extraction_debug.append(
@@ -1400,7 +1413,7 @@ class OpenAIHandlerMixin:
                                 "text": text,
                             }
                         )
-                else:
+                if not slots:
                     if debug_enabled:
                         extraction_debug.append(
                             {

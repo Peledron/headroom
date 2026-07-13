@@ -176,6 +176,58 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert strategy_chain == []
 
 
+def test_openai_responses_adapter_compresses_custom_tool_call_output_text_parts():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed=f"summary:{content.split()[0]}",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    first_text = " ".join(f"first{i}" for i in range(180))
+    second_text = " ".join(f"second{i}" for i in range(180))
+    image_part = {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "input_text", "text": first_text},
+                    image_part,
+                    {"type": "input_text", "text": second_text},
+                ],
+            }
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["output"] == [
+        {"type": "input_text", "text": "summary:first0"},
+        image_part,
+        {"type": "input_text", "text": "summary:second0"},
+    ]
+    assert payload["input"][0]["output"][0]["text"] == first_text
+    assert payload["input"][0]["output"][2]["text"] == second_text
+    assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
+    assert units_by_category == {"applied": 2}
+    assert strategy_chain == []
+
+
 def test_openai_responses_adapter_reuses_exact_tool_output_cache():
     router = ContentRouter()
     calls = {"count": 0}
