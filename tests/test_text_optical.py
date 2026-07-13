@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from headroom.transforms.text_optical import TextOpticalCompressor, extract_optical_facts
+import io
+
+from PIL import Image
+
+from headroom.transforms.text_optical import (
+    OpticalRenderConfig,
+    TextOpticalCompressor,
+    extract_optical_facts,
+)
 
 
 def _prose() -> str:
@@ -38,6 +46,58 @@ def test_optical_render_is_deterministic_and_cacheable(tmp_path) -> None:
     assert first.manifest == second.manifest
     assert [page.sha256 for page in first.pages] == [page.sha256 for page in second.pages]
     assert first.estimated_tokens_saved > 0
+
+
+def test_semantic_color_render_adds_inferred_line_types_without_changing_cost(tmp_path) -> None:
+    source = (
+        "Build log follows.\n"
+        + (
+            "[BUILD] command started\n"
+            "OK compiled /srv/app/main.py:42\n"
+            "WARNING retrying dependency download\n"
+            "ERROR failed in /srv/app/worker.py:91\n"
+        )
+        * 160
+    )
+
+    def count_tokens(text: str) -> int:
+        return len(text) * 10
+
+    monochrome = TextOpticalCompressor(tmp_path / "mono", count_tokens=count_tokens).compress(
+        source,
+        provider="openai",
+        model="gpt-5.6-sol",
+        immutable=True,
+        age_turns=3,
+        content_kind="log",
+    )
+    semantic = TextOpticalCompressor(
+        tmp_path / "semantic",
+        config=OpticalRenderConfig(semantic_colors=True),
+        count_tokens=count_tokens,
+    ).compress(
+        source,
+        provider="openai",
+        model="gpt-5.6-sol",
+        immutable=True,
+        age_turns=3,
+        content_kind="log",
+    )
+
+    assert monochrome is not None
+    assert semantic is not None
+    assert semantic.image_tokens == monochrome.image_tokens
+    assert len(semantic.pages) == len(monochrome.pages)
+    with Image.open(io.BytesIO(monochrome.pages[0].png)) as mono_image:
+        assert mono_image.mode == "L"
+    with Image.open(io.BytesIO(semantic.pages[0].png)) as semantic_image:
+        assert semantic_image.mode == "RGB"
+        colors = semantic_image.getcolors(maxcolors=1_000_000)
+        assert colors is not None
+        palette = {color for _, color in colors}
+        assert (255, 232, 232) in palette
+        assert (255, 244, 204) in palette
+        assert (229, 249, 235) in palette
 
 
 def test_warm_prefix_never_renders_a_new_optical_generation(tmp_path) -> None:
@@ -143,6 +203,10 @@ def test_optical_factsheet_keeps_exact_identifiers_in_text(tmp_path) -> None:
     assert "BUILD_OUTPUT_DIR" in facts
     assert result is not None
     assert "CITRINE-4821 x2" in result.manifest
+
+
+def test_optical_factsheet_can_be_disabled() -> None:
+    assert extract_optical_facts("BUILD-4821 /srv/app/main.py", max_entries=0) == ()
 
 
 def test_anthropic_message_adapter_keeps_text_when_extracting_is_cheaper(tmp_path) -> None:

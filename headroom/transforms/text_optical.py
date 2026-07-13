@@ -46,6 +46,8 @@ def extract_optical_facts(
     text: str, *, max_entries: int = 64, max_scan_chars: int = 262_144
 ) -> tuple[tuple[str, int], ...]:
     """Extract a deterministic text sidecar for precision-critical identifiers."""
+    if max_entries <= 0 or max_scan_chars <= 0:
+        return ()
     scan = text[:max_scan_chars]
     found: dict[str, tuple[int, int]] = {}
     for priority, pattern, group in _FACT_PATTERNS:
@@ -196,6 +198,7 @@ class OpticalRenderConfig:
     min_savings_fraction: float = 0.15
     max_factsheet_entries: int = 64
     max_factsheet_scan_chars: int = 262_144
+    semantic_colors: bool = False
     format_version: int = 1
 
 
@@ -260,6 +263,33 @@ class TextOpticalCompressor:
         r"(?:import|from|use|package)\s|[{}][,;]?$)"
     )
     _IDENTIFIER = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{24,}\b")
+    _SEMANTIC_LINE_STYLES: tuple[
+        tuple[
+            re.Pattern[str], tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]
+        ],
+        ...,
+    ] = (
+        (
+            re.compile(r"(?i)\b(error|failed|failure|fatal|exception|traceback|panic)\b"),
+            ((116, 18, 18), (255, 232, 232), (210, 45, 45)),
+        ),
+        (
+            re.compile(r"(?i)\b(warn|warning|retry|degraded|timeout)\b"),
+            ((102, 61, 0), (255, 244, 204), (220, 155, 0)),
+        ),
+        (
+            re.compile(r"(?i)\b(ok|passed|success|healthy|completed|ready)\b"),
+            ((0, 84, 43), (229, 249, 235), (35, 160, 82)),
+        ),
+        (
+            re.compile(r"^(?:\$|>|#|==+|--+|\[[A-Z][A-Z0-9 _-]*\])"),
+            ((40, 48, 110), (235, 239, 255), (78, 95, 190)),
+        ),
+        (
+            re.compile(r"(?:^|\s)(?:[A-Za-z]:)?[/\\][\w.@+\\/-]+(?::\d+)?"),
+            ((0, 72, 112), (231, 246, 255), (40, 140, 195)),
+        ),
+    )
 
     def __init__(
         self,
@@ -478,7 +508,9 @@ class TextOpticalCompressor:
 
         cfg = self.config
         font = ImageFont.load_default(size=cfg.font_size)
-        probe = Image.new("L", (cfg.width, cfg.height), 255)
+        mode = "RGB" if cfg.semantic_colors else "L"
+        background: int | tuple[int, int, int] = (255, 255, 255) if cfg.semantic_colors else 255
+        probe = Image.new(mode, (cfg.width, cfg.height), background)
         draw = ImageDraw.Draw(probe)
         bbox = draw.textbbox((0, 0), "M", font=font)
         char_width = max(1, math.ceil(bbox[2] - bbox[0]))
@@ -489,24 +521,43 @@ class TextOpticalCompressor:
         columns = max(20, column_width // char_width)
         rows = max(5, (cfg.height - 2 * cfg.margin) // line_height)
         wrapped = self._wrap(text, columns)
+        styled = self._wrap_styled(text, columns) if cfg.semantic_colors else []
         page_rows = rows * column_count
         chunks = [wrapped[i : i + page_rows] for i in range(0, len(wrapped), page_rows)]
         pages: list[OpticalPage] = []
         for index, lines in enumerate(chunks):
-            image = Image.new("L", (cfg.width, cfg.height), 255)
+            image = Image.new(mode, (cfg.width, cfg.height), background)
             page_draw = ImageDraw.Draw(image)
             for column_index in range(column_count):
                 column_lines = lines[column_index * rows : (column_index + 1) * rows]
                 if not column_lines:
                     break
                 x = cfg.margin + column_index * (column_width + cfg.column_gutter)
-                page_draw.multiline_text(
-                    (x, cfg.margin),
-                    "\n".join(column_lines),
-                    fill=0,
-                    font=font,
-                    spacing=cfg.line_spacing,
-                )
+                if cfg.semantic_colors:
+                    page_offset = index * page_rows + column_index * rows
+                    styled_lines = styled[page_offset : page_offset + len(column_lines)]
+                    for row_index, (line, style) in enumerate(styled_lines):
+                        y = cfg.margin + row_index * line_height
+                        fill = (0, 0, 0)
+                        if style is not None:
+                            fill, line_background, accent = style
+                            page_draw.rectangle(
+                                (x, y, x + column_width - 1, y + line_height - 1),
+                                fill=line_background,
+                            )
+                            page_draw.rectangle(
+                                (max(0, x - 3), y, max(0, x - 1), y + line_height - 1),
+                                fill=accent,
+                            )
+                        page_draw.text((x, y), line, fill=fill, font=font)
+                else:
+                    page_draw.multiline_text(
+                        (x, cfg.margin),
+                        "\n".join(column_lines),
+                        fill=0,
+                        font=font,
+                        spacing=cfg.line_spacing,
+                    )
             output = io.BytesIO()
             image.save(output, format="PNG", optimize=False, compress_level=9)
             png = output.getvalue()
@@ -537,6 +588,36 @@ class TextOpticalCompressor:
                 remaining = remaining[split:].lstrip(" ")
             output.append(remaining)
         return output or [""]
+
+    @classmethod
+    def _wrap_styled(
+        cls, text: str, columns: int
+    ) -> list[
+        tuple[
+            str,
+            tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]] | None,
+        ]
+    ]:
+        output: list[
+            tuple[
+                str,
+                tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]] | None,
+            ]
+        ] = []
+        for raw_line in text.expandtabs(4).splitlines():
+            style = cls._semantic_line_style(raw_line)
+            wrapped = cls._wrap(raw_line, columns)
+            output.extend((line, style) for line in wrapped)
+        return output or [("", None)]
+
+    @classmethod
+    def _semantic_line_style(
+        cls, line: str
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]] | None:
+        for pattern, style in cls._SEMANTIC_LINE_STYLES:
+            if pattern.search(line):
+                return style
+        return None
 
     @staticmethod
     def _manifest(

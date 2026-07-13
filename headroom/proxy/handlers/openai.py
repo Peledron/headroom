@@ -73,6 +73,7 @@ _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+_CODEX_GPT56_CONTEXT_WINDOW = 272_000
 
 
 def _codex_ws_compression_timeout_seconds() -> float:
@@ -87,6 +88,13 @@ _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _OPENCODE_ZEN_HOSTS = {"opencode.ai", "www.opencode.ai"}
+
+
+def _effective_openai_context_limit(provider: Any, model: str, client: str | None) -> int:
+    """Use Codex's advertised product window instead of the larger API window."""
+    if client == "codex" and model.lower().startswith("gpt-5.6"):
+        return _CODEX_GPT56_CONTEXT_WINDOW
+    return int(provider.get_context_limit(model))
 
 
 def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
@@ -2492,7 +2500,9 @@ class OpenAIHandlerMixin:
                 openai_frozen_count,
             )
         if is_hybrid_mode(self.config.mode):
-            _hybrid_limit = self.openai_provider.get_context_limit(model)
+            _hybrid_limit = _effective_openai_context_limit(
+                self.openai_provider, model, client
+            )
             _hybrid_kept = openai_prefix_tracker.conservative_compression_ratio(k=1.0)
             try:
                 _hybrid_reads = float(
@@ -2531,7 +2541,9 @@ class OpenAIHandlerMixin:
             )
         if _decision.should_compress:
             try:
-                context_limit = self.openai_provider.get_context_limit(model)
+                context_limit = _effective_openai_context_limit(
+                    self.openai_provider, model, client
+                )
 
                 # F2.1 c5/5: per-request CompressionPolicy. Hoisted out of
                 # the is_token_mode branch so the else (non-token) branch

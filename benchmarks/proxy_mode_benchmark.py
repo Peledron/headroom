@@ -23,13 +23,18 @@ from typing import Any
 from headroom.cache.compression_cache import CompressionCache
 from headroom.cache.prefix_tracker import PrefixCacheTracker, overlay_cached_prefix
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.models import ProxyConfig
 from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_HYBRID, PROXY_MODE_TOKEN
 from headroom.proxy.server import HeadroomProxy
 from headroom.tokenizers import get_tokenizer
 from headroom.utils import extract_user_query
 
-MODEL = "claude-sonnet-4-6"
+MODELS = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-5.6-sol",
+}
+CODEX_CONTEXT_WINDOW = 272_000
 
 
 @dataclass
@@ -75,7 +80,23 @@ def _build_tool_result(turn: int, rows: int = 240) -> str:
     return json.dumps(payload)
 
 
-def _build_conversation(turn: int) -> list[dict[str, Any]]:
+def _tool_result_message(turn: int, provider: str) -> dict[str, Any]:
+    content = _build_tool_result(turn)
+    if provider == "openai":
+        return {"role": "tool", "tool_call_id": f"tool-{turn}", "content": content}
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": f"tool-{turn}",
+                "content": content,
+            }
+        ],
+    }
+
+
+def _build_conversation(turn: int, provider: str = "anthropic") -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for t in range(1, turn):
         messages.extend(
@@ -84,16 +105,7 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
                     "role": "user",
                     "content": f"Analyze tool output turn {t} and summarize anomalies.",
                 },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": f"tool-{t}",
-                            "content": _build_tool_result(t),
-                        }
-                    ],
-                },
+                _tool_result_message(t, provider),
                 {"role": "assistant", "content": f"Turn {t} acknowledged."},
             ]
         )
@@ -104,16 +116,7 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
                 "role": "user",
                 "content": f"Analyze tool output turn {turn} and summarize anomalies.",
             },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": f"tool-{turn}",
-                        "content": _build_tool_result(turn),
-                    }
-                ],
-            },
+            _tool_result_message(turn, provider),
         ]
     )
     return messages
@@ -152,14 +155,17 @@ def _make_proxy(mode: str) -> HeadroomProxy:
     return HeadroomProxy(cfg)
 
 
-def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
-    tokenizer = get_tokenizer(MODEL)
+def _simulate_mode(turns: int, mode: str, provider: str = "anthropic") -> ModeBenchmarkResult:
+    if provider not in MODELS:
+        raise ValueError(f"unsupported provider: {provider}")
+    model = MODELS[provider]
+    tokenizer = get_tokenizer(model)
     result = ModeBenchmarkResult(mode=mode)
 
     if mode == "baseline":
         prev_forwarded: list[dict[str, Any]] = []
         for turn in range(1, turns + 1):
-            messages = _build_conversation(turn)
+            messages = _build_conversation(turn, provider)
             before = tokenizer.count_messages(messages)
             common, counts = _common_prefix_tokens(prev_forwarded, messages, tokenizer)
             uncached = max(0, before - common)
@@ -173,17 +179,18 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
         return result
 
     proxy = _make_proxy(mode)
-    prefix_tracker = PrefixCacheTracker("anthropic")
+    prefix_tracker = PrefixCacheTracker(provider)
     comp_cache = CompressionCache()
     prev_forwarded = []
 
     for turn in range(1, turns + 1):
-        messages = _build_conversation(turn)
+        messages = _build_conversation(turn, provider)
         before = tokenizer.count_messages(messages)
 
         frozen = prefix_tracker.get_frozen_message_count()
         if mode in {PROXY_MODE_CACHE, PROXY_MODE_HYBRID}:
-            frozen = AnthropicHandlerMixin._strict_previous_turn_frozen_count(messages, frozen)
+            handler = AnthropicHandlerMixin if provider == "anthropic" else OpenAIHandlerMixin
+            frozen = handler._strict_previous_turn_frozen_count(messages, frozen)
 
         hybrid_rebase = False
         if mode == PROXY_MODE_HYBRID:
@@ -197,7 +204,7 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
                 expected_reads=max(10.0, float(turns - turn)),
                 p_alive=1.0,
                 context_pressure=before / 200_000,
-                write_multiplier=1.25,
+                write_multiplier=1.25 if provider == "anthropic" else 1.0,
             )
             frozen = decision.frozen_message_count
             hybrid_rebase = decision.should_rebase
@@ -207,10 +214,16 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
             working = comp_cache.apply_cached(messages)
             frozen = min(frozen, comp_cache.compute_frozen_count(messages))
 
-        context_limit = proxy.anthropic_provider.get_context_limit(MODEL)
-        pipeline_result = proxy.anthropic_pipeline.apply(
+        pipeline = proxy.anthropic_pipeline if provider == "anthropic" else proxy.openai_pipeline
+        model_provider = (
+            proxy.anthropic_provider if provider == "anthropic" else proxy.openai_provider
+        )
+        context_limit = (
+            CODEX_CONTEXT_WINDOW if provider == "openai" else model_provider.get_context_limit(model)
+        )
+        pipeline_result = pipeline.apply(
             messages=working,
-            model=MODEL,
+            model=model,
             model_limit=context_limit,
             context=extract_user_query(working),
             frozen_message_count=frozen,
@@ -252,12 +265,14 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
     return result
 
 
-def run_local_benchmark(turns: int = 12) -> dict[str, ModeBenchmarkResult]:
+def run_local_benchmark(
+    turns: int = 12, provider: str = "anthropic"
+) -> dict[str, ModeBenchmarkResult]:
     return {
-        "baseline": _simulate_mode(turns, "baseline"),
-        PROXY_MODE_TOKEN: _simulate_mode(turns, PROXY_MODE_TOKEN),
-        PROXY_MODE_CACHE: _simulate_mode(turns, PROXY_MODE_CACHE),
-        PROXY_MODE_HYBRID: _simulate_mode(turns, PROXY_MODE_HYBRID),
+        "baseline": _simulate_mode(turns, "baseline", provider),
+        PROXY_MODE_TOKEN: _simulate_mode(turns, PROXY_MODE_TOKEN, provider),
+        PROXY_MODE_CACHE: _simulate_mode(turns, PROXY_MODE_CACHE, provider),
+        PROXY_MODE_HYBRID: _simulate_mode(turns, PROXY_MODE_HYBRID, provider),
     }
 
 
@@ -303,6 +318,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Local benchmark for proxy token/cache modes")
     parser.add_argument("--turns", type=int, default=12, help="Conversation turns to simulate")
+    parser.add_argument("--provider", choices=tuple(MODELS), default="anthropic")
     parser.add_argument(
         "--show-real-harness",
         action="store_true",
@@ -310,7 +326,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    results = run_local_benchmark(turns=args.turns)
+    results = run_local_benchmark(turns=args.turns, provider=args.provider)
     _print_results(results)
     if args.show_real_harness:
         _print_real_harness()
