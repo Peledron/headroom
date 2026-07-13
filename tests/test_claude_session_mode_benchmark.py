@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from benchmarks.claude_session_mode_benchmark import (
     PROXY_MODE_CACHE,
+    PROXY_MODE_HYBRID,
     PROXY_MODE_TOKEN,
     ModeSummary,
     ReplayTurn,
@@ -157,8 +158,18 @@ def test_simulation_and_winner_logic() -> None:
     assert summaries[PROXY_MODE_CACHE].rewrite_turns >= 0
 
     winners = determine_winners(summaries)
-    assert winners["total_cost"] in {"baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE}
-    assert winners["window_with_cache"] in {"baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE}
+    assert winners["total_cost"] in {
+        "baseline",
+        PROXY_MODE_TOKEN,
+        PROXY_MODE_CACHE,
+        PROXY_MODE_HYBRID,
+    }
+    assert winners["window_with_cache"] in {
+        "baseline",
+        PROXY_MODE_TOKEN,
+        PROXY_MODE_CACHE,
+        PROXY_MODE_HYBRID,
+    }
 
 
 def test_observed_usage_summary_tracks_cache_patterns() -> None:

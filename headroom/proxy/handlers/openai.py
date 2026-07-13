@@ -2097,7 +2097,11 @@ class OpenAIHandlerMixin:
             MAX_REQUEST_BODY_SIZE,
             _read_request_json,
         )
-        from headroom.proxy.modes import is_cache_mode, is_token_mode
+        from headroom.proxy.modes import (
+            is_hybrid_mode,
+            is_token_mode,
+            preserves_warm_prefix,
+        )
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
@@ -2431,9 +2435,13 @@ class OpenAIHandlerMixin:
 
         # Get prefix cache tracker for this session
         openai_session_id = self.session_tracker_store.compute_session_id(request, model, messages)
+        openai_netcost_idle_seconds = self.session_tracker_store.peek_idle_seconds(
+            openai_session_id
+        )
         openai_prefix_tracker = self.session_tracker_store.get_or_create(
             openai_session_id, "openai"
         )
+        openai_prefix_tracker.record_turn_gap(openai_netcost_idle_seconds)
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge.
         # Same pattern as anthropic.py — read client value, union with
@@ -2477,11 +2485,36 @@ class OpenAIHandlerMixin:
         )
 
         openai_frozen_count = openai_prefix_tracker.get_frozen_message_count()
-        if is_cache_mode(self.config.mode):
+        _hybrid_should_rebase = False
+        if preserves_warm_prefix(self.config.mode):
             openai_frozen_count = OpenAIHandlerMixin._strict_previous_turn_frozen_count(
                 messages,
                 openai_frozen_count,
             )
+        if is_hybrid_mode(self.config.mode):
+            _hybrid_limit = self.openai_provider.get_context_limit(model)
+            _hybrid_kept = openai_prefix_tracker.conservative_compression_ratio(k=1.0)
+            try:
+                _hybrid_reads = float(
+                    os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0
+                )
+            except ValueError:
+                _hybrid_reads = 10.0
+            _hybrid_decision = openai_prefix_tracker.hybrid_controller.decide(
+                frozen_message_count=openai_frozen_count,
+                message_count=len(messages),
+                total_tokens=original_tokens,
+                estimated_savings_tokens=max(0, int(original_tokens * (1.0 - _hybrid_kept))),
+                cached_suffix_tokens=openai_prefix_tracker.cached_token_count(),
+                expected_reads=_hybrid_reads,
+                p_alive=max(0.0, 1.0 - (openai_netcost_idle_seconds or 0.0) / 300.0),
+                context_pressure=(original_tokens / _hybrid_limit if _hybrid_limit else 0.0),
+                write_multiplier=1.0,
+            )
+            openai_frozen_count = _hybrid_decision.frozen_message_count
+            _hybrid_should_rebase = _hybrid_decision.should_rebase
+            tags["hybrid_phase"] = _hybrid_decision.phase.value
+            tags["hybrid_generation"] = _hybrid_decision.generation
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
@@ -2520,7 +2553,7 @@ class OpenAIHandlerMixin:
                     # cache has no compressible entry for it yet; otherwise
                     # OpenAI-compatible tool-call clients freeze the entire
                     # conversation and report near-zero savings.
-                    if not is_cache_mode(self.config.mode):
+                    if not preserves_warm_prefix(self.config.mode):
                         openai_frozen_count = comp_cache.compute_frozen_count(messages)
 
                     result = await self._run_compression_in_executor(
@@ -2534,7 +2567,7 @@ class OpenAIHandlerMixin:
                                     working_messages,
                                     openai_frozen_count,
                                 )
-                                if is_cache_mode(self.config.mode)
+                                if preserves_warm_prefix(self.config.mode)
                                 else openai_frozen_count
                             ),
                             biases=_hook_biases,
@@ -2567,7 +2600,7 @@ class OpenAIHandlerMixin:
                             messages,
                             openai_frozen_count,
                         )
-                        if is_cache_mode(self.config.mode)
+                        if preserves_warm_prefix(self.config.mode)
                         else openai_frozen_count
                     )
                     result = await self._run_compression_in_executor(
@@ -2610,11 +2643,15 @@ class OpenAIHandlerMixin:
         # only-guarded and idempotent (cache mode already replays).
         from headroom.cache.prefix_tracker import overlay_cached_prefix
 
-        _ov = overlay_cached_prefix(
-            optimized_messages,
-            original_client_messages,
-            openai_prefix_tracker.get_last_original_messages(),
-            openai_prefix_tracker.get_last_forwarded_messages(),
+        _ov = (
+            optimized_messages
+            if _hybrid_should_rebase
+            else overlay_cached_prefix(
+                optimized_messages,
+                original_client_messages,
+                openai_prefix_tracker.get_last_original_messages(),
+                openai_prefix_tracker.get_last_forwarded_messages(),
+            )
         )
         if _ov != optimized_messages:
             optimized_messages = _ov
@@ -2631,6 +2668,8 @@ class OpenAIHandlerMixin:
             transforms_applied = []
 
         tokens_saved = original_tokens - optimized_tokens
+        if is_hybrid_mode(self.config.mode) and tokens_saved > 0:
+            openai_prefix_tracker.note_compression(original_tokens, optimized_tokens)
         optimization_latency = (time.time() - start_time) * 1000
 
         routing_markers = summarize_routing_markers(transforms_applied)
@@ -2745,7 +2784,7 @@ class OpenAIHandlerMixin:
                         f"hashes_seen={len(injector.detected_hashes)})"
                     )
 
-        if is_cache_mode(self.config.mode):
+        if preserves_warm_prefix(self.config.mode) and not _hybrid_should_rebase:
             optimized_messages, restored_count = self._restore_frozen_prefix(
                 original_client_messages,
                 optimized_messages,

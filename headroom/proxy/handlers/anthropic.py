@@ -649,7 +649,11 @@ class AnthropicHandlerMixin:
             compute_turn_id,
             read_request_json_with_bytes,
         )
-        from headroom.proxy.modes import is_cache_mode, is_token_mode
+        from headroom.proxy.modes import (
+            is_hybrid_mode,
+            is_token_mode,
+            preserves_warm_prefix,
+        )
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1143,7 +1147,7 @@ class AnthropicHandlerMixin:
 
             # Hook: pre_compress — let hooks modify messages before compression
 
-            if self.config.hooks and not is_cache_mode(self.config.mode):
+            if self.config.hooks and not preserves_warm_prefix(self.config.mode):
                 from headroom.hooks import CompressContext
 
                 _hook_ctx = CompressContext(
@@ -1164,6 +1168,7 @@ class AnthropicHandlerMixin:
             waste_signals_dict: dict[str, int] | None = None
             optimized_messages = messages
             optimized_tokens = original_tokens
+            request_messages_for_retry = messages
 
             # Get prefix cache tracker for this session
             session_id = self.session_tracker_store.compute_session_id(request, model, messages)
@@ -1178,11 +1183,72 @@ class AnthropicHandlerMixin:
             # effect, so it always runs and builds the signal even flags-off.
             prefix_tracker.record_turn_gap(netcost_idle_seconds)
             frozen_message_count = prefix_tracker.get_frozen_message_count()
-            if is_cache_mode(self.config.mode):
+            _hybrid_should_rebase = False
+            if preserves_warm_prefix(self.config.mode):
                 frozen_message_count = self._strict_previous_turn_frozen_count(
                     original_client_messages,
                     frozen_message_count,
                 )
+            if is_hybrid_mode(self.config.mode):
+                _hybrid_limit = self.anthropic_provider.get_context_limit(model)
+                _hybrid_ttl = prefix_tracker.recommended_ttl() or "5m"
+                _hybrid_ttl_seconds = 3600.0 if _hybrid_ttl == "1h" else 300.0
+                _hybrid_alive = max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _hybrid_ttl_seconds)
+                _hybrid_kept = prefix_tracker.conservative_compression_ratio(k=1.0)
+                try:
+                    _hybrid_reads = float(
+                        os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0
+                    )
+                except ValueError:
+                    _hybrid_reads = 10.0
+                _hybrid_decision = prefix_tracker.hybrid_controller.decide(
+                    frozen_message_count=frozen_message_count,
+                    message_count=len(messages),
+                    total_tokens=original_tokens,
+                    estimated_savings_tokens=max(0, int(original_tokens * (1.0 - _hybrid_kept))),
+                    cached_suffix_tokens=prefix_tracker.cached_token_count(),
+                    expected_reads=_hybrid_reads,
+                    p_alive=_hybrid_alive,
+                    context_pressure=(original_tokens / _hybrid_limit if _hybrid_limit else 0.0),
+                    write_multiplier=2.0 if _hybrid_ttl == "1h" else 1.25,
+                )
+                frozen_message_count = _hybrid_decision.frozen_message_count
+                _hybrid_should_rebase = _hybrid_decision.should_rebase
+                tags["hybrid_phase"] = _hybrid_decision.phase.value
+                tags["hybrid_generation"] = _hybrid_decision.generation
+                if _hybrid_decision.should_rebase:
+                    logger.info(
+                        "[%s] HYBRID_REBASE: generation=%d gain=%.0f reason=%s",
+                        request_id,
+                        _hybrid_decision.generation,
+                        _hybrid_decision.net_gain_tokens,
+                        _hybrid_decision.reason,
+                    )
+                if os.environ.get("HEADROOM_OPTICAL_TEXT") == "1" and frozen_message_count == 0:
+                    from headroom.transforms.text_optical import TextOpticalCompressor
+
+                    _optical_cache = os.path.expanduser(
+                        os.environ.get(
+                            "HEADROOM_OPTICAL_CACHE_DIR", "~/.cache/headroom/text-optical"
+                        )
+                    )
+                    messages, _optical_count = TextOpticalCompressor(
+                        _optical_cache,
+                        count_tokens=tokenizer.count_text,
+                    ).compress_anthropic_messages(
+                        messages,
+                        model=model,
+                        generation=_hybrid_decision.generation,
+                    )
+                    if _optical_count:
+                        tags["optical_text_outputs"] = _optical_count
+                        logger.info(
+                            "[%s] HYBRID_OPTICAL: rendered %d immutable prose output(s) "
+                            "for generation=%d",
+                            request_id,
+                            _optical_count,
+                            _hybrid_decision.generation,
+                        )
 
             # PR-A6 (P5-50, preps P0-6): session-sticky `anthropic-beta` merge.
             # Read the client's beta value (note: anthropic-beta is NOT
@@ -1236,9 +1302,7 @@ class AnthropicHandlerMixin:
                     if t.strip() and t.strip() not in _cur_set
                 ]
                 if _missing:
-                    headers["anthropic-beta"] = (
-                        (_cur + "," if _cur else "") + ",".join(_missing)
-                    )
+                    headers["anthropic-beta"] = (_cur + "," if _cur else "") + ",".join(_missing)
                     logger.info(f"[{request_id}] HR_FORCE_BETA: appended {_missing}")
             log_beta_header_merge(
                 provider="anthropic",
@@ -1265,7 +1329,7 @@ class AnthropicHandlerMixin:
                 headers=request.headers, config=self.config, messages=messages
             )
             _image_decision.apply_to_tags(tags)
-            if _image_decision.should_compress and not is_cache_mode(self.config.mode):
+            if _image_decision.should_compress and not preserves_warm_prefix(self.config.mode):
                 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
                 compressor = None
@@ -1295,7 +1359,7 @@ class AnthropicHandlerMixin:
                         compressor.close()
 
             _compression_failed = False
-            original_messages = messages  # Preserve for 400-retry fallback
+            original_messages = request_messages_for_retry  # Preserve for 400-retry fallback
             _decision = CompressionDecision.decide(
                 headers=request.headers,
                 config=self.config,
@@ -1591,7 +1655,7 @@ class AnthropicHandlerMixin:
                             # gate's next-turn saving estimate self-corrects off real
                             # data instead of the static prior.
                             prefix_tracker.note_compression(original_tokens, optimized_tokens)
-                    elif not is_cache_mode(self.config.mode):
+                    elif not preserves_warm_prefix(self.config.mode) or _hybrid_should_rebase:
                         skip_ccr_request_compression = should_skip_ccr_request_compression(
                             frozen_message_count
                         )
@@ -1748,11 +1812,15 @@ class AnthropicHandlerMixin:
 
             _prev_orig_diag = prefix_tracker.get_last_original_messages()
             _prev_fwd_diag = prefix_tracker.get_last_forwarded_messages()
-            _ov = overlay_cached_prefix(
-                optimized_messages,
-                original_client_messages,
-                _prev_orig_diag,
-                _prev_fwd_diag,
+            _ov = (
+                optimized_messages
+                if _hybrid_should_rebase
+                else overlay_cached_prefix(
+                    optimized_messages,
+                    original_client_messages,
+                    _prev_orig_diag,
+                    _prev_fwd_diag,
+                )
             )
             # TOKEN_DIAG (2026-07-12, temporary): trace token-mode partial busts.
             # overlay replays the prior forwarded prefix byte-stable ONLY when it
@@ -1814,7 +1882,7 @@ class AnthropicHandlerMixin:
 
             # Guard: if "optimization" inflated tokens, revert to originals.
             # Skip in cache mode where prefix-stability may legitimately shift counts.
-            if optimized_tokens > original_tokens and not is_cache_mode(self.config.mode):
+            if optimized_tokens > original_tokens and not preserves_warm_prefix(self.config.mode):
                 logger.warning(
                     f"[{request_id}] Optimization inflated tokens "
                     f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
@@ -1824,6 +1892,8 @@ class AnthropicHandlerMixin:
                 transforms_applied = []
 
             tokens_saved = max(0, original_tokens - optimized_tokens)
+            if is_hybrid_mode(self.config.mode) and tokens_saved > 0:
+                prefix_tracker.note_compression(original_tokens, optimized_tokens)
             optimization_latency = (time.time() - start_time) * 1000
 
             routing_markers = summarize_routing_markers(transforms_applied)
@@ -2161,7 +2231,7 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] CCR: Proactively expanded {len(expansions)} context(s) "
                                 f"based on query relevance"
                             )
-                            if is_cache_mode(self.config.mode):
+                            if preserves_warm_prefix(self.config.mode):
                                 logger.info(
                                     f"[{request_id}] CCR: skipping proactive expansion append "
                                     "in cache mode to preserve next-turn prefix stability"
@@ -2252,7 +2322,7 @@ class AnthropicHandlerMixin:
                                     bytes_injected=0,
                                     query=user_query,
                                 )
-                            elif is_cache_mode(self.config.mode):
+                            elif preserves_warm_prefix(self.config.mode):
                                 # Cache mode: skip injection entirely so the next-turn
                                 # prefix bytes remain byte-equal to this turn's bytes.
                                 log_memory_injection(
@@ -2811,7 +2881,8 @@ class AnthropicHandlerMixin:
                             _c = _m.get("content")
                             if _idx < _last and isinstance(_c, list) and len(_c) > 1:
                                 _f = [
-                                    _b for _b in _c
+                                    _b
+                                    for _b in _c
                                     if not (
                                         isinstance(_b, dict)
                                         and _b.get("type") == "text"
@@ -2939,9 +3010,7 @@ class AnthropicHandlerMixin:
                                 and isinstance(_b.get("text"), str)
                                 and "[1m]" in _b["text"]
                             ):
-                                _canon = _re.sub(
-                                    r"(claude-[a-z0-9.\-]+)\[1m\]", r"\1", _b["text"]
-                                )
+                                _canon = _re.sub(r"(claude-[a-z0-9.\-]+)\[1m\]", r"\1", _b["text"])
                                 if _canon != _b["text"]:
                                     _out.append({**_b, "text": _canon})
                                     _changed = True
@@ -3882,7 +3951,10 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
+                        lambda messages=messages,
+                        model=model,
+                        context_limit=context_limit,
+                        frozen_message_count=frozen_message_count: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,

@@ -233,16 +233,19 @@ def dashboard(port: int, no_open: bool) -> None:
     metavar="[token|cache]",
     type=click.Choice(
         # Canonical modes first; legacy aliases follow for backward compatibility.
-        # `metavar` above hides the alias clutter from --help; users see "[token|cache]"
+        # `metavar` above hides the alias clutter from --help.
         # while internal callers passing "token_mode"/"cost_savings"/etc. still validate.
         [
             "token",
             "cache",
+            "hybrid",
             "token_mode",
             "cache_mode",
             "token_savings",
             "cost_savings",
             "token_headroom",
+            "hybrid_mode",
+            "cache_hybrid",
         ],
         case_sensitive=False,
     ),
@@ -250,6 +253,7 @@ def dashboard(port: int, no_open: bool) -> None:
         "Optimization mode (default: token).\n"
         "  token  — prioritize compression; prior turns may be rewritten for max savings.\n"
         "  cache  — freeze prior turns to maximise provider prefix-cache hit rate.\n"
+        "  hybrid - freeze a compressed prefix, compress live deltas, and rebase by cost.\n"
         "Legacy aliases (token_mode, token_savings, token_headroom, cache_mode, "
         "cost_savings) are still accepted. Env: HEADROOM_MODE."
     ),

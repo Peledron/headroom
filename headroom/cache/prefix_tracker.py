@@ -26,6 +26,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.proxy.hybrid_mode import HybridModeController
+
 logger = logging.getLogger(__name__)
 
 # Provider cache economics for cost comparisons
@@ -456,6 +458,10 @@ class PrefixCacheTracker:
         # the estimate is noisy). Both stay None/0 until the first observation.
         self._kept_ewma: float | None = None
         self._kept_var: float = 0.0
+        # First-class hybrid mode owns its prefix generation and rebase
+        # hysteresis here so it follows the same session affinity and expiry as
+        # provider cache observations.
+        self.hybrid_controller = HybridModeController(provider)
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides

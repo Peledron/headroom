@@ -271,6 +271,9 @@ headroom proxy --no-cache
 # Preserve provider prefix-cache stability instead of maximizing token removal
 headroom proxy --mode cache
 
+# Keep an immutable warm prefix and compress only its live delta
+headroom proxy --mode hybrid
+
 # Enable memory and live learning
 headroom proxy --memory
 headroom proxy --learn --min-evidence 3
@@ -282,7 +285,9 @@ headroom proxy --learn --min-evidence 3
 |----------|-------------|---------|
 | `HEADROOM_HOST` | Proxy bind host | `127.0.0.1` |
 | `HEADROOM_PORT` | Proxy bind port | `8787` |
-| `HEADROOM_MODE` | Proxy optimization mode: `token` or `cache` | `token` |
+| `HEADROOM_MODE` | Proxy optimization mode: `token`, `cache`, or `hybrid` | `token` |
+| `HEADROOM_OPTICAL_TEXT` | Experimental Anthropic optical text conversion in `hybrid` mode. `1` enables cold-build and approved-rebase conversion only. Exact identifiers remain in a text sidecar. | `0` |
+| `HEADROOM_OPTICAL_CACHE_DIR` | Content-addressed PNG cache for experimental optical text conversion | `~/.cache/headroom/text-optical` |
 | `HEADROOM_WORKERS` | Uvicorn worker count | `1` |
 | `HEADROOM_LIMIT_CONCURRENCY` | Maximum concurrent connections before 503 | `1000` |
 | `HEADROOM_MAX_CONNECTIONS` | Maximum upstream HTTP connections | `500` |

@@ -5,6 +5,7 @@ Compares:
 - baseline: no compression
 - token mode: prioritize compression
 - cache mode: preserve prior-turn prefix stability
+- hybrid mode: stable compressed prefix plus live-delta compression and cost-gated rebases
 
 Includes an optional real-test harness printout for Claude Code, but does not
 invoke external APIs unless the user does so manually.
@@ -20,10 +21,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.cache.compression_cache import CompressionCache
-from headroom.cache.prefix_tracker import PrefixCacheTracker
+from headroom.cache.prefix_tracker import PrefixCacheTracker, overlay_cached_prefix
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.models import ProxyConfig
-from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_TOKEN
+from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_HYBRID, PROXY_MODE_TOKEN
 from headroom.proxy.server import HeadroomProxy
 from headroom.tokenizers import get_tokenizer
 from headroom.utils import extract_user_query
@@ -181,8 +182,25 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
         before = tokenizer.count_messages(messages)
 
         frozen = prefix_tracker.get_frozen_message_count()
-        if mode == PROXY_MODE_CACHE:
+        if mode in {PROXY_MODE_CACHE, PROXY_MODE_HYBRID}:
             frozen = AnthropicHandlerMixin._strict_previous_turn_frozen_count(messages, frozen)
+
+        hybrid_rebase = False
+        if mode == PROXY_MODE_HYBRID:
+            kept = prefix_tracker.conservative_compression_ratio(k=1.0)
+            decision = prefix_tracker.hybrid_controller.decide(
+                frozen_message_count=frozen,
+                message_count=len(messages),
+                total_tokens=before,
+                estimated_savings_tokens=max(0, int(before * (1.0 - kept))),
+                cached_suffix_tokens=prefix_tracker.cached_token_count(),
+                expected_reads=max(10.0, float(turns - turn)),
+                p_alive=1.0,
+                context_pressure=before / 200_000,
+                write_multiplier=1.25,
+            )
+            frozen = decision.frozen_message_count
+            hybrid_rebase = decision.should_rebase
 
         working = messages
         if mode == PROXY_MODE_TOKEN:
@@ -201,9 +219,12 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
 
         if mode == PROXY_MODE_TOKEN:
             comp_cache.update_from_result(messages, forwarded)
-        if mode == PROXY_MODE_CACHE:
-            forwarded, _ = AnthropicHandlerMixin._restore_frozen_prefix(
-                messages, forwarded, frozen_message_count=frozen
+        if mode == PROXY_MODE_CACHE or (mode == PROXY_MODE_HYBRID and not hybrid_rebase):
+            forwarded = overlay_cached_prefix(
+                forwarded,
+                messages,
+                prefix_tracker.get_last_original_messages(),
+                prefix_tracker.get_last_forwarded_messages(),
             )
 
         after = tokenizer.count_messages(forwarded)
@@ -213,6 +234,8 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
         result.total_original_tokens += before
         result.total_sent_tokens += after
         result.total_tokens_saved += max(0, before - after)
+        if mode == PROXY_MODE_HYBRID and after < before:
+            prefix_tracker.note_compression(before, after)
         result.total_cache_read_tokens += common
         result.total_uncached_tokens += uncached
 
@@ -221,6 +244,7 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
             cache_write_tokens=uncached,
             messages=forwarded,
             message_token_counts=msg_counts,
+            original_messages=messages,
         )
         result.total_cache_write_tokens += uncached
         prev_forwarded = copy.deepcopy(forwarded)
@@ -233,6 +257,7 @@ def run_local_benchmark(turns: int = 12) -> dict[str, ModeBenchmarkResult]:
         "baseline": _simulate_mode(turns, "baseline"),
         PROXY_MODE_TOKEN: _simulate_mode(turns, PROXY_MODE_TOKEN),
         PROXY_MODE_CACHE: _simulate_mode(turns, PROXY_MODE_CACHE),
+        PROXY_MODE_HYBRID: _simulate_mode(turns, PROXY_MODE_HYBRID),
     }
 
 
@@ -241,7 +266,7 @@ def _print_results(results: dict[str, ModeBenchmarkResult]) -> None:
         "\nMode benchmark (higher compression + higher cache_hit is better for total cost):\n"
         "mode      orig_tok   sent_tok   saved_tok   compression   cache_hit   uncached_tok"
     )
-    for key in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for key in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         r = results[key]
         print(
             f"{r.mode:<9} {r.total_original_tokens:>9,} {r.total_sent_tokens:>10,} "
@@ -251,19 +276,24 @@ def _print_results(results: dict[str, ModeBenchmarkResult]) -> None:
 
     token = results[PROXY_MODE_TOKEN]
     cache = results[PROXY_MODE_CACHE]
+    hybrid = results[PROXY_MODE_HYBRID]
     print("\nDelta (cache - token):")
     print(f"  cache_hit_pct: {cache.cache_hit_pct - token.cache_hit_pct:+.1f}%")
     print(f"  compression_pct: {cache.compression_pct - token.compression_pct:+.1f}%")
     print(f"  uncached_tokens: {cache.total_uncached_tokens - token.total_uncached_tokens:+,}")
+    print("\nDelta (hybrid - token):")
+    print(f"  cache_hit_pct: {hybrid.cache_hit_pct - token.cache_hit_pct:+.1f}%")
+    print(f"  compression_pct: {hybrid.compression_pct - token.compression_pct:+.1f}%")
 
 
 def _print_real_harness() -> None:
     print("\nReal test harness (manual; optional, not executed by this benchmark):")
     print("  1) Start proxy in cache mode:  HEADROOM_MODE=cache headroom proxy --port 8787")
     print("  2) Start proxy in token mode:  HEADROOM_MODE=token headroom proxy --port 8787")
-    print("  3) Run Claude Code against each:")
+    print("  3) Start proxy in hybrid mode: HEADROOM_MODE=hybrid headroom proxy --port 8787")
+    print("  4) Run Claude Code against each:")
     print("     ANTHROPIC_BASE_URL=http://localhost:8787 claude")
-    print("  4) Compare /stats prefix_cache and compression sections per run.")
+    print("  5) Compare /stats prefix_cache and compression sections per run.")
 
 
 def main() -> None:
