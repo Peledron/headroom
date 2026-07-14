@@ -73,3 +73,24 @@ def test_codex_timeout_is_restored_after_tokensave_rewrite(tmp_path) -> None:
     assert mod.ensure_codex_tokensave_timeout(config) is True
     assert "startup_timeout_sec = 30.0" in config.read_text(encoding="utf-8")
     assert mod.ensure_codex_tokensave_timeout(config) is False
+
+
+def test_bounded_tokensave_policy_is_appended_once(tmp_path) -> None:
+    mod = _module()
+    codex = tmp_path / ".codex" / "AGENTS.md"
+    claude = tmp_path / ".claude" / "CLAUDE.md"
+    codex.parent.mkdir()
+    claude.parent.mkdir()
+    codex.write_text("# Codex guidance\n", encoding="utf-8")
+    claude.write_text("# Claude guidance\n", encoding="utf-8")
+
+    changed = mod.ensure_bounded_tokensave_policy(
+        ["codex", "claude"], home=tmp_path
+    )
+    assert changed == [codex, claude]
+    assert codex.read_text(encoding="utf-8").count(mod.TOKENSAVE_BUDGET_MARKER) == 1
+    assert claude.read_text(encoding="utf-8").count(mod.TOKENSAVE_BUDGET_MARKER) == 1
+
+    assert mod.ensure_bounded_tokensave_policy(
+        ["codex", "claude"], home=tmp_path
+    ) == []

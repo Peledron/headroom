@@ -22,7 +22,8 @@ from .base import Provider, TokenCounter
 logger = logging.getLogger(__name__)
 
 # Pricing metadata for transparency
-_PRICING_LAST_UPDATED = date(2025, 1, 14)
+_PRICING_LAST_UPDATED = date(2026, 7, 13)
+_PRICING_SOURCE_URL = "https://platform.openai.com/docs/pricing"
 _PRICING_STALE_DAYS = 60  # Warn if pricing data is older than this
 
 # Warning tracking
@@ -116,37 +117,65 @@ _CONTEXT_LIMITS: dict[str, int] = {
 }
 
 # Fallback pricing - LiteLLM is preferred source
-# OpenAI pricing per 1M tokens (input, output)
+# OpenAI standard-processing pricing per 1M tokens
+# (uncached input, cached input, output).  A cached-input value of None means
+# the upstream table does not publish a cache discount for that model.
 # NOTE: These are ESTIMATES. Always verify against actual OpenAI billing.
-# Last updated: 2025-01-14
-_PRICING: dict[str, tuple[float, float]] = {
-    "gpt-4o": (2.50, 10.00),
-    "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4-turbo": (10.00, 30.00),
-    "gpt-4": (30.00, 60.00),
-    "gpt-3.5-turbo": (0.50, 1.50),
-    "o1": (15.00, 60.00),
-    "o1-preview": (15.00, 60.00),
-    "o1-mini": (3.00, 12.00),
-    "o3": (10.00, 40.00),
-    "o3-mini": (1.10, 4.40),
+# Source: https://platform.openai.com/docs/pricing
+# Last updated: 2026-07-13
+_PRICING: dict[str, tuple[float, float | None, float]] = {
+    "gpt-5.6-sol": (5.00, 0.50, 30.00),
+    "gpt-5.6-terra": (2.50, 0.25, 15.00),
+    "gpt-5.6-luna": (1.00, 0.10, 6.00),
+    "gpt-5.6": (5.00, 0.50, 30.00),
+    "gpt-5.5-pro": (30.00, None, 180.00),
+    "gpt-5.5": (5.00, 0.50, 30.00),
+    "gpt-5.4-mini": (0.75, 0.075, 4.50),
+    "gpt-5.4-nano": (0.20, 0.02, 1.25),
+    "gpt-5.4-pro": (30.00, None, 180.00),
+    "gpt-5.4": (2.50, 0.25, 15.00),
+    "gpt-5.2-pro": (21.00, None, 168.00),
+    "gpt-5.2": (1.75, 0.175, 14.00),
+    "gpt-5.1": (1.25, 0.125, 10.00),
+    "gpt-5-mini": (0.25, 0.025, 2.00),
+    "gpt-5-nano": (0.05, 0.005, 0.40),
+    "gpt-5-pro": (15.00, None, 120.00),
+    "gpt-5": (1.25, 0.125, 10.00),
+    "gpt-4.1-mini": (0.40, 0.10, 1.60),
+    "gpt-4.1-nano": (0.10, 0.025, 0.40),
+    "gpt-4.1": (2.00, 0.50, 8.00),
+    "gpt-4o-mini": (0.15, 0.075, 0.60),
+    "gpt-4o": (2.50, 1.25, 10.00),
+    "gpt-4-turbo": (10.00, None, 30.00),
+    "gpt-4": (30.00, None, 60.00),
+    "gpt-3.5-turbo": (0.50, None, 1.50),
+    "o1-pro": (150.00, None, 600.00),
+    "o1-mini": (1.10, 0.55, 4.40),
+    "o1-preview": (15.00, 7.50, 60.00),
+    "o1": (15.00, 7.50, 60.00),
+    "o3-pro": (20.00, None, 80.00),
+    "o3-mini": (1.10, 0.55, 4.40),
+    "o3": (2.00, 0.50, 8.00),
+    "o4-mini": (1.10, 0.275, 4.40),
 }
 
 # Pattern-based defaults for unknown models
 _PATTERN_DEFAULTS = {
-    "gpt-4o": {"context": 128000, "encoding": "o200k_base", "pricing": (2.50, 10.00)},
-    "gpt-4-turbo": {"context": 128000, "encoding": "cl100k_base", "pricing": (10.00, 30.00)},
-    "gpt-4": {"context": 8192, "encoding": "cl100k_base", "pricing": (30.00, 60.00)},
-    "gpt-3.5": {"context": 16385, "encoding": "cl100k_base", "pricing": (0.50, 1.50)},
-    "o1": {"context": 200000, "encoding": "o200k_base", "pricing": (15.00, 60.00)},
-    "o3": {"context": 200000, "encoding": "o200k_base", "pricing": (10.00, 40.00)},
+    "gpt-5.6": {"context": 1_050_000, "encoding": "o200k_base", "pricing": (5.00, 0.50, 30.00)},
+    "gpt-5": {"context": 400000, "encoding": "o200k_base", "pricing": (1.25, 0.125, 10.00)},
+    "gpt-4o": {"context": 128000, "encoding": "o200k_base", "pricing": (2.50, 1.25, 10.00)},
+    "gpt-4-turbo": {"context": 128000, "encoding": "cl100k_base", "pricing": (10.00, None, 30.00)},
+    "gpt-4": {"context": 8192, "encoding": "cl100k_base", "pricing": (30.00, None, 60.00)},
+    "gpt-3.5": {"context": 16385, "encoding": "cl100k_base", "pricing": (0.50, None, 1.50)},
+    "o1": {"context": 200000, "encoding": "o200k_base", "pricing": (15.00, 7.50, 60.00)},
+    "o3": {"context": 200000, "encoding": "o200k_base", "pricing": (2.00, 0.50, 8.00)},
 }
 
 # Default for completely unknown OpenAI models
 _UNKNOWN_OPENAI_DEFAULT = {
     "context": 128000,
     "encoding": "o200k_base",
-    "pricing": (2.50, 10.00),  # GPT-4o tier as reasonable default
+    "pricing": (2.50, 1.25, 10.00),  # GPT-4o tier as reasonable default
 }
 
 
@@ -390,7 +419,7 @@ class OpenAIProvider(Provider):
            {
              "openai": {
                "context_limits": {"my-model": 128000},
-               "pricing": {"my-model": [2.50, 10.00]}
+                "pricing": {"my-model": [2.50, 1.25, 10.00]}
              }
            }
     """
@@ -413,8 +442,12 @@ class OpenAIProvider(Provider):
 
         # Handle pricing (can be tuple or list from JSON)
         for model, pricing in custom_config["pricing"].items():
-            if isinstance(pricing, list | tuple) and len(pricing) >= 2:
-                self._pricing[model] = (float(pricing[0]), float(pricing[1]))
+            if isinstance(pricing, list | tuple) and len(pricing) >= 3:
+                cached = None if pricing[1] is None else float(pricing[1])
+                self._pricing[model] = (float(pricing[0]), cached, float(pricing[2]))
+            elif isinstance(pricing, list | tuple) and len(pricing) >= 2:
+                # Backwards-compatible [input, output] custom configuration.
+                self._pricing[model] = (float(pricing[0]), None, float(pricing[1]))
 
         # Explicit overrides take precedence
         if context_limits:
@@ -521,27 +554,24 @@ class OpenAIProvider(Provider):
         model: str,
         cached_tokens: int = 0,
     ) -> float | None:
-        """Estimate cost for OpenAI API call.
+        """Estimate an OpenAI API call at current standard-processing rates.
 
-        ⚠️ IMPORTANT: This is an ESTIMATE only.
-        - Pricing data may be outdated
-        - Cached token discount assumed at 50% (actual may vary)
-        - Always verify against your actual OpenAI billing
-
-        Args:
-            input_tokens: Number of input tokens.
-            output_tokens: Number of output tokens.
-            model: Model name.
-            cached_tokens: Number of cached tokens (estimated 50% discount).
-
-        Returns:
-            Estimated cost in USD, or None if pricing unknown.
+        Known OpenAI models use the dated, source-linked upstream table in this
+        module.  Unknown compatible models fall back to LiteLLM when possible.
+        ``input_tokens`` includes ``cached_tokens``.
         """
-        # Try LiteLLM first (most up-to-date pricing)
+        has_manual_price = any(
+            model == model_name or model.startswith(f"{model_name}-")
+            for model_name in self._pricing
+        )
+        if has_manual_price or _infer_model_family(model) in _PATTERN_DEFAULTS:
+            return self._estimate_cost_manual(
+                input_tokens, output_tokens, model, cached_tokens
+            )
+
         litellm = _get_litellm_module()
-        if litellm is not None:
+        if litellm is not None and cached_tokens <= 0:
             try:
-                # LiteLLM uses per-token pricing, returns total cost
                 cost = litellm.completion_cost(
                     model=model,
                     prompt_tokens=input_tokens,
@@ -550,10 +580,11 @@ class OpenAIProvider(Provider):
                 if cost is not None and cost > 0:
                     return float(cost)
             except Exception:
-                pass  # Fall through to manual pricing
+                pass
 
-        # Fall back to hardcoded pricing
-        return self._estimate_cost_manual(input_tokens, output_tokens, model, cached_tokens)
+        return self._estimate_cost_manual(
+            input_tokens, output_tokens, model, cached_tokens
+        )
 
     def _estimate_cost_manual(
         self,
@@ -562,45 +593,50 @@ class OpenAIProvider(Provider):
         model: str,
         cached_tokens: int = 0,
     ) -> float | None:
-        """Estimate cost using hardcoded pricing (fallback)."""
-        # Check for stale pricing and warn once
+        """Estimate cost from the source-linked fallback pricing table."""
         staleness_warning = _check_pricing_staleness()
         if staleness_warning:
             warnings.warn(staleness_warning, UserWarning, stacklevel=2)
 
         pricing = self._get_pricing(model)
-        if not pricing:
+        if pricing is None:
             return None
 
-        input_price, output_price = pricing
+        input_price, cached_input_price, output_price = pricing
+        input_count = max(0, input_tokens)
+        cached_count = min(max(0, cached_tokens), input_count)
+        uncached_count = input_count - cached_count
+        effective_cached_price = (
+            input_price if cached_input_price is None else cached_input_price
+        )
+        return (
+            uncached_count * input_price
+            + cached_count * effective_cached_price
+            + max(0, output_tokens) * output_price
+        ) / 1_000_000
 
-        # Calculate cost (cached tokens get estimated 50% discount)
-        # NOTE: Actual OpenAI cache discount may vary
-        regular_input = input_tokens - cached_tokens
-        cached_cost = (cached_tokens / 1_000_000) * input_price * 0.5
-        regular_cost = (regular_input / 1_000_000) * input_price
-        output_cost = (output_tokens / 1_000_000) * output_price
-
-        return cached_cost + regular_cost + output_cost
-
-    def _get_pricing(self, model: str) -> tuple[float, float] | None:
-        """Get pricing for a model with fallback logic."""
-        # Direct match
+    def _get_pricing(
+        self, model: str
+    ) -> tuple[float, float | None, float] | None:
+        """Get standard pricing for a model with family fallbacks."""
         if model in self._pricing:
             return self._pricing[model]
 
-        # Prefix match
         for model_prefix, pricing in self._pricing.items():
-            if model.startswith(model_prefix):
+            if model.startswith(f"{model_prefix}-"):
                 return pricing
 
-        # Pattern-based inference
         family = _infer_model_family(model)
         if family and family in _PATTERN_DEFAULTS:
-            return cast(tuple[float, float], _PATTERN_DEFAULTS[family]["pricing"])
+            return cast(
+                tuple[float, float | None, float],
+                _PATTERN_DEFAULTS[family]["pricing"],
+            )
 
-        # Default for unknown models
-        return cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
+        return cast(
+            tuple[float, float | None, float],
+            _UNKNOWN_OPENAI_DEFAULT["pricing"],
+        )
 
     def get_output_buffer(self, model: str, default: int = 4000) -> int:
         """Get recommended output buffer."""

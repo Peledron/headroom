@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -35,6 +36,30 @@ LANGUAGE_MARKERS = (
     ("go", ("go.mod",)),
     ("java", ("pom.xml", "build.gradle", "build.gradle.kts")),
 )
+
+TOKENSAVE_BUDGET_MARKER = "## Headroom TokenSave call budget"
+CODEX_TOOL_BUDGET_COMMAND = "headroom-codex-tool-budget"
+CODEX_TOOL_BUDGET_MATCHER = (
+    "Bash|mcp__tokensave__.*|mcp__serena__.*|tokensave\\..*|serena\\..*"
+)
+TOKENSAVE_BUDGET_POLICY = f"""{TOKENSAVE_BUDGET_MARKER}
+
+Use TokenSave for open-ended semantic discovery, call relationships, impact,
+and affected-file analysis. Skip it for three or fewer named files, exact
+literals, known symbols, or questions one bounded grep or symbol lookup can
+answer.
+
+For a targeted named-file investigation, use at most two tool calls per phase.
+Read the named files or symbols directly. Do not begin with a repository-wide
+search, reread agent instruction files, or inspect benchmark/scorer files unless
+the user asks for them. Stop once the requested facts are established.
+
+Check TokenSave status once per project session. Use at most one context or
+search call per investigation phase and at most two exact TokenSave source
+fetches before handing off to Serena or direct reads. Never use TokenSave read
+and body calls for the same source. Query the TokenSave SQLite database only for
+complex structural questions the MCP tools cannot express.
+"""
 
 
 def detect_languages(root: Path, *, file_limit: int = 2_000) -> list[str]:
@@ -146,6 +171,54 @@ def ensure_codex_tokensave_timeout(
     return True
 
 
+def ensure_codex_tool_budget_hook(hooks_path: Path | None = None) -> bool:
+    """Install the bounded exploration hook without replacing existing hooks."""
+    if hooks_path is None:
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        hooks_path = codex_home / "hooks.json"
+
+    if hooks_path.exists():
+        try:
+            config = json.loads(hooks_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid Codex hooks JSON in {hooks_path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise RuntimeError(f"Codex hooks configuration must be an object: {hooks_path}")
+    else:
+        config = {}
+
+    hooks = config.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"Codex hooks entry must be an object: {hooks_path}")
+    pre_tool_use = hooks.setdefault("PreToolUse", [])
+    if not isinstance(pre_tool_use, list):
+        raise RuntimeError(f"Codex PreToolUse entry must be a list: {hooks_path}")
+
+    for group in pre_tool_use:
+        if not isinstance(group, dict):
+            continue
+        commands = group.get("hooks", [])
+        if isinstance(commands, list) and any(
+            isinstance(item, dict) and item.get("command") == CODEX_TOOL_BUDGET_COMMAND
+            for item in commands
+        ):
+            if group.get("matcher") == CODEX_TOOL_BUDGET_MATCHER:
+                return False
+            group["matcher"] = CODEX_TOOL_BUDGET_MATCHER
+            hooks_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            return True
+
+    pre_tool_use.append(
+        {
+            "matcher": CODEX_TOOL_BUDGET_MATCHER,
+            "hooks": [{"type": "command", "command": CODEX_TOOL_BUDGET_COMMAND}],
+        }
+    )
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
 def build_plan(
     root: Path, agents: Iterable[str], *, install_missing: bool = True
 ) -> list[list[str]]:
@@ -192,6 +265,37 @@ def run_plan(plan: Sequence[Sequence[str]], *, dry_run: bool) -> None:
             subprocess.run(command, check=True)
 
 
+def ensure_bounded_tokensave_policy(
+    agents: Sequence[str], *, home: Path | None = None
+) -> list[Path]:
+    """Append an idempotent measured call budget to installed agent guidance."""
+    base = Path.home() if home is None else home
+    codex_home = (
+        Path(os.environ.get("CODEX_HOME", base / ".codex"))
+        if home is None
+        else base / ".codex"
+    )
+    paths = {
+        "codex": codex_home / "AGENTS.md",
+        "claude": base / ".claude" / "CLAUDE.md",
+    }
+    changed: list[Path] = []
+    for agent in agents:
+        path = paths[agent]
+        if not path.exists():
+            continue
+        source = path.read_text(encoding="utf-8")
+        if TOKENSAVE_BUDGET_MARKER in source:
+            continue
+        separator = "" if not source or source.endswith("\n\n") else "\n"
+        path.write_text(
+            f"{source}{separator}\n{TOKENSAVE_BUDGET_POLICY}\n",
+            encoding="utf-8",
+        )
+        changed.append(path)
+    return changed
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("project", nargs="?", default=".")
@@ -208,8 +312,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             update_serena_languages(config_path, root.name, languages)
         plan = build_plan(root, agents, install_missing=not args.no_install_missing)
         run_plan(plan, dry_run=args.dry_run)
+        if not args.dry_run:
+            ensure_bounded_tokensave_policy(agents)
         if not args.dry_run and "codex" in agents:
             ensure_codex_tokensave_timeout()
+            ensure_codex_tool_budget_hook()
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"bootstrap failed: {exc}", file=sys.stderr)
         return 1

@@ -295,6 +295,7 @@ all = [
 [project.scripts]
 headroom = "headroom.cli:main"
 headroom-bootstrap-agent-tools = "headroom.cli.bootstrap_agent_tools:main"
+headroom-codex-tool-budget = "headroom.cli.codex_tool_budget:main"
 
 [project.urls]
 Homepage = "https://headroom-docs.vercel.app"
