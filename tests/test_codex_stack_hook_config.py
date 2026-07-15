@@ -27,3 +27,9 @@ def test_non_full_arms_do_not_bypass_hook_trust() -> None:
     assert "--dangerously-bypass-hook-trust" not in codex_stack_canary._arm_flags(
         "headroom"
     )
+
+
+def test_full_without_headroom_uses_direct_openai_provider() -> None:
+    flags = codex_stack_canary._arm_flags("full-no-headroom")
+    assert "--dangerously-bypass-hook-trust" in flags
+    assert 'model_provider="openai"' in flags

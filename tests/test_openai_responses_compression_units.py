@@ -542,6 +542,45 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output():
     assert search_unheading(folded) == grep_out  # byte-exact recovery
 
 
+def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts():
+    from headroom.transforms.lossless_compaction import search_unheading
+
+    router = ContentRouter()
+    router.config.exclude_tools = {"grep"}
+    handler = _handler_with_router(router)
+    grep_out = "".join(
+        f"src/part_{f}.py:{ln}:matching content in a content part\n"
+        for f in range(8)
+        for ln in range(6)
+    )
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "grep", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [{"type": "output_text", "text": grep_out}],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_content_part_fold",
+        )
+    )
+
+    assert modified is True
+    assert saved >= 0
+    assert "router:excluded:lossless" in transforms
+    folded = new_payload["input"][1]["output"]
+    assert len(folded) < len(grep_out)
+    assert search_unheading(folded) == grep_out
+
+
 def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):
     """Excluded match is case-insensitive, and the debug path stays exercised.
 
@@ -577,6 +616,47 @@ def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(mo
                 "call_id": "call_1",
                 "output": output,
             },
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert new_payload == payload
+
+
+def test_openai_responses_adapter_keeps_websearch_output_verbatim():
+    """Default-excluded web tools must bypass both lossy and lossless rewrites."""
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="should not be used",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = (
+        "{\n"
+        '  "results": [\n'
+        '    {"title": "Headroom", "snippet": "structured web payload with spacing that must remain verbatim"}\n'
+        "  ]\n"
+        "}"
+    )
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "WebSearch", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": output},
         ],
     }
 
@@ -722,3 +802,158 @@ def test_openai_responses_payload_routes_through_content_router_without_rust(
     assert reason is None
     assert new_payload["input"][0]["output"] == "compressed fallback"
     assert any(t.startswith("router:openai:responses:") for t in transforms)
+
+
+def test_openai_responses_adapter_aggregates_small_tool_outputs_before_floor():
+    """Regression for #2050: many individually-small tool outputs whose combined
+    size clears the floor must still reach the router.
+
+    The Responses path extracts each ``function_call_output`` as its own unit.
+    A per-item size floor would reject every unit in a session made of many
+    small tool outputs (the Codex shape), yielding 0% savings even though the
+    aggregate compressible text is large. The floor must be evaluated against
+    the aggregate of the extracted group, matching the batch (Anthropic) path.
+    """
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="tiny summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    # Each output is individually below OPENAI_RESPONSES_ROUTER_MIN_BYTES (512),
+    # but the four combined exceed it — exactly the case that used to floor to
+    # zero savings. Guard the premise so the test stays honest if the byte
+    # shapes drift.
+    floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+    outputs = [" ".join(f"tok{i}_{j}" for j in range(30)) for i in range(4)]
+    assert all(len(o.encode("utf-8")) < floor for o in outputs)
+    assert sum(len(o.encode("utf-8")) for o in outputs) >= floor
+
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": f"c{i}",
+                "output": output,
+            }
+            for i, output in enumerate(outputs)
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, _strategy_chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_aggregate_floor",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    # No unit should be size-floored; every extracted unit is compressed.
+    assert "size_floor" not in units_by_category
+    assert units_by_category == {"applied": len(outputs)}
+    assert all(item["output"] == "tiny summary" for item in new_payload["input"])
+
+
+def test_openai_responses_adapter_floors_when_aggregate_below_threshold():
+    """Complement to #2050: when the *whole* group is below the floor the units
+    are still skipped, so trivially small payloads don't churn the router.
+    """
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("aggregate below floor should skip compression")
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+    outputs = ["ok", "done"]
+    assert sum(len(o.encode("utf-8")) for o in outputs) < floor
+
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": f"c{i}",
+                "output": output,
+            }
+            for i, output in enumerate(outputs)
+        ],
+    }
+
+    new_payload, modified, saved, _transforms, units_by_category, _strategy_chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_aggregate_below",
+        )
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert units_by_category == {"size_floor": len(outputs)}
+    assert new_payload == payload
+
+
+def test_openai_responses_adapter_preserves_serena_lifecycle_outputs():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed lifecycle output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    lifecycle_output = " ".join(f"instruction{i}" for i in range(180))
+
+    for tool_name in (
+        "mcp__serena__activate_project",
+        "mcp__serena__initial_instructions",
+        "serena.activate_project",
+        "serena.initial_instructions",
+    ):
+        payload = {
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_lifecycle",
+                    "name": tool_name,
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_lifecycle",
+                    "output": lifecycle_output,
+                },
+            ],
+        }
+
+        new_payload, modified, saved, transforms, units_by_category, strategy_chain, _ = (
+            handler._compress_openai_responses_live_text_units_with_router(
+                payload,
+                model="gpt-5",
+                request_id="req_test",
+            )
+        )
+
+        assert modified is False
+        assert saved == 0
+        assert transforms == []
+        assert new_payload == payload
+        assert units_by_category == {}
+        assert strategy_chain == []

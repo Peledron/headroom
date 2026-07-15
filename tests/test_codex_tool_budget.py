@@ -18,6 +18,10 @@ def test_classifies_reads_but_not_tests_or_edits() -> None:
     assert is_exploration_tool("mcp__serena__find_symbol", {})
     assert is_exploration_tool("tokensave.tokensave_context", {})
     assert is_exploration_tool("serena.find_symbol", {})
+    assert not is_exploration_tool("mcp__serena__activate_project", {})
+    assert not is_exploration_tool("mcp__serena__initial_instructions", {})
+    assert not is_exploration_tool("serena.activate_project", {})
+    assert not is_exploration_tool("serena.initial_instructions", {})
     assert not is_exploration_tool("Bash", {"command": "rtk uv run pytest -q"})
     assert not is_exploration_tool("apply_patch", {"command": "*** Begin Patch"})
 

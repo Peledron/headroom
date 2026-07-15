@@ -42,6 +42,10 @@ CODEX_TOOL_BUDGET_COMMAND = "headroom-codex-tool-budget"
 CODEX_TOOL_BUDGET_MATCHER = (
     "Bash|mcp__tokensave__.*|mcp__serena__.*|tokensave\\..*|serena\\..*"
 )
+CLAUDE_TOOL_BUDGET_COMMAND = "headroom-claude-tool-budget"
+CLAUDE_TOOL_BUDGET_MATCHER = (
+    "Bash|Read|Grep|Glob|mcp__tokensave__.*|mcp__serena__.*"
+)
 TOKENSAVE_BUDGET_POLICY = f"""{TOKENSAVE_BUDGET_MARKER}
 
 Use TokenSave for open-ended semantic discovery, call relationships, impact,
@@ -219,6 +223,68 @@ def ensure_codex_tool_budget_hook(hooks_path: Path | None = None) -> bool:
     return True
 
 
+def ensure_claude_tool_budget_hooks(settings_path: Path | None = None) -> bool:
+    """Install Claude's per-prompt exploration budget and preserve user hooks."""
+    if settings_path is None:
+        settings_path = Path.home() / ".claude" / "settings.json"
+    if settings_path.exists():
+        try:
+            config = json.loads(settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid Claude settings JSON in {settings_path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise RuntimeError(f"Claude settings configuration must be an object: {settings_path}")
+    else:
+        config = {}
+
+    hooks = config.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"Claude hooks entry must be an object: {settings_path}")
+
+    changed = False
+    for event, matcher in (
+        ("UserPromptSubmit", "*"),
+        ("PreToolUse", CLAUDE_TOOL_BUDGET_MATCHER),
+    ):
+        groups = hooks.setdefault(event, [])
+        if not isinstance(groups, list):
+            raise RuntimeError(f"Claude {event} entry must be a list: {settings_path}")
+        existing: dict[str, object] | None = None
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            commands = group.get("hooks", [])
+            if isinstance(commands, list) and any(
+                isinstance(item, dict)
+                and item.get("command") == CLAUDE_TOOL_BUDGET_COMMAND
+                for item in commands
+            ):
+                existing = group
+                break
+        if existing is None:
+            groups.append(
+                {
+                    "matcher": matcher,
+                    "hooks": [
+                        {"type": "command", "command": CLAUDE_TOOL_BUDGET_COMMAND}
+                    ],
+                }
+            )
+            changed = True
+        elif existing.get("matcher") != matcher:
+            existing["matcher"] = matcher
+            changed = True
+
+    if not changed:
+        return False
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = settings_path.with_suffix(settings_path.suffix + ".headroom-backup")
+    if settings_path.exists() and not backup_path.exists():
+        shutil.copy2(settings_path, backup_path)
+    settings_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
 def build_plan(
     root: Path, agents: Iterable[str], *, install_missing: bool = True
 ) -> list[list[str]]:
@@ -317,6 +383,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.dry_run and "codex" in agents:
             ensure_codex_tokensave_timeout()
             ensure_codex_tool_budget_hook()
+        if not args.dry_run and "claude" in agents:
+            ensure_claude_tool_budget_hooks()
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"bootstrap failed: {exc}", file=sys.stderr)
         return 1

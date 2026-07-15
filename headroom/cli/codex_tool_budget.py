@@ -23,10 +23,20 @@ EXPLORATION_MCP_PREFIXES = (
     "tokensave.",
     "serena.",
 )
+LIFECYCLE_TOOLS = frozenset(
+    {
+        "mcp__serena__activate_project",
+        "mcp__serena__initial_instructions",
+        "serena.activate_project",
+        "serena.initial_instructions",
+    }
+)
 
 
 def is_exploration_tool(tool_name: str, tool_input: Any) -> bool:
     """Return whether a tool call consumes the bounded discovery budget."""
+    if tool_name in LIFECYCLE_TOOLS:
+        return False
     if tool_name.startswith(EXPLORATION_MCP_PREFIXES):
         return True
     if tool_name != "Bash" or not isinstance(tool_input, dict):

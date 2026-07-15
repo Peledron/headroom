@@ -199,6 +199,14 @@ class CCRToolInjector:
             # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
             # space, comma, or the closing `>>`.
             re.compile(r"<<ccr:([a-f0-9]{12,24})\b"),
+            # read_lifecycle STALE/SUPERSEDED markers:
+            # `[Read content stale/superseded: ... Retrieve original: hash=xxx]`.
+            # These carry a retrievable CCR hash but never contain the word
+            # "compressed", so the patterns above miss them -- and the retrieve
+            # tool is then not injected, leaving the model a marker it cannot
+            # redeem (silent data loss, #1006). Match the load-bearing
+            # "Retrieve original: hash=" phrase directly.
+            re.compile(r"Retrieve original: hash=([a-f0-9]{12,24})"),
         ]
     )
 
@@ -465,7 +473,8 @@ def parse_tool_call(
         args_str = function.get("arguments", "{}")
         try:
             input_data = json.loads(args_str)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
             input_data = {}
     elif provider == "google":
         # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
@@ -480,7 +489,8 @@ def parse_tool_call(
         args_str = tool_call.get("arguments", "{}")
         try:
             input_data = json.loads(args_str)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
             input_data = {}
     else:
         # Generic fallback
@@ -488,6 +498,12 @@ def parse_tool_call(
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
     if name != CCR_TOOL_NAME:
+        return None
+
+    # A CCR-named tool call whose decoded arguments/input are not an object
+    # (a JSON array/string/number, or a non-dict Anthropic `input`) is simply
+    # not a valid CCR call — return None instead of crashing on `.get`.
+    if not isinstance(input_data, dict):
         return None
 
     hash_key = input_data.get("hash")

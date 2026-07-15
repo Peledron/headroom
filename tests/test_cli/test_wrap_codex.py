@@ -9,8 +9,11 @@ way a user would from the shell.
 
 from __future__ import annotations
 
+import errno
 import shutil
+import socket
 import sqlite3
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1053,6 +1056,365 @@ def test_wrap_codex_prepare_only_respects_codex_home(
     assert not (tmp_path / ".codex" / "config.toml").exists()
 
 
+def test_codex_session_home_overlay_seeds_active_home_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config_file = codex_home / "config.toml"
+    auth_file = codex_home / "auth.json"
+    original_config = '[profiles.default]\nmodel = "gpt-4o"\n'
+    original_auth = '{"auth_mode": "apikey"}'
+    config_file.write_text(original_config, encoding="utf-8")
+    auth_file.write_text(original_auth, encoding="utf-8")
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        seeded_config = (session_home / "config.toml").read_text(encoding="utf-8")
+        seeded_auth = (session_home / "auth.json").read_text(encoding="utf-8")
+        assert seeded_config == original_config
+        assert seeded_auth == original_auth
+        (session_home / "config.toml").write_text('model_provider = "headroom"\n', encoding="utf-8")
+        assert config_file.read_text(encoding="utf-8") == original_config
+
+    assert not session_home.exists()
+    assert config_file.read_text(encoding="utf-8") == original_config
+    assert auth_file.read_text(encoding="utf-8") == original_auth
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or not hasattr(socket, "AF_UNIX"),
+    reason="requires POSIX Unix domain sockets",
+)
+def test_codex_session_home_overlay_skips_unix_sockets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    socket_dir = codex_home / "vendor_imports" / "skills" / ".git"
+    socket_dir.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.chdir(codex_home)
+
+    head_file = socket_dir / "HEAD"
+    head_file.write_text("ref: refs/heads/main\n", encoding="utf-8")
+    socket_file = socket_dir / "fsmonitor--daemon.ipc"
+    relative_socket_file = socket_file.relative_to(codex_home)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as fsmonitor_socket:
+        try:
+            fsmonitor_socket.bind(str(relative_socket_file))
+        except PermissionError as exc:
+            if exc.errno in {errno.EPERM, errno.EACCES}:
+                pytest.skip("sandbox does not allow AF_UNIX socket binding")
+            raise
+
+        with wrap_mod._codex_session_home_overlay() as session_home:
+            session_socket_dir = session_home / socket_dir.relative_to(codex_home)
+            assert (session_socket_dir / "HEAD").read_text(encoding="utf-8") == (
+                "ref: refs/heads/main\n"
+            )
+            assert not (session_socket_dir / socket_file.name).exists()
+
+        assert socket_file.is_socket()
+
+
+def test_codex_session_home_overlay_skips_ephemeral_top_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    (codex_home / "config.toml").write_text("model = 'gpt-4o'\n", encoding="utf-8")
+    (codex_home / "sessions").mkdir()
+    (codex_home / "sessions" / "rollout.jsonl").write_text("{}\n", encoding="utf-8")
+    for name in ("tmp", ".tmp", "cache", "log", "logs"):
+        (codex_home / name).mkdir()
+        (codex_home / name / "scratch.bin").write_bytes(b"x" * 64)
+    (codex_home / "logs_2.sqlite").write_bytes(b"db")
+    (codex_home / "logs_2.sqlite-wal").write_bytes(b"wal")
+    (codex_home / "state_5.sqlite").write_bytes(b"state")
+    # A nested dir named tmp is real data and must survive the copy.
+    nested = codex_home / "skills" / "tmp"
+    nested.mkdir(parents=True)
+    (nested / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        assert (session_home / "config.toml").exists()
+        assert (session_home / "sessions" / "rollout.jsonl").exists()
+        assert (session_home / "state_5.sqlite").exists()
+        assert (session_home / "skills" / "tmp" / "keep.txt").exists()
+        for name in ("tmp", ".tmp", "cache", "log", "logs"):
+            assert not (session_home / name).exists()
+        assert not (session_home / "logs_2.sqlite").exists()
+        assert not (session_home / "logs_2.sqlite-wal").exists()
+
+
+def test_codex_session_home_overlay_falls_back_when_out_of_space(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "config.toml").write_text("model = 'gpt-4o'\n", encoding="utf-8")
+
+    real_seed = wrap_mod._seed_codex_session_home
+    calls: list[Path] = []
+
+    def _seed_quota_once(source_home: Path, session_home: Path) -> None:
+        calls.append(session_home)
+        if len(calls) == 1:
+            raise shutil.Error(
+                [(str(source_home), str(session_home), "[Errno 122] Disk quota exceeded")]
+            )
+        real_seed(source_home, session_home)
+
+    monkeypatch.setattr(wrap_mod, "_seed_codex_session_home", _seed_quota_once)
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        assert len(calls) == 2
+        assert session_home == calls[1]
+        fallback_base = tmp_path / ".cache" / "headroom"
+        assert fallback_base in session_home.parents
+        assert (session_home / "config.toml").exists()
+
+    assert not session_home.exists()
+
+
+def test_codex_session_home_overlay_partial_copy_warns_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "config.toml").write_text("model = 'gpt-4o'\n", encoding="utf-8")
+
+    def _seed_permission_error(source_home: Path, session_home: Path) -> None:
+        raise shutil.Error(
+            [(str(source_home), str(session_home), "[Errno 13] Permission denied")]
+        )
+
+    monkeypatch.setattr(wrap_mod, "_seed_codex_session_home", _seed_permission_error)
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        assert session_home.exists()
+
+    err = capsys.readouterr().err
+    assert "could not be copied" in err
+    assert "Permission denied" in err
+
+
+def test_codex_session_home_overlay_syncs_session_data_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os as _os
+
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    original_config = "model = 'gpt-4o'\n"
+    (codex_home / "config.toml").write_text(original_config, encoding="utf-8")
+    sessions = codex_home / "sessions"
+    sessions.mkdir()
+    (sessions / "old-rollout.jsonl").write_text('{"turn": 1}\n', encoding="utf-8")
+    # Push the seeded mtimes into the past so overlay writes are strictly newer.
+    past = 1_000_000_000
+    for f in (codex_home / "config.toml", sessions / "old-rollout.jsonl"):
+        _os.utime(f, (past, past))
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        (session_home / "sessions" / "old-rollout.jsonl").write_text(
+            '{"turn": 1}\n{"turn": 2}\n', encoding="utf-8"
+        )
+        (session_home / "sessions" / "new-rollout.jsonl").write_text(
+            '{"turn": 1}\n', encoding="utf-8"
+        )
+        (session_home / "history.jsonl").write_text('{"cmd": "ls"}\n', encoding="utf-8")
+        (session_home / "auth.json").write_text('{"token": "fresh"}', encoding="utf-8")
+        (session_home / "config.toml").write_text(
+            'model_provider = "headroom"\n', encoding="utf-8"
+        )
+
+    updated = (codex_home / "sessions" / "old-rollout.jsonl").read_text(encoding="utf-8")
+    assert updated == '{"turn": 1}\n{"turn": 2}\n'
+    assert (codex_home / "sessions" / "new-rollout.jsonl").exists()
+    assert (codex_home / "history.jsonl").read_text(encoding="utf-8") == '{"cmd": "ls"}\n'
+    assert (codex_home / "auth.json").read_text(encoding="utf-8") == '{"token": "fresh"}'
+    # The injected provider config must never leak back into the real home.
+    assert (codex_home / "config.toml").read_text(encoding="utf-8") == original_config
+
+
+def test_codex_session_home_overlay_sync_back_never_clobbers_newer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os as _os
+    import time as _time
+
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    sessions = codex_home / "sessions"
+    sessions.mkdir()
+    rollout = sessions / "rollout.jsonl"
+    rollout.write_text("seeded\n", encoding="utf-8")
+    _os.utime(rollout, (1_000_000_000, 1_000_000_000))
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        (session_home / "sessions" / "rollout.jsonl").write_text(
+            "overlay-change\n", encoding="utf-8"
+        )
+        # A concurrent Codex instance updates the real file to something newer
+        # than the overlay's version.
+        rollout.write_text("concurrent-newer\n", encoding="utf-8")
+        future = _time.time() + 3600
+        _os.utime(rollout, (future, future))
+
+    assert rollout.read_text(encoding="utf-8") == "concurrent-newer\n"
+
+
+def test_wrap_codex_launch_uses_session_scoped_codex_home(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config_file = codex_home / "config.toml"
+    auth_file = codex_home / "auth.json"
+    original_config = '[profiles.default]\nmodel = "gpt-4o"\n'
+    original_auth = '{"auth_mode": "apikey"}'
+    config_file.write_text(original_config, encoding="utf-8")
+    auth_file.write_text(original_auth, encoding="utf-8")
+
+    launch_env: dict[str, str] = {}
+    session_home_seen: list[Path] = []
+
+    def fake_launch(
+        *,
+        binary: str,
+        args: tuple,
+        env: dict[str, str],
+        port: int,
+        no_proxy: bool,
+        tool_label: str,
+        env_vars_display: list[str],
+        **kwargs: object,
+    ) -> None:
+        del args, port, no_proxy, tool_label, env_vars_display, kwargs
+        assert binary == "/fake/codex"
+        launch_env.update(env)
+        session_home = Path(env["CODEX_HOME"])
+        session_home_seen.append(session_home)
+        assert session_home.exists()
+        seeded_config = (session_home / "config.toml").read_text(encoding="utf-8")
+        assert original_config in seeded_config
+        assert 'model_provider = "headroom"' in seeded_config
+        assert 'base_url = "http://127.0.0.1:8787/v1"' in seeded_config
+        assert "[mcp_servers.headroom]" in seeded_config
+        assert (session_home / "auth.json").read_text(encoding="utf-8") == original_auth
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch(
+            "headroom.cli.wrap.shutil.which",
+            side_effect=lambda cmd: "/fake/codex" if cmd == "codex" else None,
+        ):
+            with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch):
+                result = runner.invoke(
+                    main,
+                    [
+                        "wrap",
+                        "codex",
+                        "--port",
+                        "8787",
+                        "--no-tokensave",
+                        "--no-serena",
+                    ],
+                )
+
+    assert result.exit_code == 0, result.output
+    assert session_home_seen
+    assert launch_env["CODEX_HOME"] == str(session_home_seen[0])
+    assert launch_env["OPENAI_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert config_file.read_text(encoding="utf-8") == original_config
+    assert auth_file.read_text(encoding="utf-8") == original_auth
+    assert not session_home_seen[0].exists()
+
+
+def test_wrap_codex_launches_use_distinct_session_homes_per_port(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config_file = codex_home / "config.toml"
+    auth_file = codex_home / "auth.json"
+    original_config = '[profiles.default]\nmodel = "gpt-4o"\n'
+    original_auth = '{"auth_mode": "apikey"}'
+    config_file.write_text(original_config, encoding="utf-8")
+    auth_file.write_text(original_auth, encoding="utf-8")
+
+    launch_records: list[tuple[int, Path, str]] = []
+
+    def fake_launch(
+        *,
+        binary: str,
+        args: tuple,
+        env: dict[str, str],
+        port: int,
+        no_proxy: bool,
+        tool_label: str,
+        env_vars_display: list[str],
+        **kwargs: object,
+    ) -> None:
+        del args, no_proxy, tool_label, env_vars_display, kwargs
+        assert binary == "/fake/codex"
+        session_home = Path(env["CODEX_HOME"])
+        assert session_home.exists()
+        launch_records.append(
+            (port, session_home, (session_home / "config.toml").read_text(encoding="utf-8"))
+        )
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch(
+            "headroom.cli.wrap.shutil.which",
+            side_effect=lambda cmd: "/fake/codex" if cmd == "codex" else None,
+        ):
+            with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch):
+                first = runner.invoke(
+                    main,
+                    ["wrap", "codex", "--port", "8787", "--no-tokensave", "--no-serena"],
+                )
+                second = runner.invoke(
+                    main,
+                    ["wrap", "codex", "--port", "9898", "--no-tokensave", "--no-serena"],
+                )
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert len(launch_records) == 2
+    assert launch_records[0][1] != launch_records[1][1]
+    assert 'base_url = "http://127.0.0.1:8787/v1"' in launch_records[0][2]
+    assert 'base_url = "http://127.0.0.1:9898/v1"' in launch_records[1][2]
+    assert config_file.read_text(encoding="utf-8") == original_config
+    assert auth_file.read_text(encoding="utf-8") == original_auth
+    assert not launch_records[0][1].exists()
+    assert not launch_records[1][1].exists()
+
+
 def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1079,6 +1441,41 @@ def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
                 "--no-serena",
             ],
         )
+
+    assert result.exit_code == 0, result.output
+    assert project_agents.read_bytes() == original_bytes
+    global_agents = tmp_path / ".codex" / "AGENTS.md"
+    assert wrap_mod._RTK_MARKER.encode() in global_agents.read_bytes()
+
+
+def test_wrap_codex_launch_injects_rtk_globally_without_changing_project_agents(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project_agents = project_dir / "AGENTS.md"
+    original = "# Project instructions\n\nUse the repository conventions.\n"
+    project_agents.write_text(original, encoding="utf-8")
+    original_bytes = project_agents.read_bytes()
+    monkeypatch.chdir(project_dir)
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=tmp_path / "rtk"):
+        with patch(
+            "headroom.cli.wrap.shutil.which",
+            side_effect=lambda cmd: "/fake/codex" if cmd == "codex" else None,
+        ):
+            with patch("headroom.cli.wrap._launch_tool"):
+                result = runner.invoke(
+                    main,
+                    [
+                        "wrap",
+                        "codex",
+                        "--no-mcp",
+                        "--no-serena",
+                        "--no-tokensave",
+                    ],
+                )
 
     assert result.exit_code == 0, result.output
     assert project_agents.read_bytes() == original_bytes
@@ -1539,16 +1936,14 @@ def test_wrap_codex_memory_launch_failure_unwrap_cleans_memory_only_config(
 
     assert wrap_result.exit_code == 1
     config_file = tmp_path / ".codex" / "config.toml"
-    content = config_file.read_text()
-    assert "[mcp_servers.headroom_memory]" in content
-    assert wrap_mod._CODEX_TOP_LEVEL_MARKER not in content
+    assert not config_file.exists()
+    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
 
     with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_proxy:
         unwrap_result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
 
     assert unwrap_result.exit_code == 0, unwrap_result.output
-    assert not config_file.exists()
-    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
+    assert "Nothing to undo" in unwrap_result.output
     stop_proxy.assert_not_called()
 
 
@@ -1692,58 +2087,29 @@ class TestCodexProjectHeaderConfig:
 
 
 # ---------------------------------------------------------------------------
-# Regression: codex delegates port resolution to _ensure_proxy
+# Regression: codex preserves the requested port through the session-scoped runner
 # ---------------------------------------------------------------------------
 
 
 class TestCodexPortResolution:
-    """codex() uses _ensure_proxy() to resolve ports (not early _find_available_port).
+    """codex() hands the requested port to the session-scoped wrap runner.
 
-    Regression for headroom#1406 round 2 review: codex() must follow
-    the same selected-port contract as other wrappers (aider, copilot, etc.)
-    so that a healthy existing proxy on the requested port is reused instead
-    of skipped by a blind socket probe.
+    Regression for headroom#1406 round 2 review: the codex command must keep
+    the selected-port contract intact after the session-home refactor instead
+    of silently dropping or rewriting the requested port before the shared
+    launch path handles proxy reuse and fallback.
     """
 
-    def test_delegates_to_ensure_proxy(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """codex() calls _ensure_proxy and uses the returned port."""
+    def test_delegates_to_session_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """codex() passes the requested port through to _run_codex_wrap."""
         _set_test_home(monkeypatch, Path("/tmp/test_headroom_codex"))
 
-        captured_port: list[int] = []
+        call_kw: dict = {}
 
-        # Mock _ensure_proxy to capture the requested port
-        def mock_ensure_proxy(port: int, no_proxy: bool, **kwargs: object) -> tuple[None, int]:
-            captured_port.append(port)
-            # Simulate port fallback: requested 8787, actual 8788
-            return None, 8788
+        def mock_run_codex_wrap(**kwargs: object) -> None:
+            call_kw.update(kwargs)
 
-        monkeypatch.setattr(wrap_mod, "_ensure_proxy", mock_ensure_proxy)
-
-        # Mock all heavy dependencies
-        monkeypatch.setattr(
-            wrap_mod, "_codex_config_paths", lambda: (Path("/dev/null"), Path("/dev/null"))
-        )
-        monkeypatch.setattr(wrap_mod, "_snapshot_codex_config_if_unwrapped", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_setup_lean_ctx_agent", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_inject_rtk_instructions", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_codex_home_dir", lambda: Path("/tmp"))
-        monkeypatch.setattr(wrap_mod, "_setup_headroom_mcp", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_setup_serena_mcp", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_disable_serena_mcp", lambda *a, **kw: None)
-        monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/codex" if x == "codex" else None)
-        monkeypatch.setattr(wrap_mod, "_build_codex_launch_env", lambda port, env: ({}, []))
-        monkeypatch.setattr(wrap_mod, "_inject_codex_provider_config", lambda port: None)
-        monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
-        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *a, **kw: [])
-
-        # Intercept _launch_tool to verify port propagation
-        launch_kw: dict = {}
-
-        def mock_launch_tool(**kwargs: object) -> None:
-            launch_kw.update(kwargs)
-
-        monkeypatch.setattr(wrap_mod, "_launch_tool", mock_launch_tool)
+        monkeypatch.setattr(wrap_mod, "_run_codex_wrap", mock_run_codex_wrap)
 
         runner = CliRunner()
         result = runner.invoke(
@@ -1752,10 +2118,66 @@ class TestCodexPortResolution:
         )
 
         assert result.exit_code == 0, f"CLI failed: {result.output}"
-        assert captured_port == [8787], (
-            f"_ensure_proxy called with {captured_port}, expected [8787]"
+        assert call_kw.get("port") == 8787
+        assert call_kw.get("no_proxy") is False
+        assert call_kw.get("prepare_only") is False
+
+
+class TestCodexLaunchExportsCustomUpstream:
+    """`_run_codex_wrap` must export the detected custom upstream base URL into
+    the launch env so Codex emits the ``X-Headroom-Base-Url`` header. Otherwise
+    the proxy falls back to api.openai.com and the user's gateway key is sent to
+    the wrong host (regression of #1614)."""
+
+    def _launch_env(self, monkeypatch, tmp_path, *, custom_upstream):
+        from contextlib import contextmanager
+
+        captured: dict = {}
+
+        monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: "/usr/bin/codex")
+        monkeypatch.setattr(wrap_mod, "_codex_home_dir", lambda: tmp_path)
+
+        @contextmanager
+        def _fake_overlay():
+            yield tmp_path / "session"
+
+        monkeypatch.setattr(wrap_mod, "_codex_session_home_overlay", _fake_overlay)
+        # Stand in for the heavy prepare step; only its return value matters here.
+        monkeypatch.setattr(wrap_mod, "_prepare_codex_wrap_state", lambda **kwargs: custom_upstream)
+
+        def _fake_launch(*, env, **kwargs):
+            captured["env"] = env
+
+        monkeypatch.setattr(wrap_mod, "_launch_tool", _fake_launch)
+
+        wrap_mod._run_codex_wrap(
+            port=8787,
+            no_rtk=True,
+            no_mcp=True,
+            no_tokensave=True,
+            serena=False,
+            no_serena=True,
+            code_graph=False,
+            no_proxy=True,
+            learn=False,
+            memory=False,
+            backend=None,
+            anyllm_provider=None,
+            region=None,
+            verbose=False,
+            prepare_only=False,
+            codex_args=(),
         )
-        assert launch_kw.get("port") == 8788, (
-            f"_launch_tool port={launch_kw.get('port')}, expected 8788 "
-            "(the actual_port from _ensure_proxy fallback)"
-        )
+        return captured["env"]
+
+    def test_custom_upstream_exported_into_launch_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        env = self._launch_env(monkeypatch, tmp_path, custom_upstream="https://api.freemodel.dev")
+        assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.freemodel.dev"
+
+    def test_no_custom_upstream_leaves_env_var_unset(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        env = self._launch_env(monkeypatch, tmp_path, custom_upstream=None)
+        assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env

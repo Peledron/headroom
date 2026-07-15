@@ -235,6 +235,30 @@ def test_noop_when_nothing_to_defer() -> None:
     assert inject_tool_search_deferral(tools) is tools
 
 
+def test_claude_code_core_tool_names_are_case_insensitive() -> None:
+    tools = _tools(15)
+    tools[0]["name"] = "Bash"
+    tools[1]["name"] = "Read"
+
+    out = inject_tool_search_deferral(tools)
+    by_name = {tool.get("name"): tool for tool in out if isinstance(tool, dict)}
+
+    assert "defer_loading" not in by_name["Bash"]
+    assert "defer_loading" not in by_name["Read"]
+
+
+def test_tokensave_and_serena_tool_families_stay_resident() -> None:
+    tools = _tools(15)
+    tools[0]["name"] = "mcp__tokensave__tokensave_context"
+    tools[1]["name"] = "mcp__serena__find_symbol"
+
+    out = inject_tool_search_deferral(tools)
+    by_name = {tool.get("name"): tool for tool in out if isinstance(tool, dict)}
+
+    assert "defer_loading" not in by_name["mcp__tokensave__tokensave_context"]
+    assert "defer_loading" not in by_name["mcp__serena__find_symbol"]
+
+
 def test_cache_control_moved_off_deferred_tool_to_last_resident() -> None:
     tools = _tools(20, core_first=3)
     # the client's tools cache breakpoint sits on a tool we will defer

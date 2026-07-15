@@ -30,6 +30,7 @@ import contextlib
 import hmac
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -140,6 +141,7 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
     retry_after_ms,
 )
+from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -164,6 +166,7 @@ from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
+from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -760,6 +763,11 @@ class HeadroomProxy(
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
             router_config.search_group_by_file = True
+        # Note: protect_tool_results runs AFTER token mode (ordering matters).
+        # It resets protect_recent_reads_fraction from 0.3→0.0, restoring
+        # full protection for ALL excluded-tool results regardless of age.
+        # This means naming any tool with --protect-tool-results also
+        # protects Read/Glob/Grep/Write/Edit results indefinitely.
         if config.protect_tool_results:
             router_config.protect_recent_reads_fraction = 0.0
         # `--compress-user-messages` flips the router's default skip rule.
@@ -2007,39 +2015,35 @@ def _request_is_loopback(request: Request) -> bool:
         host_header = request.headers.get("host")
     except AttributeError:
         host_header = None
-    return is_loopback_host(client_host) and is_loopback_host_header(host_header)
 
-
-def _is_known_websocket_callback_failure(context: dict[str, Any]) -> bool:
-    """Return True iff this exact websockets callback failure shape is observed."""
-    if (
-        context.get("message")
-        != "Exception in callback Connection.connection_lost(ConnectionResetError())"
-    ):
+    # The Host-header gate is the DNS-rebinding defence and always applies.
+    if not is_loopback_host_header(host_header):
         return False
-    exception = context.get("exception")
-    return (
-        isinstance(exception, AttributeError)
-        and str(exception) == "'ClientConnection' object has no attribute 'recv_messages'"
+
+    # Genuine loopback peer (native run, or curl inside the container).
+    if is_loopback_host(client_host):
+        return True
+
+    # Containerized dashboards: when Headroom runs in a bridge-network
+    # container, a browser on the host reaches it via the container's
+    # gateway, so ``request.client.host`` is the gateway IP, not 127.0.0.1
+    # — and the per-request logs / upstream URLs get stripped even though
+    # the operator is local. Treat a peer inside an operator-configured
+    # trusted-gateway CIDR as loopback-equivalent. Opt-in and empty by
+    # default (HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS), so this is a no-op
+    # unless the operator explicitly allow-lists their container gateway.
+    from headroom.proxy.forwarded_headers import (
+        load_trusted_gateway_cidrs,
+        peer_is_trusted_gateway,
     )
 
+    return peer_is_trusted_gateway(client_host, load_trusted_gateway_cidrs())
 
-def _tool_schema_saved_from_tags(tags: object) -> int:
-    """Tool-definition tokens Headroom kept out of context for one request by
-    deferring heavy tool schemas: the native tool-search injection
-    (``tool_search_deferred_tokens``) plus any registered turn-hook tools
-    rewrite (``turn_hook_tools_saved_tokens``). Both tags are set only on the
-    path where Headroom performed the deferral, so a client that already had
-    tool search enabled (e.g. Claude Code / Codex) contributes zero here."""
-    if not isinstance(tags, dict):
-        return 0
-    total = 0
-    for key in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
-        try:
-            total += int(tags.get(key, 0) or 0)
-        except (TypeError, ValueError):
-            continue
-    return total
+
+_is_known_websocket_callback_failure = is_known_websocket_callback_failure
+
+
+_tool_schema_saved_from_tags = tool_schema_saved_from_tags
 
 
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
@@ -2324,6 +2328,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 url=_upstream_check_cache["url"],
                 error=_upstream_check_cache["error"],
             ),
+            "kompress": _component_health(
+                enabled=not config.disable_kompress,
+                ready=proxy.warmup.kompress.status == "loaded",
+                backend=proxy.warmup.kompress.info.get("backend", None),
+            ),
         }
 
     def _runtime_payload() -> dict[str, Any]:
@@ -2422,7 +2431,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
-        ready = all(check["ready"] for check in checks.values())
+        # Kompress is an optional soft component: model downloads lazily on
+        # first use, so "not ready" (cold cache) must not degrade overall health.
+        ready = all(check["ready"] for name, check in checks.items() if name != "kompress")
         payload: dict[str, Any] = {
             "service": "headroom-proxy",
             "status": "healthy" if ready else "unhealthy",
@@ -2487,9 +2498,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         config.compress_system_messages,
                     )
                 ),
-                "protect_recent": profile_kwargs.get(
-                    "read_protection_window",
-                    config.protect_recent,
+                "protect_recent": (
+                    config.protect_recent
+                    if config.protect_recent is not None
+                    else profile_kwargs.get("read_protection_window")
                 ),
                 "protect_analysis_context": profile_kwargs.get(
                     "protect_analysis_context",
@@ -2958,29 +2970,63 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     RECENT_REQUEST_LOG_WINDOW = 100
 
+    def _is_recent_request_number(value: Any) -> bool:
+        return (
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
+    def _recent_request_optional_number(log: dict[str, Any], key: str) -> int | float | None:
+        value = log.get(key)
+        return value if _is_recent_request_number(value) else None
+
+    def _recent_request_token_accounting_status(log: dict[str, Any]) -> str:
+        token_fields = (
+            "input_tokens_original",
+            "input_tokens_optimized",
+            "tokens_saved",
+            "savings_percent",
+        )
+        present = [_is_recent_request_number(log.get(field)) for field in token_fields]
+        if all(present):
+            return "complete"
+        if any(present):
+            return "partial"
+        return "missing"
+
     def _build_recent_request_payload(limit: int = RECENT_REQUEST_LOG_WINDOW) -> dict[str, Any]:
         recent_request_logs = proxy.logger.get_recent(limit) if proxy.logger else []
-        dashboard_recent_requests = [
-            {
-                "request_id": log.get("request_id"),
-                "timestamp": log.get("timestamp"),
-                "provider": log.get("provider"),
-                "model": log.get("model"),
-                "input_tokens_original": log.get("input_tokens_original"),
-                "input_tokens_optimized": log.get("input_tokens_optimized"),
-                "output_tokens": log.get("output_tokens"),
-                "tokens_saved": log.get("tokens_saved"),
-                "savings_percent": log.get("savings_percent"),
-                "optimization_latency_ms": log.get("optimization_latency_ms"),
-                "total_latency_ms": log.get("total_latency_ms"),
-                "transforms_applied": log.get("transforms_applied", []),
-                "waste_signals": log.get("waste_signals"),
-                "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
-            }
-            for log in recent_request_logs
-            if log.get("input_tokens_original") is not None
-            and log.get("input_tokens_optimized") is not None
-        ][-10:]
+        dashboard_recent_requests = []
+        for log in recent_request_logs:
+            token_accounting_status = _recent_request_token_accounting_status(log)
+            dashboard_recent_requests.append(
+                {
+                    "request_id": log.get("request_id"),
+                    "timestamp": log.get("timestamp"),
+                    "provider": log.get("provider"),
+                    "model": log.get("model"),
+                    "input_tokens_original": _recent_request_optional_number(
+                        log, "input_tokens_original"
+                    ),
+                    "input_tokens_optimized": _recent_request_optional_number(
+                        log, "input_tokens_optimized"
+                    ),
+                    "output_tokens": _recent_request_optional_number(log, "output_tokens"),
+                    "tokens_saved": _recent_request_optional_number(log, "tokens_saved"),
+                    "savings_percent": _recent_request_optional_number(log, "savings_percent"),
+                    "optimization_latency_ms": _recent_request_optional_number(
+                        log, "optimization_latency_ms"
+                    ),
+                    "total_latency_ms": _recent_request_optional_number(log, "total_latency_ms"),
+                    "has_exact_tokens": token_accounting_status == "complete",
+                    "token_accounting_status": token_accounting_status,
+                    "transforms_applied": log.get("transforms_applied", []),
+                    "waste_signals": log.get("waste_signals"),
+                    "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
+                }
+            )
+        dashboard_recent_requests = dashboard_recent_requests[-10:]
         return {
             "request_logs": recent_request_logs[-10:],
             "recent_requests": dashboard_recent_requests,
@@ -3111,6 +3157,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # schema size. So the savings rate is plain `saved / attempted`
         # — adding `saved` again would double-count.
         attempted_input_tokens = getattr(m, "attempted_input_tokens_total", 0)
+        # New-content denominator: what the provider actually billed as
+        # non-cache-read input (uncached + cache-write tokens, summed
+        # across providers from response usage). Unlike
+        # `proxy_total_before_compression`, this does NOT recount the
+        # full transcript on every turn — a long session's history is
+        # served from prefix cache, not re-billed, so it doesn't belong
+        # in a denominator that claims to measure what compression had
+        # any power over. Tokens Headroom removed never reached the
+        # provider at all, so they're added back to form the baseline.
+        _pc_totals = prefix_cache_stats.get("totals", {})
+        new_input_tokens = int(_pc_totals.get("uncached_input_tokens", 0) or 0) + int(
+            _pc_totals.get("cache_write_tokens", 0) or 0
+        )
 
         # Build human-readable summary
         summary = _build_session_summary(
@@ -3339,6 +3398,27 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     else 0,
                     2,
                 ),
+                # New-content-relative rate: savings as a fraction of the
+                # input that would have newly entered context (provider-
+                # billed uncached + cache-write tokens, plus the tokens
+                # compression removed before they could be billed). The
+                # whole-request ratios above recount the FULL transcript
+                # every turn, so a 200-turn session counts its history
+                # 200x into the denominator and long-running sessions
+                # (1M-context models never compact) read as ~0% no
+                # matter how well compression performs on new content.
+                # Guarded on new_input_tokens > 0 (not the full sum): the
+                # cache accumulators only see requests with cache
+                # activity, so a deployment with no cache metrics (e.g.
+                # Bedrock) would otherwise divide savings by themselves
+                # and report ~100%. No usage data -> report 0, not a lie.
+                "new_input_tokens": new_input_tokens,
+                "new_input_savings_percent": round(
+                    (proxy_compression_tokens / (new_input_tokens + proxy_compression_tokens) * 100)
+                    if new_input_tokens > 0
+                    else 0,
+                    2,
+                ),
                 "savings_percent": round(
                     (all_layers_tokens_saved / total_tokens_before * 100)
                     if total_tokens_before > 0
@@ -3529,7 +3609,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "compress_system_messages": bool(
                 profile_kwargs.get("compress_system_messages", config.compress_system_messages)
             ),
-            "protect_recent": profile_kwargs.get("read_protection_window", config.protect_recent),
+            "protect_recent": (
+                config.protect_recent
+                if config.protect_recent is not None
+                else profile_kwargs.get("read_protection_window")
+            ),
             "protect_analysis_context": config.protect_analysis_context,
             "min_tokens_to_crush": profile_kwargs.get(
                 "min_tokens_to_compress", config.min_tokens_to_crush
@@ -4364,6 +4448,27 @@ def _get_code_aware_banner_status(config: ProxyConfig) -> str:
         return "DISABLED  (install headroom-ai[code] to enable)"
 
 
+def _configure_windows_uvicorn_loop(uvicorn_kwargs: dict[str, Any]) -> None:
+    """Select a Windows-safe asyncio loop for uvicorn across versions.
+
+    ProactorEventLoop can close the listening socket on transient AcceptEx
+    failures (for example WinError 64 from keep-alive RSTs). SelectorEventLoop
+    keeps accept errors scoped to the connection.
+
+    uvicorn >= 0.36 resolves ``asyncio:SelectorEventLoop`` as a custom loop
+    factory import path. Older uvicorn only accepts built-in loop names and
+    raises KeyError for that value, so we set the selector policy instead.
+    """
+    import uvicorn as _uvicorn
+
+    if hasattr(_uvicorn.config.Config, "get_loop_factory"):
+        uvicorn_kwargs["loop"] = "asyncio:SelectorEventLoop"
+    else:
+        policy_cls = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+        if policy_cls is not None:
+            asyncio.set_event_loop_policy(policy_cls())
+
+
 def run_server(
     config: ProxyConfig | None = None,
     workers: int = 1,
@@ -4467,10 +4572,7 @@ def run_server(
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
-        # ProactorEventLoop can close the listening socket on transient
-        # AcceptEx failures (for example WinError 64 from keep-alive RSTs).
-        # The selector loop keeps accept errors scoped to the connection.
-        uvicorn_kwargs["loop"] = "asyncio:SelectorEventLoop"
+        _configure_windows_uvicorn_loop(uvicorn_kwargs)
     if workers > 1:
         # CompressionCache and PrefixTracker are always per-worker instance vars.
         # Python CompressionStore defaults to InMemoryBackend (per-process), so

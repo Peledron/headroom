@@ -188,3 +188,32 @@ def test_normalize_is_noop_when_no_block_markers():
     # places exactly one breakpoint (so the prefix gets cached), content stable
     assert _markers(out) == 1
     assert _strip_cache_control(out) == _strip_cache_control(plain)
+
+
+def test_latest_message_cache_control_ttl_survives_precompression_strip():
+    from headroom.cache.prefix_tracker import latest_message_cache_control_ttl
+
+    original = [
+        B("user", "old", cc=True),
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "new delta",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        },
+    ]
+
+    ttl = latest_message_cache_control_ttl(original)
+    stripped = _strip_cache_control(original)
+    normalized = normalize_message_cache_control(stripped, force_ttl=ttl)
+
+    assert ttl == "1h"
+    assert normalized[-1]["content"][-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
+    assert _strip_cache_control(normalized) == stripped

@@ -33,7 +33,7 @@ PRICING_USD_PER_1M: dict[str, tuple[float, float, float]] = {
     "gpt-5.6-terra": (2.50, 0.25, 15.00),
     "gpt-5.6-luna": (1.00, 0.10, 6.00),
 }
-ARMS = ("bare", "headroom", "full")
+ARMS = ("bare", "headroom", "full", "full-no-headroom")
 HEADROOM_ONLY_CONFIG = """\
 model_provider = "headroom"
 
@@ -158,7 +158,7 @@ def _prepare_codex_home(root: Path, arm: str) -> Path:
     if not (home / "auth.json").exists():
         raise RuntimeError(f"Codex subscription auth not found at {source / 'auth.json'}")
 
-    if arm == "full":
+    if arm in ("full", "full-no-headroom"):
         for name in (
             "config.toml",
             "hooks.json",
@@ -176,6 +176,12 @@ def _prepare_codex_home(root: Path, arm: str) -> Path:
 def _arm_flags(arm: str) -> list[str]:
     if arm == "full":
         return ["--dangerously-bypass-hook-trust"]
+    if arm == "full-no-headroom":
+        return [
+            "--dangerously-bypass-hook-trust",
+            "--config",
+            'model_provider="openai"',
+        ]
     if arm == "bare":
         return ["--ignore-user-config", "--ignore-rules"]
     return ["--ignore-rules"]

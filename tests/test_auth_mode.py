@@ -68,6 +68,20 @@ def test_cursor_ua_classified_subscription() -> None:
     assert classify_auth_mode(headers) is AuthMode.SUBSCRIPTION
 
 
+def test_codex_tui_ua_classified_subscription_and_client() -> None:
+    """Current Codex Rust CLI identifies as ``codex-tui``, not ``codex-cli``."""
+    headers = {
+        "user-agent": (
+            "codex-tui/0.144.1 (Fedora 44.0.0; x86_64) "
+            "Konsole/260403 (codex-tui; 0.144.1)"
+        ),
+        "authorization": "Bearer header.payload.signature",
+    }
+
+    assert classify_auth_mode(headers) is AuthMode.SUBSCRIPTION
+    assert classify_client(headers) == "codex"
+
+
 def test_no_auth_no_user_agent_default_payg() -> None:
     """Empty headers → safest default is PAYG.
 
