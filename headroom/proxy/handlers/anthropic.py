@@ -1196,6 +1196,23 @@ class AnthropicHandlerMixin:
             # has recent gaps to reason about. Pure bookkeeping, no forwarding
             # effect, so it always runs and builds the signal even flags-off.
             prefix_tracker.record_turn_gap(netcost_idle_seconds)
+            # Structural bust detection (pre-forward): the surviving fraction
+            # of last turn's original prefix in this turn's client bytes. When
+            # the client already rewrote history at depth k, the cached suffix
+            # below k re-writes this turn no matter what the proxy decides, so
+            # the mutation gates scale their bust penalty by this value and
+            # compression of the dead region becomes free (bust piggybacking).
+            # Runs before update_from_response overwrites the comparison state.
+            # Also feeds the churn-depth ring that anchor placement reads.
+            client_prefix_alive_fraction = prefix_tracker.observe_client_churn(
+                original_client_messages
+            )
+            if client_prefix_alive_fraction < 1.0:
+                logger.info(
+                    f"[{request_id}] STRUCTURAL-CHURN: client prefix diverged, "
+                    f"alive_fraction={client_prefix_alive_fraction:.2f} "
+                    "(bust penalty scaled down for this turn)"
+                )
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
@@ -1215,12 +1232,27 @@ class AnthropicHandlerMixin:
                 _hybrid_limit = self.anthropic_provider.get_context_limit(model)
                 _hybrid_ttl = prefix_tracker.recommended_ttl() or "5m"
                 _hybrid_ttl_seconds = 3600.0 if _hybrid_ttl == "1h" else 300.0
-                _hybrid_alive = max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _hybrid_ttl_seconds)
+                # Hazard survival from the session's gap history (linear idle
+                # proxy as low-evidence fallback), scaled by the structural
+                # churn observation: suffix regions the client already busted
+                # this turn carry no remaining bust penalty.
+                _hybrid_alive = prefix_tracker.survival_p_alive(
+                    _hybrid_ttl_seconds,
+                    max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _hybrid_ttl_seconds),
+                )
+                _hybrid_alive *= client_prefix_alive_fraction
                 _hybrid_kept = prefix_tracker.conservative_compression_ratio(k=1.0)
+                # Expected-reads forecast from this session's cadence (an
+                # explicit env value stays authoritative, the dynamic
+                # geometric run-length estimate replaces only the default).
+                _reads_env = os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "")
                 try:
-                    _hybrid_reads = float(
-                        os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0
-                    )
+                    if _reads_env:
+                        _hybrid_reads = float(_reads_env)
+                    else:
+                        _hybrid_reads = prefix_tracker.expected_reads_within_ttl(
+                            _hybrid_ttl_seconds, fallback=10.0
+                        )
                 except ValueError:
                     _hybrid_reads = 10.0
                 _hybrid_decision = prefix_tracker.hybrid_controller.decide(
@@ -1542,16 +1574,35 @@ class AnthropicHandlerMixin:
                             _kept = prefix_tracker.conservative_compression_ratio(k=_conf_k)
                             _est_dt = max(0, int(original_tokens * (1.0 - _kept)))
                             _S = prefix_tracker.cached_token_count()
-                            try:
-                                _R = float(
-                                    os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0
-                                )
-                            except ValueError:
-                                _R = 10.0
                             _ttl = prefix_tracker.recommended_ttl() or "5m"
                             _w = write_multiplier_for_ttl(_ttl)
                             _ttl_s = 3600.0 if _ttl == "1h" else 300.0
-                            _p_alive = max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s)
+                            # Cadence-forecast expected reads (env override
+                            # stays authoritative when set).
+                            _R_env = os.environ.get(
+                                "HEADROOM_NET_COST_EXPECTED_READS", ""
+                            )
+                            try:
+                                if _R_env:
+                                    _R = float(_R_env)
+                                else:
+                                    _R = prefix_tracker.expected_reads_within_ttl(
+                                        _ttl_s, fallback=10.0
+                                    )
+                            except ValueError:
+                                _R = 10.0
+                            # Hazard-based survival: the session's own gap
+                            # history predicts whether the written prefix gets
+                            # read again inside the TTL, with the old linear
+                            # idle proxy as the low-evidence fallback.
+                            _p_linear = max(
+                                0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s
+                            )
+                            _p_alive = prefix_tracker.survival_p_alive(_ttl_s, _p_linear)
+                            # Bust piggybacking: client churn already killed
+                            # part of the cached suffix this turn, so only the
+                            # surviving fraction still carries a bust penalty.
+                            _p_alive *= client_prefix_alive_fraction
                             _gain = compression_policy.net_mutation_gain(
                                 _est_dt, _S, _R, _p_alive, _w
                             )
@@ -3068,43 +3119,66 @@ class AnthropicHandlerMixin:
                         return _n
 
                     _existing = _count_cc([body.get("system"), body.get("tools"), _msgs])
-                    if len(_msgs) >= 80 and _existing < 4:
-                        _anchor = max(32, (len(_msgs) - 16) // 64 * 64)
-                        _anchor = min(_anchor, len(_msgs) - 16)
-                        for _i in range(_anchor, max(_anchor - 24, 0), -1):
-                            _c = _msgs[_i].get("content")
-                            # Accept both list content (anchor the last block)
-                            # and bare-dict content (anchor the dict itself), so
-                            # a client list<->dict shape flip on the target
-                            # message does not make the scan skip it and drift
-                            # the anchor to a neighbour.
-                            _tail = None
-                            if isinstance(_c, list) and _c and isinstance(_c[-1], dict):
-                                _tail = _c[-1]
-                            elif isinstance(_c, dict):
-                                _tail = _c
-                            if (
-                                _tail is not None
-                                and not _tail.get("cache_control")
-                                and _tail.get("type") in ("text", "tool_result")
-                            ):
-                                _new_tail = {
-                                    **_tail,
-                                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
-                                }
-                                if isinstance(_c, list):
-                                    _new_content = list(_c[:-1]) + [_new_tail]
-                                else:
-                                    _new_content = _new_tail
-                                _new_msg = {**_msgs[_i], "content": _new_content}
-                                body["messages"] = (
-                                    list(_msgs[:_i]) + [_new_msg] + list(_msgs[_i + 1 :])
-                                )
-                                logger.info(
-                                    f"[{request_id}] HR_MID_ANCHOR: 1h anchor at "
-                                    f"msg {_i}/{len(_msgs)}"
-                                )
-                                break
+                    _budget = 4 - _existing
+                    if len(_msgs) >= 80 and _budget > 0:
+                        # HR_DP_ANCHORS (2026-07-17, local fork): spend the whole
+                        # remaining breakpoint budget at DP-optimal depths from
+                        # this session's observed churn-depth profile, instead of
+                        # the single fixed mid-depth anchor. Opt-in while it
+                        # canaries. Same quantization, so anchors stay
+                        # byte-stable between growth jumps either way.
+                        if os.environ.get("HR_DP_ANCHORS") == "1":
+                            from headroom.cache.anchor_dp import optimal_anchor_depths
+
+                            _targets = optimal_anchor_depths(
+                                len(_msgs),
+                                prefix_tracker.churn_depth_samples,
+                                _budget,
+                            )
+                        else:
+                            _anchor = max(32, (len(_msgs) - 16) // 64 * 64)
+                            _targets = [min(_anchor, len(_msgs) - 16)]
+
+                        _taken: set[int] = set()
+                        for _target in _targets:
+                            _msgs = body.get("messages") or []
+                            for _i in range(_target, max(_target - 24, 0), -1):
+                                if _i in _taken:
+                                    continue
+                                _c = _msgs[_i].get("content")
+                                # Accept both list content (anchor the last block)
+                                # and bare-dict content (anchor the dict itself), so
+                                # a client list<->dict shape flip on the target
+                                # message does not make the scan skip it and drift
+                                # the anchor to a neighbour.
+                                _tail = None
+                                if isinstance(_c, list) and _c and isinstance(_c[-1], dict):
+                                    _tail = _c[-1]
+                                elif isinstance(_c, dict):
+                                    _tail = _c
+                                if (
+                                    _tail is not None
+                                    and not _tail.get("cache_control")
+                                    and _tail.get("type") in ("text", "tool_result")
+                                ):
+                                    _new_tail = {
+                                        **_tail,
+                                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                                    }
+                                    if isinstance(_c, list):
+                                        _new_content = list(_c[:-1]) + [_new_tail]
+                                    else:
+                                        _new_content = _new_tail
+                                    _new_msg = {**_msgs[_i], "content": _new_content}
+                                    body["messages"] = (
+                                        list(_msgs[:_i]) + [_new_msg] + list(_msgs[_i + 1 :])
+                                    )
+                                    _taken.add(_i)
+                                    logger.info(
+                                        f"[{request_id}] HR_MID_ANCHOR: 1h anchor at "
+                                        f"msg {_i}/{len(_msgs)}"
+                                    )
+                                    break
                 except Exception:
                     logger.warning("HR_MID_ANCHOR failed", exc_info=True)
 

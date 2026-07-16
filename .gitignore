@@ -27,6 +27,7 @@ scripts/*
 !scripts/README.md
 !scripts/repro_codex_replay.py
 !scripts/eval_output_shaper.py
+!scripts/oracle_replay.py
 !scripts/fixtures/
 !scripts/fixtures/*.json
 !scripts/record_fixtures.py

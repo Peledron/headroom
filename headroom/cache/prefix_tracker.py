@@ -503,6 +503,12 @@ class PrefixCacheTracker:
         # out. Fed by the handler with the pre-refresh idle gap each turn.
         self._turn_gaps: deque[float] = deque(maxlen=8)
         self._ttl_recommendation: str | None = None
+        # Depth fractions (0..1 of last turn's original prefix) where client
+        # churn structurally diverged the history, recorded by
+        # observe_client_churn. Consumed by anchor placement: the empirical
+        # churn-depth profile says where breakpoints stop paying. Bounded ring,
+        # recent churn behavior is what matters for this session.
+        self._churn_depth_fractions: deque[float] = deque(maxlen=32)
         # Token-mode cost-aware prefix gate state. Once the break-even math
         # decides to compress this session, it latches on: pressure and expected
         # reads only grow, so re-deciding every turn could flip compressed back to
@@ -609,6 +615,103 @@ class PrefixCacheTracker:
             self._ttl_recommendation = "1h"
         # else: ambiguous band -> keep the previous recommendation (hysteresis).
         return self._ttl_recommendation
+
+    def observe_client_churn(
+        self, current_original_messages: list[dict[str, Any]]
+    ) -> float:
+        """Surviving fraction of last turn's ORIGINAL prefix in this turn's bytes.
+
+        Structural bust detection, the pre-forward counterpart of
+        :meth:`classify_cache_miss`. Compares this turn's client messages
+        against last turn's recorded originals with the shared canonicalizer,
+        client bytes against client bytes, so the proxy's own transforms can
+        never register as churn. Returns ``k / n`` where ``k`` is the first
+        divergent message index and ``n`` last turn's length: ``1.0`` means the
+        prefix is intact (or there is no history to compare), ``0.0`` means the
+        client rewrote the head and the entire cached suffix is already dead.
+
+        The mutation gates multiply their bust penalty by this scale: content
+        below the divergence point re-writes this turn regardless, so mutating
+        it is free and only the surviving fraction still carries a penalty.
+        Message-count granularity approximates the token split, which is the
+        conservative direction only when churn hits size-typical messages;
+        callers treat it as an estimate, not an exact token ratio.
+
+        Call BEFORE :meth:`update_from_response` (which overwrites
+        ``_last_original_messages``), once per request. A real divergence
+        (``k < n``) is also recorded into the churn-depth ring consumed by
+        anchor placement.
+        """
+        prev = self._last_original_messages
+        if not prev:
+            return 1.0
+        n = len(prev)
+        limit = min(n, len(current_original_messages))
+        k = 0
+        while k < limit and _canonicalize_for_prefix_compare(
+            current_original_messages[k]
+        ) == _canonicalize_for_prefix_compare(prev[k]):
+            k += 1
+        if k >= n:
+            return 1.0
+        fraction = k / n
+        self._churn_depth_fractions.append(fraction)
+        return fraction
+
+    @property
+    def churn_depth_samples(self) -> list[float]:
+        """Recent structural-churn depth fractions (0 = head, 1 = tail)."""
+        return list(self._churn_depth_fractions)
+
+    def survival_p_alive(
+        self, ttl_seconds: float, linear_fallback: float
+    ) -> float:
+        """P(the prefix written now is read again before its TTL lapses).
+
+        Empirical hazard estimate from this session's observed inter-turn gaps:
+        the fraction of recent gaps that fit inside ``ttl_seconds``. The linear
+        ``1 - idle/ttl`` proxy this replaces predicts the NEXT gap from the
+        CURRENT idle, which mis-prices heavy-tailed cadences (a bursty session
+        looks half-dead at 4 minutes idle when its gap history says the next
+        request lands in seconds). With fewer than two samples the fallback is
+        returned unchanged, and the blend weight ``n / (n + 4)`` walks from the
+        fallback toward the empirical rate as evidence accumulates, so a single
+        outlier gap cannot swing the estimate.
+        """
+        gaps = self._turn_gaps
+        n = len(gaps)
+        if n < 2 or ttl_seconds <= 0:
+            return min(max(linear_fallback, 0.0), 1.0)
+        empirical = sum(1 for g in gaps if g <= ttl_seconds) / n
+        weight = n / (n + 4.0)
+        blended = weight * empirical + (1.0 - weight) * linear_fallback
+        return min(max(blended, 0.0), 1.0)
+
+    def expected_reads_within_ttl(
+        self, ttl_seconds: float, fallback: float
+    ) -> float:
+        """Forecast of future same-session reads before a TTL-lapsing gap.
+
+        The net-mutation break-even amortizes a bust over expected future
+        reads ``R``. A fixed ``R`` misprices both extremes: a rapid-fire
+        session amortizes far more reads than a constant admits, a sporadic
+        one far fewer. With ``p`` the observed fraction of this session's
+        gaps that fit inside ``ttl_seconds``, the expected run of consecutive
+        within-TTL turns ahead is the geometric run length ``p / (1 - p)``.
+        ``p`` is capped at 0.95 (a 19-read forecast) so a streak of quick
+        turns cannot promise an unbounded amortization horizon. Same blend
+        discipline as :meth:`survival_p_alive`: with fewer than two gaps the
+        fallback is returned unchanged, then evidence weight ``n / (n + 4)``
+        walks toward the forecast.
+        """
+        gaps = self._turn_gaps
+        n = len(gaps)
+        if n < 2 or ttl_seconds <= 0:
+            return max(fallback, 0.0)
+        p = min(sum(1 for g in gaps if g <= ttl_seconds) / n, 0.95)
+        forecast = p / (1.0 - p)
+        weight = n / (n + 4.0)
+        return max(weight * forecast + (1.0 - weight) * max(fallback, 0.0), 0.0)
 
     @property
     def compress_latched(self) -> bool:
