@@ -1963,11 +1963,21 @@ class AnthropicHandlerMixin:
                 original_client_messages
             )
             _force_ttl = None
-            if os.environ.get("HEADROOM_ADAPTIVE_TTL") == "1":
+            _hybrid_policy = prefix_tracker.hybrid_controller.config
+            if (
+                is_hybrid_mode(getattr(self.config, "mode", None))
+                and _hybrid_policy.adaptive_ttl
+            ) or os.environ.get("HEADROOM_ADAPTIVE_TTL") == "1":
                 _force_ttl = prefix_tracker.recommended_ttl()
             if (
                 _force_ttl is None
-                and os.environ.get("HR_SUBAGENT_TTL_5M") == "1"
+                and (
+                    (
+                        is_hybrid_mode(getattr(self.config, "mode", None))
+                        and _hybrid_policy.subagent_ttl_5m
+                    )
+                    or os.environ.get("HR_SUBAGENT_TTL_5M") == "1"
+                )
                 and _is_subagent_request
             ):
                 _force_ttl = "5m"
@@ -2980,7 +2990,10 @@ class AnthropicHandlerMixin:
             # churn, so the whole class stops busting. The current-turn reminder
             # is preserved (only already-acted deep ones go, and only when other
             # content remains so a message is never emptied). Off by default.
-            if os.environ.get("HR_STRIP_DEEP_REMINDERS") == "1":
+            if (
+                is_hybrid_mode(getattr(self.config, "mode", None))
+                and prefix_tracker.hybrid_controller.config.strip_deep_reminders
+            ) or os.environ.get("HR_STRIP_DEEP_REMINDERS") == "1":
                 try:
                     _msgs = body.get("messages") or []
                     if len(_msgs) > 1:
@@ -3025,7 +3038,10 @@ class AnthropicHandlerMixin:
             # between growth jumps. Copy-on-write when attaching the marker:
             # in-place mutation would leak into tracker or compression-cache
             # state that is compared against next turn's client bytes.
-            if os.environ.get("HR_MID_ANCHOR") == "1":
+            if (
+                is_hybrid_mode(getattr(self.config, "mode", None))
+                and prefix_tracker.hybrid_controller.config.mid_anchor
+            ) or os.environ.get("HR_MID_ANCHOR") == "1":
                 try:
                     _msgs = body.get("messages") or []
 
@@ -3105,7 +3121,10 @@ class AnthropicHandlerMixin:
             # behavior-neutral. Idempotent, so byte-stable across turns. Off by
             # default. Full cross-agent KV reuse is not possible (needs control
             # of the serving stack); this only dedups the head-id fork.
-            if os.environ.get("HR_CANON_MODEL_ID") == "1":
+            if (
+                is_hybrid_mode(getattr(self.config, "mode", None))
+                and prefix_tracker.hybrid_controller.config.canon_model_id
+            ) or os.environ.get("HR_CANON_MODEL_ID") == "1":
                 try:
                     import re as _re
 

@@ -9,6 +9,7 @@ net-cost, minimum-age, hysteresis, and cooldown gates.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from enum import Enum
 
@@ -29,6 +30,29 @@ class HybridModeConfig:
     minimum_savings_fraction: float = 0.08
     pressure_rebase_threshold: float = 0.92
     pressure_hard_limit: float = 0.98
+    adaptive_ttl: bool = True
+    subagent_ttl_5m: bool = True
+    net_cost_mutations: bool = True
+    strip_deep_reminders: bool = True
+    mid_anchor: bool = True
+    canon_model_id: bool = True
+
+    @classmethod
+    def from_environment(cls) -> HybridModeConfig:
+        """Resolve legacy feature flags into one hybrid policy."""
+
+        def enabled(name: str) -> bool:
+            value = os.environ.get(name)
+            return value != "0" if value is not None else True
+
+        return cls(
+            adaptive_ttl=enabled("HEADROOM_ADAPTIVE_TTL"),
+            subagent_ttl_5m=enabled("HR_SUBAGENT_TTL_5M"),
+            net_cost_mutations=enabled("HEADROOM_NET_COST_POLICY"),
+            strip_deep_reminders=enabled("HR_STRIP_DEEP_REMINDERS"),
+            mid_anchor=enabled("HR_MID_ANCHOR"),
+            canon_model_id=enabled("HR_CANON_MODEL_ID"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +77,7 @@ class HybridModeController:
 
     def __init__(self, provider: str, config: HybridModeConfig | None = None):
         self.provider = provider
-        self.config = config or HybridModeConfig()
+        self.config = config or HybridModeConfig.from_environment()
         self.phase = HybridPhase.COLD_PREFIX
         self.generation = 0
         self._warm_turns = 0

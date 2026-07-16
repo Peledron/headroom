@@ -3678,7 +3678,12 @@ class ContentRouter(Transform):
         # token sums are precomputed once (reverse cumulative) so each
         # candidate's S lookup is O(1). v1 estimator per the issue: S is the
         # token total of every message after the candidate.
-        netcost_enabled = os.environ.get("HEADROOM_NET_COST_POLICY") == "1"
+        _netcost_policy = kwargs.get("net_cost_policy")
+        netcost_enabled = (
+            bool(_netcost_policy)
+            if _netcost_policy is not None
+            else os.environ.get("HEADROOM_NET_COST_POLICY") == "1"
+        )
         netcost_suffix_tokens: list[int] = []
         # #856 P3a: shared batch-reclaim state for this request. ``floor`` is
         # the shallowest slot admitted as a net-positive mutation; once set,

@@ -27,6 +27,37 @@ def test_cold_prefix_establishes_without_freezing() -> None:
     assert decision.should_rebase is False
 
 
+def test_hybrid_cache_features_default_on_and_allow_explicit_opt_out(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_ADAPTIVE_TTL", raising=False)
+    assert HybridModeConfig.from_environment().adaptive_ttl is True
+
+    monkeypatch.setenv("HEADROOM_ADAPTIVE_TTL", "0")
+    assert HybridModeConfig.from_environment().adaptive_ttl is False
+
+    monkeypatch.setenv("HEADROOM_ADAPTIVE_TTL", "1")
+    assert HybridModeConfig.from_environment().adaptive_ttl is True
+
+
+def test_hybrid_policy_centralizes_legacy_feature_opt_outs(monkeypatch) -> None:
+    features = {
+        "HEADROOM_ADAPTIVE_TTL": "adaptive_ttl",
+        "HR_SUBAGENT_TTL_5M": "subagent_ttl_5m",
+        "HEADROOM_NET_COST_POLICY": "net_cost_mutations",
+        "HR_STRIP_DEEP_REMINDERS": "strip_deep_reminders",
+        "HR_MID_ANCHOR": "mid_anchor",
+        "HR_CANON_MODEL_ID": "canon_model_id",
+    }
+    for env_name in features:
+        monkeypatch.delenv(env_name, raising=False)
+    defaults = HybridModeConfig.from_environment()
+    assert all(getattr(defaults, field) for field in features.values())
+
+    for env_name, field in features.items():
+        monkeypatch.setenv(env_name, "0")
+        assert getattr(HybridModeConfig.from_environment(), field) is False
+        monkeypatch.delenv(env_name)
+
+
 def test_warm_prefix_only_exposes_live_delta() -> None:
     controller = HybridModeController("anthropic")
     decision = _decide(controller, estimated_savings_tokens=100, context_pressure=0.2)

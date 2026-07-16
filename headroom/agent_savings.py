@@ -280,6 +280,14 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
     """
 
     kwargs: dict[str, object] = {}
+    # Hybrid owns cache-safe mutation economics. Passing the mode into the
+    # content router makes its per-message net-cost gate part of that subsystem
+    # instead of requiring a second environment flag.
+    from headroom.proxy.hybrid_mode import HybridModeConfig
+    from headroom.proxy.modes import is_hybrid_mode
+
+    if is_hybrid_mode(getattr(config, "mode", None)):
+        kwargs["net_cost_policy"] = HybridModeConfig.from_environment().net_cost_mutations
     profile_name = getattr(config, "savings_profile", None)
     if profile_name:
         profile = get_agent_savings_profile(str(profile_name))
