@@ -1523,6 +1523,12 @@ class AnthropicHandlerMixin:
                             _mask_candidates = discover_candidates(
                                 messages,
                                 count_tokens=tokenizer.count_text,
+                                mask_after_turns=getattr(
+                                    _masking_config, "mask_after_turns", 2
+                                ),
+                                mask_min_tokens=getattr(
+                                    _masking_config, "mask_min_tokens", 150
+                                ),
                             )
                             _masking_admitted = bool(_mask_candidates) and (
                                 client_prefix_alive_fraction == 0.0
@@ -1685,6 +1691,20 @@ class AnthropicHandlerMixin:
                                 write_multiplier=write_multiplier_for_ttl(_mask_ttl),
                             )
                             _masking_admitted = _mask_gain > 0.0
+                            if not _masking_admitted:
+                                # Declined-gain telemetry: a distribution that
+                                # clusters just below zero across sessions means
+                                # expected_reads/p_alive are estimated too
+                                # conservatively and are worth recalibrating.
+                                _mask_dt = sum(
+                                    c.tokens_saved for c in _mask_candidates
+                                )
+                                logger.info(
+                                    f"[{request_id}] MASKING_GATE: declined "
+                                    f"(gain={_mask_gain:.0f} dT={_mask_dt} "
+                                    f"n={len(_mask_candidates)} R={_mask_reads:.1f} "
+                                    f"p_alive={_mask_alive:.3f} ttl={_mask_ttl})"
+                                )
                         _mask_result = None
                         if skip_ccr_request_compression:
                             logger.info(

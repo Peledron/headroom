@@ -58,6 +58,26 @@ def test_hybrid_policy_centralizes_legacy_feature_opt_outs(monkeypatch) -> None:
         monkeypatch.delenv(env_name)
 
 
+def test_masking_thresholds_default_and_env_override(monkeypatch) -> None:
+    monkeypatch.delenv("HR_MASK_AFTER_TURNS", raising=False)
+    monkeypatch.delenv("HR_MASK_MIN_TOKENS", raising=False)
+    defaults = HybridModeConfig.from_environment()
+    assert defaults.mask_after_turns == 2
+    assert defaults.mask_min_tokens == 150
+
+    monkeypatch.setenv("HR_MASK_AFTER_TURNS", "5")
+    monkeypatch.setenv("HR_MASK_MIN_TOKENS", "400")
+    overridden = HybridModeConfig.from_environment()
+    assert overridden.mask_after_turns == 5
+    assert overridden.mask_min_tokens == 400
+
+    monkeypatch.setenv("HR_MASK_AFTER_TURNS", "not-a-number")
+    monkeypatch.setenv("HR_MASK_MIN_TOKENS", "-3")
+    fallback = HybridModeConfig.from_environment()
+    assert fallback.mask_after_turns == 2
+    assert fallback.mask_min_tokens == 0
+
+
 def test_warm_prefix_only_exposes_live_delta() -> None:
     controller = HybridModeController("anthropic")
     decision = _decide(controller, estimated_savings_tokens=100, context_pressure=0.2)

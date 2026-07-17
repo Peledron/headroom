@@ -38,6 +38,12 @@ class HybridModeConfig:
     dp_anchors: bool = True
     observation_masking: bool = True
     canon_model_id: bool = True
+    # Thresholds derived from a 15-session transcript breakdown (2026-07-17):
+    # coverage of tool-result tokens is flat across age 1 to 5 but jumps from
+    # 57% to 78.5% when the size floor drops from 400 to 150, so size is the
+    # binding lever and age 2 keeps a safety margin behind the working set.
+    mask_after_turns: int = 2
+    mask_min_tokens: int = 150
 
     @classmethod
     def from_environment(cls) -> HybridModeConfig:
@@ -46,6 +52,15 @@ class HybridModeConfig:
         def enabled(name: str) -> bool:
             value = os.environ.get(name)
             return value != "0" if value is not None else True
+
+        def integer(name: str, default: int) -> int:
+            value = os.environ.get(name)
+            if value is None:
+                return default
+            try:
+                return max(0, int(value))
+            except ValueError:
+                return default
 
         return cls(
             adaptive_ttl=enabled("HEADROOM_ADAPTIVE_TTL"),
@@ -56,6 +71,8 @@ class HybridModeConfig:
             dp_anchors=enabled("HR_DP_ANCHORS"),
             observation_masking=enabled("HEADROOM_OBSERVATION_MASKING"),
             canon_model_id=enabled("HR_CANON_MODEL_ID"),
+            mask_after_turns=integer("HR_MASK_AFTER_TURNS", 2),
+            mask_min_tokens=integer("HR_MASK_MIN_TOKENS", 150),
         )
 
 
