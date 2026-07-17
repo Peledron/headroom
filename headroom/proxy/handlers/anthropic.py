@@ -1534,6 +1534,39 @@ class AnthropicHandlerMixin:
                                     _masking_config, "mask_min_tokens", 150
                                 ),
                             )
+                            if not _mask_candidates:
+                                # Zero candidates on a large session means the
+                                # wire shape eluded discovery; log the shape
+                                # histogram so the mismatch is diagnosable
+                                # from logs alone.
+                                _tr_shapes: dict[str, int] = {}
+                                for _m in messages:
+                                    _c = _m.get("content") if isinstance(_m, dict) else None
+                                    if not isinstance(_c, list):
+                                        continue
+                                    for _b in _c:
+                                        if isinstance(_b, dict) and _b.get("type") == "tool_result":
+                                            _inner = _b.get("content")
+                                            if isinstance(_inner, list):
+                                                _k = "list[" + ",".join(
+                                                    sorted(
+                                                        {
+                                                            _x.get("type", "?")
+                                                            if isinstance(_x, dict)
+                                                            else type(_x).__name__
+                                                            for _x in _inner
+                                                        }
+                                                    )
+                                                ) + f"]x{len(_inner)}"
+                                            else:
+                                                _k = type(_inner).__name__
+                                            _tr_shapes[_k] = _tr_shapes.get(_k, 0) + 1
+                                if sum(_tr_shapes.values()) > 10:
+                                    logger.info(
+                                        f"[{request_id}] MASKING_DISCOVERY: 0 candidates "
+                                        f"across {sum(_tr_shapes.values())} tool_results, "
+                                        f"shapes={_tr_shapes}"
+                                    )
                             # Admission covers all three free/cheap moments:
                             # structural death (client rewrote the prefix),
                             # an already-decided rebase, and temporal death
