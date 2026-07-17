@@ -7,6 +7,18 @@ Defaults are `mask_after_turns=3` assistant turns and `mask_min_tokens=400`.
 Both conditions must hold. The environment override follows the existing
 hybrid policy pattern. `HEADROOM_OBSERVATION_MASKING=0` disables it. There is
 no standalone `HR_*` primary feature flag.
+
+Extension 2026-07-17: discovery also walks assistant `tool_use` blocks and
+masks a fixed allowlist of bulky input keys (`content`, `file_text`,
+`new_string`, `old_string`) under identical age, size, economics, and CCR
+rules, with marker prefix `[Tool input masked:`. Motivation: a 15-session
+transcript breakdown measured tool_use args at 35% of resent tokens, the
+largest single source, previously untouched by any layer. The original scope
+followed the masking paper, which only studied tool outputs; inputs were never
+deliberately excluded. Defaults were also lowered to `mask_after_turns=2` and
+`mask_min_tokens=150` from the same breakdown (size floor is the binding
+lever, age is not), overridable via `HR_MASK_AFTER_TURNS` and
+`HR_MASK_MIN_TOKENS`.
 ## Existing machinery and overlap
 - `read_lifecycle.py` already maps Anthropic `tool_use` IDs to tool results,
   replaces stale or superseded Reads, stores originals in CCR, and emits the
