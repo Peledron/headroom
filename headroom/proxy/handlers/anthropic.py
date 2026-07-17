@@ -1497,6 +1497,10 @@ class AnthropicHandlerMixin:
                             masking_gate_gain,
                         )
 
+                        from headroom.transforms.observation_masking import (
+                            _MASKABLE_INPUT_KEYS,
+                        )
+
                         _mask_candidates = discover_candidates(
                             messages,
                             count_tokens=tokenizer.count_text,
@@ -1505,6 +1509,11 @@ class AnthropicHandlerMixin:
                             ),
                             mask_min_tokens=getattr(
                                 _masking_config, "mask_min_tokens", 150
+                            ),
+                            mask_input_keys=(
+                                _MASKABLE_INPUT_KEYS
+                                if getattr(_masking_config, "mask_tool_inputs", False)
+                                else ()
                             ),
                         )
                         if not _mask_candidates:

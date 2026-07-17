@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 
 from headroom.transforms.observation_masking import (
+    _MASKABLE_INPUT_KEYS,
     apply_candidates,
     discover_candidates,
     masking_gate_gain,
@@ -122,17 +123,16 @@ def test_placeholder_and_ccr_content():
 def test_idempotence_and_existing_recovery_marker():
     payload = "word " * 30
     messages = _messages(payload)
-    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     first = apply_candidates(messages, candidates, compression_store=_Store())
     frozen = deepcopy(first.messages)
     second_candidates = discover_candidates(
-        first.messages, count_tokens=_count, mask_min_tokens=10
-    )
+        first.messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert second_candidates == []
     assert first.messages == frozen
 
     recovery = _messages("old. Retrieve original: hash=0123456789abcdef01234567 " + payload)
-    assert discover_candidates(recovery, count_tokens=_count, mask_min_tokens=10) == []
+    assert discover_candidates(recovery, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS) == []
 
 
 def test_non_string_and_store_failure_leave_messages_unchanged():
@@ -141,7 +141,7 @@ def test_non_string_and_store_failure_leave_messages_unchanged():
         {"type": "tool_result", "tool_use_id": "tool-1", "content": [{"type": "text"}]}
     )
     original = deepcopy(messages)
-    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     store = _Store(fail=True)
     result = apply_candidates(messages, candidates, compression_store=store)
     assert result.messages == original
@@ -155,6 +155,7 @@ def test_tool_use_input_age_threshold(later_turns: int, expected: int):
         _write_messages("word " * 20, later_turns),
         count_tokens=_count,
         mask_min_tokens=10,
+        mask_input_keys=_MASKABLE_INPUT_KEYS,
     )
     assert len(candidates) == expected
     if expected:
@@ -164,7 +165,7 @@ def test_tool_use_input_age_threshold(later_turns: int, expected: int):
 def test_tool_use_input_masks_and_recovers():
     payload = "word " * 30
     messages = _write_messages(payload)
-    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert [c.input_key for c in candidates] == ["content"]
     marker = candidates[0].marker
     assert marker.startswith("[Tool input masked: tool=Write, key=content")
@@ -179,16 +180,16 @@ def test_tool_use_input_masks_and_recovers():
     # source list untouched (copy on write)
     assert messages[0]["content"][0]["input"]["content"] == payload
 
-    second = discover_candidates(result.messages, count_tokens=_count, mask_min_tokens=10)
+    second = discover_candidates(result.messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert second == []
 
 
 def test_tool_use_non_allowlisted_and_non_dict_input_untouched():
     messages = _write_messages("word " * 30)
     messages[0]["content"][0]["input"] = {"command": "word " * 30}
-    assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10) == []
+    assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS) == []
     messages[0]["content"][0]["input"] = "word " * 30
-    assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10) == []
+    assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS) == []
 
 
 def test_tool_use_multiple_keys_same_block():
@@ -199,7 +200,7 @@ def test_tool_use_multiple_keys_same_block():
         "old_string": "old " * 30,
         "new_string": "new " * 40,
     }
-    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert sorted(c.input_key for c in candidates if c.input_key) == [
         "new_string",
         "old_string",

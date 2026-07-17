@@ -44,6 +44,12 @@ class HybridModeConfig:
     # binding lever and age 2 keeps a safety margin behind the working set.
     mask_after_turns: int = 2
     mask_min_tokens: int = 150
+    # DEFAULT OFF after the 2026-07-17 mimicry incident: masking
+    # model-authored tool inputs taught the model to emit fabricated
+    # markers as real Write contents (live file corruption, original
+    # unrecoverable). Opt back in only with HR_MASK_TOOL_INPUTS=1 and
+    # only for experiments.
+    mask_tool_inputs: bool = False
 
     @classmethod
     def from_environment(cls) -> HybridModeConfig:
@@ -73,6 +79,7 @@ class HybridModeConfig:
             canon_model_id=enabled("HR_CANON_MODEL_ID"),
             mask_after_turns=integer("HR_MASK_AFTER_TURNS", 2),
             mask_min_tokens=integer("HR_MASK_MIN_TOKENS", 150),
+            mask_tool_inputs=os.environ.get("HR_MASK_TOOL_INPUTS") == "1",
         )
 
 

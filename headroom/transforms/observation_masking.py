@@ -15,10 +15,14 @@ INPUT_MASK_PREFIX = "[Tool input masked:"
 _RECOVERY_MARKER = "Retrieve original: hash="
 _EXCERPT_CHARS = 120
 
-# tool_use input keys that carry bulk content worth masking. Deliberately a
-# short allowlist: these are file bodies and edit payloads that are
-# recoverable from the CCR store (and usually from disk), never control
-# arguments the model reasons about later.
+# tool_use input keys that MAY be masked when a caller explicitly opts in.
+# DEFAULT OFF (discover_candidates masks no input keys unless asked): tool
+# inputs are MODEL-authored, and masking them plants marker text in the
+# position the model generates into. On 2026-07-17 this caused live file
+# corruption: after a masked rebase, the model emitted a fabricated
+# "[Tool input masked: ...]" marker as a Write's content, the file landed
+# on disk as the marker, and the invented hash was unrecoverable. Tool
+# RESULTS are environment-authored and stay safe to mask.
 _MASKABLE_INPUT_KEYS = ("content", "file_text", "new_string", "old_string")
 
 
@@ -127,6 +131,7 @@ def discover_candidates(
     count_tokens: Callable[[str], int],
     mask_after_turns: int = 3,
     mask_min_tokens: int = 400,
+    mask_input_keys: tuple[str, ...] = (),
 ) -> list[MaskCandidate]:
     """Prepare eligible markers without mutating messages or writing CCR."""
     metadata, assistant_turns = _tool_metadata(messages)
@@ -234,7 +239,7 @@ def discover_candidates(
                 )
                 if candidate is not None:
                     candidates.append(candidate)
-            elif block_type == "tool_use" and is_assistant:
+            elif block_type == "tool_use" and is_assistant and mask_input_keys:
                 tool_use_id = block.get("id")
                 if not isinstance(tool_use_id, str) or tool_use_id not in metadata:
                     continue
@@ -242,7 +247,7 @@ def discover_candidates(
                 if not isinstance(block_input, dict):
                     continue
                 tool_name, source_turn = metadata[tool_use_id]
-                for input_key in _MASKABLE_INPUT_KEYS:
+                for input_key in mask_input_keys:
                     original = block_input.get(input_key)
                     if not isinstance(original, str):
                         continue

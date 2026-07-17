@@ -11,7 +11,11 @@ from copy import deepcopy
 import pytest
 
 from headroom.proxy.hybrid_mode import HybridModeConfig
-from headroom.transforms.observation_masking import apply_candidates, discover_candidates
+from headroom.transforms.observation_masking import (
+    _MASKABLE_INPUT_KEYS,
+    apply_candidates,
+    discover_candidates,
+)
 
 
 def _count(text: str) -> int:
@@ -75,7 +79,7 @@ def test_input_candidates_ignore_non_strings_and_copy_nested_input() -> None:
     messages = _aged_tool_use(shared_input)
     original = deepcopy(messages)
 
-    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert [candidate.input_key for candidate in candidates] == ["content"]
 
     result = apply_candidates(messages, candidates, compression_store=_Store())
@@ -91,7 +95,7 @@ def test_malformed_result_block_with_input_only_masks_result_content() -> None:
     block["input"] = {"content": "input " * 30}
     block["content"] = "result " * 30
 
-    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert [(candidate.message_index, candidate.block_index, candidate.input_key) for candidate in candidates] == [
         (0, 0, "content"),
         (1, 0, None),
@@ -104,12 +108,12 @@ def test_partial_store_failure_does_not_repeat_admitted_input_on_fresh_discovery
     old = "old " * 30
     new = "new " * 30
     messages = _aged_tool_use({"old_string": old, "new_string": new})
-    first_candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    first_candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     store = _Store(fail_originals={new})
     first = apply_candidates(messages, first_candidates, compression_store=store)
     assert first.masked_count == 1
 
-    second_candidates = discover_candidates(first.messages, count_tokens=_count, mask_min_tokens=10)
+    second_candidates = discover_candidates(first.messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert [candidate.input_key for candidate in second_candidates] == ["new_string"]
     second_store = _Store()
     second = apply_candidates(first.messages, second_candidates, compression_store=second_store)
@@ -119,14 +123,14 @@ def test_partial_store_failure_does_not_repeat_admitted_input_on_fresh_discovery
 
 def test_input_marker_economics_are_evaluated_per_key() -> None:
     messages = _aged_tool_use({"content": "one two three four five six seven eight nine"})
-    candidates = discover_candidates(messages, count_tokens=_plain_count, mask_min_tokens=0)
+    candidates = discover_candidates(messages, count_tokens=_plain_count, mask_min_tokens=0, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert candidates == []
 
 
 def test_minimum_zero_still_rejects_empty_and_tiny_payloads() -> None:
     for payload in ("", "one"):
         messages = _aged_tool_use({"content": payload})
-        assert discover_candidates(messages, count_tokens=_plain_count, mask_min_tokens=0) == []
+        assert discover_candidates(messages, count_tokens=_plain_count, mask_min_tokens=0, mask_input_keys=_MASKABLE_INPUT_KEYS) == []
 
 
 def test_threshold_env_parsing_clamps_negatives_and_accepts_large_ints(monkeypatch) -> None:
@@ -156,7 +160,7 @@ def test_duplicate_tool_id_does_not_suppress_an_old_input_candidate() -> None:
             ],
         }
     )
-    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10, mask_input_keys=_MASKABLE_INPUT_KEYS)
     assert [(candidate.message_index, candidate.input_key) for candidate in candidates] == [
         (0, "content")
     ]
