@@ -35,6 +35,8 @@ class HybridModeConfig:
     net_cost_mutations: bool = True
     strip_deep_reminders: bool = True
     mid_anchor: bool = True
+    dp_anchors: bool = True
+    observation_masking: bool = True
     canon_model_id: bool = True
 
     @classmethod
@@ -51,6 +53,8 @@ class HybridModeConfig:
             net_cost_mutations=enabled("HEADROOM_NET_COST_POLICY"),
             strip_deep_reminders=enabled("HR_STRIP_DEEP_REMINDERS"),
             mid_anchor=enabled("HR_MID_ANCHOR"),
+            dp_anchors=enabled("HR_DP_ANCHORS"),
+            observation_masking=enabled("HEADROOM_OBSERVATION_MASKING"),
             canon_model_id=enabled("HR_CANON_MODEL_ID"),
         )
 

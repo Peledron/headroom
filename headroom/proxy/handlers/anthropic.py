@@ -196,9 +196,11 @@ class AnthropicHandlerMixin:
         from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
         from headroom.tokenizers import EstimatingTokenCounter, get_tokenizer
 
+        countable_messages = [message for message in messages if isinstance(message, dict)]
+
         def _resolve_and_count():  # noqa: ANN202
             tokenizer = get_tokenizer(model)
-            return tokenizer, tokenizer.count_messages(messages)
+            return tokenizer, tokenizer.count_messages(countable_messages)
 
         try:
             return await self._run_compression_in_executor(
@@ -218,7 +220,7 @@ class AnthropicHandlerMixin:
                     f"({e.__class__.__name__}); falling back to estimation"
                 )
             estimator = EstimatingTokenCounter()
-            return estimator, estimator.count_messages(messages)
+            return estimator, estimator.count_messages(countable_messages)
 
     @staticmethod
     def _resolve_ccr_workspace(
@@ -1183,7 +1185,7 @@ class AnthropicHandlerMixin:
             session_id = self.session_tracker_store.compute_session_id(
                 request,
                 model,
-                messages,
+                [message for message in messages if isinstance(message, dict)],
                 system=body.get("system"),
             )
             # #856 P3b: read the idle gap BEFORE get_or_create refreshes
@@ -1510,6 +1512,22 @@ class AnthropicHandlerMixin:
                         skip_ccr_request_compression = should_skip_ccr_request_compression(
                             frozen_message_count
                         )
+                        _mask_candidates = []
+                        _masking_admitted = False
+                        _masking_config = prefix_tracker.hybrid_controller.config
+                        if getattr(_masking_config, "observation_masking", True):
+                            from headroom.transforms.observation_masking import (
+                                discover_candidates,
+                            )
+
+                            _mask_candidates = discover_candidates(
+                                messages,
+                                count_tokens=tokenizer.count_text,
+                            )
+                            _masking_admitted = bool(_mask_candidates) and (
+                                client_prefix_alive_fraction == 0.0
+                                or _hybrid_should_rebase
+                            )
                         # HR_SUBAGENT_FREEZE (2026-07-12, local fork): a controlled
                         # token-vs-cache A/B on the same prompt proved token-mode
                         # compression BUSTS sub-agent traffic hard (158k tokens lost
@@ -1573,6 +1591,8 @@ class AnthropicHandlerMixin:
                             # single lucky sample.
                             _kept = prefix_tracker.conservative_compression_ratio(k=_conf_k)
                             _est_dt = max(0, int(original_tokens * (1.0 - _kept)))
+                            _mask_dt = sum(c.tokens_saved for c in _mask_candidates)
+                            _est_dt += _mask_dt
                             _S = prefix_tracker.cached_token_count()
                             _ttl = prefix_tracker.recommended_ttl() or "5m"
                             _w = write_multiplier_for_ttl(_ttl)
@@ -1622,6 +1642,7 @@ class AnthropicHandlerMixin:
                             # compress near the limit to avert a compaction.
                             if (_pressure >= _floor and _gain > 0.0) or _pressure >= _thr:
                                 prefix_tracker.latch_compress()
+                                _masking_admitted = bool(_mask_candidates)
                                 logger.info(
                                     f"[{request_id}] TOKEN_PREFIX_GATE: compress "
                                     f"(gain={_gain:.0f} pressure={_pressure:.2f} R={_R:.0f} "
@@ -1634,6 +1655,37 @@ class AnthropicHandlerMixin:
                                     f"(gain={_gain:.0f}<=0 pressure={_pressure:.2f}<{_thr:.2f}); "
                                     "compression does not yet pay"
                                 )
+                        if _mask_candidates and not _masking_admitted and context_limit:
+                            from headroom.transforms.compression_policy import (
+                                write_multiplier_for_ttl,
+                            )
+                            from headroom.transforms.observation_masking import (
+                                masking_gate_gain,
+                            )
+
+                            _mask_ttl = prefix_tracker.recommended_ttl() or "5m"
+                            _mask_ttl_s = 3600.0 if _mask_ttl == "1h" else 300.0
+                            _mask_reads = prefix_tracker.expected_reads_within_ttl(
+                                _mask_ttl_s, fallback=10.0
+                            )
+                            _mask_alive = prefix_tracker.survival_p_alive(
+                                _mask_ttl_s,
+                                max(
+                                    0.0,
+                                    1.0 - (netcost_idle_seconds or 0.0) / _mask_ttl_s,
+                                ),
+                            )
+                            _mask_alive *= client_prefix_alive_fraction
+                            _mask_gain = masking_gate_gain(
+                                _mask_candidates,
+                                compression_policy=compression_policy,
+                                suffix_tokens=prefix_tracker.cached_token_count(),
+                                expected_reads=_mask_reads,
+                                p_alive=_mask_alive,
+                                write_multiplier=write_multiplier_for_ttl(_mask_ttl),
+                            )
+                            _masking_admitted = _mask_gain > 0.0
+                        _mask_result = None
                         if skip_ccr_request_compression:
                             logger.info(
                                 f"[{request_id}] CCR: skipping request-side compression "
@@ -1641,12 +1693,44 @@ class AnthropicHandlerMixin:
                             )
                         if skip_ccr_request_compression:
                             optimized_messages = messages
+                            if _masking_admitted:
+                                from headroom.cache.compression_store import (
+                                    get_compression_store,
+                                )
+                                from headroom.transforms.observation_masking import (
+                                    apply_candidates,
+                                )
+
+                                _mask_result = apply_candidates(
+                                    messages,
+                                    _mask_candidates,
+                                    compression_store=get_compression_store(),
+                                )
+                                optimized_messages = _mask_result.messages
+                                if _mask_result.masked_count:
+                                    transforms_applied.append(
+                                        f"observation_masking:{_mask_result.masked_count}"
+                                    )
                             _, optimized_tokens = await self._count_tokens_offloaded(
                                 model, optimized_messages
                             )
                         else:
                             # Zone 1: Swap cached compressed versions into working copy
                             working_messages = comp_cache.apply_cached(messages)
+                            if _masking_admitted:
+                                from headroom.cache.compression_store import (
+                                    get_compression_store,
+                                )
+                                from headroom.transforms.observation_masking import (
+                                    apply_candidates,
+                                )
+
+                                _mask_result = apply_candidates(
+                                    working_messages,
+                                    _mask_candidates,
+                                    compression_store=get_compression_store(),
+                                )
+                                working_messages = _mask_result.messages
                             if (
                                 getattr(self, "_background_compression_enabled", False)
                                 and frozen_message_count == 0
@@ -1769,6 +1853,10 @@ class AnthropicHandlerMixin:
                             # Always use pipeline result — Zone 1 swaps are already applied
                             optimized_messages = result.messages
                             transforms_applied = result.transforms_applied
+                            if _mask_result is not None and _mask_result.masked_count:
+                                transforms_applied = list(transforms_applied) + [
+                                    f"observation_masking:{_mask_result.masked_count}"
+                                ]
                             pipeline_timing = result.timing
                             # Issue #327 / Bug 3: pipeline.apply uses the provider-
                             # side tokenizer (AnthropicProvider tiktoken estimator),
@@ -2011,7 +2099,11 @@ class AnthropicHandlerMixin:
             # worst forces one re-write on a surprise >5 min idle), never a wrong
             # response. Both flags off by default.
             _client_message_ttl = latest_message_cache_control_ttl(
-                original_client_messages
+                [
+                    message
+                    for message in original_client_messages
+                    if isinstance(message, dict)
+                ]
             )
             _force_ttl = None
             _hybrid_policy = prefix_tracker.hybrid_controller.config
@@ -3048,6 +3140,22 @@ class AnthropicHandlerMixin:
                 try:
                     _msgs = body.get("messages") or []
                     if len(_msgs) > 1:
+                        def _is_deep_hook_reminder(block: Any) -> bool:
+                            if not isinstance(block, dict) or block.get("type") != "text":
+                                return False
+                            text = block.get("text")
+                            if not isinstance(text, str) or not text.lstrip().startswith(
+                                "<system-reminder>"
+                            ):
+                                return False
+                            lines = text.lstrip().splitlines()
+                            if len(lines) <= 1:
+                                return False
+                            reminder_line = lines[1].strip()
+                            return reminder_line.startswith("hook additional context") or (
+                                reminder_line.endswith(" hook additional context")
+                            )
+
                         _last = len(_msgs) - 1
                         _out = []
                         _changed = False
@@ -3057,13 +3165,7 @@ class AnthropicHandlerMixin:
                                 _f = [
                                     _b
                                     for _b in _c
-                                    if not (
-                                        isinstance(_b, dict)
-                                        and _b.get("type") == "text"
-                                        and isinstance(_b.get("text"), str)
-                                        and _b["text"].lstrip().startswith("<system-reminder>")
-                                        and "hook additional context" in _b["text"]
-                                    )
+                                    if not _is_deep_hook_reminder(_b)
                                 ]
                                 if len(_f) != len(_c) and _f:
                                     _out.append({**_m, "content": _f})
@@ -3121,13 +3223,14 @@ class AnthropicHandlerMixin:
                     _existing = _count_cc([body.get("system"), body.get("tools"), _msgs])
                     _budget = 4 - _existing
                     if len(_msgs) >= 80 and _budget > 0:
-                        # HR_DP_ANCHORS (2026-07-17, local fork): spend the whole
+                        # DP anchors (2026-07-17, local fork): spend the whole
                         # remaining breakpoint budget at DP-optimal depths from
                         # this session's observed churn-depth profile, instead of
-                        # the single fixed mid-depth anchor. Opt-in while it
-                        # canaries. Same quantization, so anchors stay
-                        # byte-stable between growth jumps either way.
-                        if os.environ.get("HR_DP_ANCHORS") == "1":
+                        # the single fixed mid-depth anchor. Hybrid policy,
+                        # default on, HR_DP_ANCHORS=0 overrides. Same
+                        # quantization, so anchors stay byte-stable between
+                        # growth jumps either way.
+                        if prefix_tracker.hybrid_controller.config.dp_anchors:
                             from headroom.cache.anchor_dp import optimal_anchor_depths
 
                             _targets = optimal_anchor_depths(
