@@ -1225,6 +1225,10 @@ class AnthropicHandlerMixin:
             # 0 for back-to-back agent turns (cache still warm → no decay).
             idle_seconds = getattr(prefix_tracker, "_idle_seconds_at_fetch", 0.0)
             _hybrid_should_rebase = False
+            # Temporal-death default: overwritten with the hazard estimate in
+            # the hybrid branch below. 1.0 (alive) keeps non-hybrid modes on
+            # their structural-churn-only masking admission.
+            _hybrid_alive = 1.0
             if preserves_warm_prefix(self.config.mode):
                 frozen_message_count = self._strict_previous_turn_frozen_count(
                     original_client_messages,
@@ -1530,9 +1534,16 @@ class AnthropicHandlerMixin:
                                     _masking_config, "mask_min_tokens", 150
                                 ),
                             )
+                            # Admission covers all three free/cheap moments:
+                            # structural death (client rewrote the prefix),
+                            # an already-decided rebase, and temporal death
+                            # (idle blew past the TTL, hazard survival ~0,
+                            # e.g. the 151-minute lapse on 2026-07-17 that
+                            # rewrote a 262k prefix unmasked).
                             _masking_admitted = bool(_mask_candidates) and (
                                 client_prefix_alive_fraction == 0.0
                                 or _hybrid_should_rebase
+                                or _hybrid_alive <= 0.05
                             )
                         # HR_SUBAGENT_FREEZE (2026-07-12, local fork): a controlled
                         # token-vs-cache A/B on the same prompt proved token-mode
