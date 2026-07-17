@@ -2760,6 +2760,31 @@ _TOOL_SEARCH_CORE_PREFIXES = ("mcp__tokensave__", "mcp__serena__")
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def referenced_tool_names(messages: Any) -> frozenset[str]:
+    """Lowercased names of tools referenced by tool_use blocks in messages.
+
+    A tool whose schema is deferred but whose name appears in a historical
+    tool_use block makes Anthropic reject the request ("Tool reference 'X'
+    not found in available tools"), which broke Claude Code compaction
+    requests on 2026-07-17. Referenced tools must stay resident.
+    """
+    names: set[str] = set()
+    if not isinstance(messages, list):
+        return frozenset()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                name = block.get("name")
+                if isinstance(name, str) and name:
+                    names.add(name.lower())
+    return frozenset(names)
+
+
 def inject_tool_search_deferral(
     tools: Any,
     *,
@@ -2767,6 +2792,7 @@ def inject_tool_search_deferral(
     core_prefixes: tuple[str, ...] = _TOOL_SEARCH_CORE_PREFIXES,
     search_type: str = _TOOL_SEARCH_DEFAULT_TYPE,
     search_name: str = _TOOL_SEARCH_DEFAULT_NAME,
+    referenced: frozenset[str] = frozenset(),
 ) -> Any:
     """Return a new ``tools`` list with non-core tools deferred + a search tool
     injected, or the original list unchanged when injection doesn't apply.
@@ -2802,6 +2828,7 @@ def inject_tool_search_deferral(
             not isinstance(tool, dict)
             or tool.get("type")
             or tool_name in core_tools
+            or tool_name in referenced
             or any(tool_name.startswith(prefix) for prefix in core_prefixes)
         ):
             # Non-dict, server/typed tools (web_search, computer, …), and core

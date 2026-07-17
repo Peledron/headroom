@@ -1482,6 +1482,127 @@ class AnthropicHandlerMixin:
                             and CCR_TOOL_NAME not in existing_tool_names
                         )
 
+                    # Observation masking is a request-level hybrid policy, not a
+                    # token-mode pipeline transform.  Evaluate and apply it before
+                    # the token / non-cache / cache-delta split so every forwarded
+                    # request sees the same discovery and admission decision.
+                    _hoisted_mask_result = None
+                    _mask_candidates = []
+                    _masking_admitted = False
+                    _masking_config = prefix_tracker.hybrid_controller.config
+                    if getattr(_masking_config, "observation_masking", True):
+                        from headroom.transforms.observation_masking import (
+                            apply_candidates,
+                            discover_candidates,
+                            masking_gate_gain,
+                        )
+
+                        _mask_candidates = discover_candidates(
+                            messages,
+                            count_tokens=tokenizer.count_text,
+                            mask_after_turns=getattr(
+                                _masking_config, "mask_after_turns", 2
+                            ),
+                            mask_min_tokens=getattr(
+                                _masking_config, "mask_min_tokens", 150
+                            ),
+                        )
+                        if not _mask_candidates:
+                            _tr_shapes: dict[str, int] = {}
+                            for _m in messages:
+                                _c = _m.get("content") if isinstance(_m, dict) else None
+                                if not isinstance(_c, list):
+                                    continue
+                                for _b in _c:
+                                    if (
+                                        isinstance(_b, dict)
+                                        and _b.get("type") == "tool_result"
+                                    ):
+                                        _inner = _b.get("content")
+                                        if isinstance(_inner, list):
+                                            _k = (
+                                                "list["
+                                                + ",".join(
+                                                    sorted(
+                                                        {
+                                                            _x.get("type", "?")
+                                                            if isinstance(_x, dict)
+                                                            else type(_x).__name__
+                                                            for _x in _inner
+                                                        }
+                                                    )
+                                                )
+                                                + f"]x{len(_inner)}"
+                                            )
+                                        else:
+                                            _k = type(_inner).__name__
+                                        _tr_shapes[_k] = _tr_shapes.get(_k, 0) + 1
+                            if sum(_tr_shapes.values()) > 10:
+                                logger.info(
+                                    f"[{request_id}] MASKING_DISCOVERY: 0 candidates "
+                                    f"across {sum(_tr_shapes.values())} tool_results, "
+                                    f"shapes={_tr_shapes}"
+                                )
+
+                        _masking_admitted = bool(_mask_candidates) and (
+                            client_prefix_alive_fraction == 0.0
+                            or _hybrid_should_rebase
+                            or _hybrid_alive <= 0.05
+                        )
+                        if _mask_candidates and not _masking_admitted and context_limit:
+                            from headroom.transforms.compression_policy import (
+                                write_multiplier_for_ttl,
+                            )
+
+                            _mask_ttl = prefix_tracker.recommended_ttl() or "5m"
+                            _mask_ttl_s = 3600.0 if _mask_ttl == "1h" else 300.0
+                            _mask_reads = prefix_tracker.expected_reads_within_ttl(
+                                _mask_ttl_s, fallback=10.0
+                            )
+                            _mask_alive = prefix_tracker.survival_p_alive(
+                                _mask_ttl_s,
+                                max(
+                                    0.0,
+                                    1.0
+                                    - (netcost_idle_seconds or 0.0) / _mask_ttl_s,
+                                ),
+                            )
+                            _mask_alive *= client_prefix_alive_fraction
+                            _mask_gain = masking_gate_gain(
+                                _mask_candidates,
+                                compression_policy=compression_policy,
+                                suffix_tokens=prefix_tracker.cached_token_count(),
+                                expected_reads=_mask_reads,
+                                p_alive=_mask_alive,
+                                write_multiplier=write_multiplier_for_ttl(_mask_ttl),
+                            )
+                            _masking_admitted = _mask_gain > 0.0
+                            if not _masking_admitted:
+                                _mask_dt = sum(
+                                    candidate.tokens_saved
+                                    for candidate in _mask_candidates
+                                )
+                                logger.info(
+                                    f"[{request_id}] MASKING_GATE: declined "
+                                    f"(gain={_mask_gain:.0f} dT={_mask_dt} "
+                                    f"n={len(_mask_candidates)} R={_mask_reads:.1f} "
+                                    f"p_alive={_mask_alive:.3f} ttl={_mask_ttl})"
+                                )
+
+                        if _masking_admitted:
+                            from headroom.cache.compression_store import (
+                                get_compression_store,
+                            )
+
+                            _hoisted_mask_result = apply_candidates(
+                                messages,
+                                _mask_candidates,
+                                compression_store=get_compression_store(),
+                            )
+                            messages = _hoisted_mask_result.messages
+                            optimized_messages = messages
+                            optimized_tokens = tokenizer.count_messages(messages)
+
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
 
@@ -1991,6 +2112,14 @@ class AnthropicHandlerMixin:
                             previous_original_messages,
                             previous_forwarded_messages,
                         )
+                        if (
+                            _hoisted_mask_result is not None
+                            and _hoisted_mask_result.masked_count
+                        ):
+                            # An admitted historical mutation intentionally rebases
+                            # the prefix, so replaying the previous forwarded prefix
+                            # would silently restore the unmasked bytes.
+                            delta = None
                         if delta is not None:
                             stable_forwarded_prefix, delta_messages = delta
                             if delta_messages:
@@ -2073,6 +2202,17 @@ class AnthropicHandlerMixin:
                             # prove it is perfectly replayable across future turns.
                             optimized_messages = messages
                             optimized_tokens = original_tokens
+
+                    if (
+                        _hoisted_mask_result is not None
+                        and _hoisted_mask_result.masked_count
+                    ):
+                        _mask_tag = (
+                            f"observation_masking:"
+                            f"{_hoisted_mask_result.masked_count}"
+                        )
+                        if _mask_tag not in transforms_applied:
+                            transforms_applied = list(transforms_applied) + [_mask_tag]
 
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
@@ -2867,10 +3007,20 @@ class AnthropicHandlerMixin:
                 and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
             ):
-                from headroom.proxy.helpers import inject_tool_search_deferral
+                from headroom.proxy.helpers import (
+                    inject_tool_search_deferral,
+                    referenced_tool_names,
+                )
 
                 _ts_before = body.get("tools")
-                _ts_after = inject_tool_search_deferral(_ts_before)
+                # Tools referenced by historical tool_use blocks must stay
+                # resident: deferring one made Anthropic 400 the request
+                # ("Tool reference 'TaskCreate' not found"), which broke
+                # Claude Code compaction on 2026-07-17.
+                _ts_after = inject_tool_search_deferral(
+                    _ts_before,
+                    referenced=referenced_tool_names(body.get("messages")),
+                )
                 if _ts_after is not _ts_before:
                     _ts_deferred = [
                         t for t in _ts_after if isinstance(t, dict) and t.get("defer_loading")
