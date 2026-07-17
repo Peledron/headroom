@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 MASK_PREFIX = "[Tool result masked:"
 INPUT_MASK_PREFIX = "[Tool input masked:"
 _RECOVERY_MARKER = "Retrieve original: hash="
-_EXCERPT_CHARS = 80
+_EXCERPT_CHARS = 120
 
 # tool_use input keys that carry bulk content worth masking. Deliberately a
 # short allowlist: these are file bodies and edit payloads that are
@@ -39,6 +39,10 @@ class MaskCandidate:
     input_key: str | None = None
     """None targets tool_result content; a key name targets that field of a
     tool_use block's input dict instead."""
+    text_block: bool = False
+    """True when the tool_result content is the Claude Code block-list form
+    [{"type": "text", "text": ...}] rather than a plain string. The marker
+    replaces the inner text, preserving sibling keys like cache_control."""
 
     @property
     def tokens_saved(self) -> int:
@@ -136,6 +140,7 @@ def discover_candidates(
         source_turn: int,
         original: str,
         input_key: str | None,
+        text_block: bool = False,
     ) -> MaskCandidate | None:
         if _already_compact(original):
             return None
@@ -155,15 +160,15 @@ def discover_candidates(
         if input_key is None:
             marker = (
                 f"[Tool result masked: tool={tool_name}, tokens={original_tokens}, "
-                f"bytes={original_bytes}, head={_excerpt(original)}. "
-                f"Retrieve original: hash={content_hash}]"
+                f"bytes={original_bytes}, head={_excerpt(original)}. Not deleted, recover "
+                f"the full text by requesting: Retrieve original: hash={content_hash}]"
             )
         else:
             marker = (
                 f"[Tool input masked: tool={tool_name}, key={input_key}, "
                 f"tokens={original_tokens}, bytes={original_bytes}, "
-                f"head={_excerpt(original)}. "
-                f"Retrieve original: hash={content_hash}]"
+                f"head={_excerpt(original)}. Not deleted, recover the full text by "
+                f"requesting: Retrieve original: hash={content_hash}]"
             )
         marker_tokens = max(0, int(count_tokens(marker)))
         if marker_tokens >= original_tokens:
@@ -180,6 +185,7 @@ def discover_candidates(
             marker_tokens=marker_tokens,
             original_bytes=original_bytes,
             input_key=input_key,
+            text_block=text_block,
         )
 
     for message_index, message in enumerate(messages):
@@ -193,6 +199,21 @@ def discover_candidates(
             block_type = block.get("type")
             if block_type == "tool_result":
                 original = block.get("content")
+                text_block = False
+                if isinstance(original, list):
+                    # Claude Code sends tool_result content as a block list,
+                    # almost always a single text block. Mask that inner text;
+                    # multi-block or non-text lists stay untouched.
+                    if (
+                        len(original) == 1
+                        and isinstance(original[0], dict)
+                        and original[0].get("type") == "text"
+                        and isinstance(original[0].get("text"), str)
+                    ):
+                        original = original[0]["text"]
+                        text_block = True
+                    else:
+                        continue
                 if not isinstance(original, str):
                     continue
                 tool_use_id = block.get("tool_use_id")
@@ -209,6 +230,7 @@ def discover_candidates(
                     source_turn,
                     original,
                     None,
+                    text_block,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -284,14 +306,35 @@ def apply_candidates(
             if not isinstance(block, dict):
                 continue
             candidate = replacements.get((message_index, block_index, None))
-            if candidate is not None and block.get("content") == candidate.original:
-                block = {**block, "content": candidate.marker}
-                new_content[block_index] = block
-                tokens_saved += candidate.tokens_saved
-                bytes_saved += candidate.original_bytes - len(
-                    candidate.marker.encode("utf-8")
-                )
-                changed = True
+            if candidate is not None:
+                block_content = block.get("content")
+                if candidate.text_block:
+                    if (
+                        isinstance(block_content, list)
+                        and len(block_content) == 1
+                        and isinstance(block_content[0], dict)
+                        and block_content[0].get("text") == candidate.original
+                    ):
+                        block = {
+                            **block,
+                            "content": [
+                                {**block_content[0], "text": candidate.marker}
+                            ],
+                        }
+                        new_content[block_index] = block
+                        tokens_saved += candidate.tokens_saved
+                        bytes_saved += candidate.original_bytes - len(
+                            candidate.marker.encode("utf-8")
+                        )
+                        changed = True
+                elif block_content == candidate.original:
+                    block = {**block, "content": candidate.marker}
+                    new_content[block_index] = block
+                    tokens_saved += candidate.tokens_saved
+                    bytes_saved += candidate.original_bytes - len(
+                        candidate.marker.encode("utf-8")
+                    )
+                    changed = True
             for input_key in _MASKABLE_INPUT_KEYS:
                 candidate = replacements.get((message_index, block_index, input_key))
                 if candidate is None:

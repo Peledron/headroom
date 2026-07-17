@@ -82,9 +82,36 @@ def test_breaker_recovery_uses_marker_hash_and_is_idempotent() -> None:
     assert len(store.calls) == 1
 
 
-@pytest.mark.parametrize("content", [[{"type": "text", "text": "x " * 30}], ""])
-def test_breaker_non_string_and_empty_remain_untouched(content: object) -> None:
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        [{"type": "text", "text": "x " * 30}, {"type": "text", "text": "y " * 30}],
+        [{"type": "image", "source": {}}],
+    ],
+)
+def test_breaker_empty_multiblock_and_nontext_remain_untouched(content: object) -> None:
     messages = _messages(content)
     original = deepcopy(messages)
     assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10) == []
     assert messages == original
+
+
+def test_breaker_single_text_block_masks_and_preserves_cache_control() -> None:
+    # Claude Code's real tool_result shape: a one-element text-block list,
+    # sometimes carrying cache_control, which the marker block must keep.
+    payload = "x " * 30
+    content = [{"type": "text", "text": payload, "cache_control": {"type": "ephemeral"}}]
+    messages = _messages(content)
+    candidates = discover_candidates(messages, count_tokens=_marker_count, mask_min_tokens=10)
+    assert len(candidates) == 1
+    assert candidates[0].text_block is True
+    store = _Store()
+    result = apply_candidates(messages, candidates, compression_store=store)
+    masked = result.messages[1]["content"][0]["content"]
+    assert masked[0]["text"].startswith("[Tool result masked:")
+    assert masked[0]["cache_control"] == {"type": "ephemeral"}
+    assert store.calls[0]["original"] == payload
+    # source untouched, second pass idempotent
+    assert messages[1]["content"][0]["content"][0]["text"] == payload
+    assert discover_candidates(result.messages, count_tokens=_marker_count, mask_min_tokens=10) == []
