@@ -2201,7 +2201,17 @@ class AnthropicHandlerMixin:
                             # In-message append rewriting is deferred until we can
                             # prove it is perfectly replayable across future turns.
                             optimized_messages = messages
-                            optimized_tokens = original_tokens
+                            # messages may carry hoisted masking mutations, so
+                            # original_tokens would overstate what is forwarded
+                            # and hide masking savings from PERF accounting.
+                            optimized_tokens = (
+                                original_tokens
+                                - (
+                                    _hoisted_mask_result.tokens_saved
+                                    if _hoisted_mask_result is not None
+                                    else 0
+                                )
+                            )
 
                     if (
                         _hoisted_mask_result is not None
