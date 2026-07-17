@@ -160,7 +160,14 @@ class _FakePrefixTracker:
     @property
     def hybrid_controller(self):  # noqa: ANN201
         return SimpleNamespace(
-            config=SimpleNamespace(adaptive_ttl=False, subagent_ttl_5m=False)
+            config=SimpleNamespace(
+                adaptive_ttl=False,
+                subagent_ttl_5m=False,
+                # These tests lock byte-stability of the un-admitted path, so
+                # gated masking (which may legitimately mutate a churn-dead
+                # frozen prefix) is pinned off.
+                observation_masking=False,
+            )
         )
 
     def get_last_original_messages(self):  # noqa: ANN201
@@ -1623,10 +1630,14 @@ def test_issue_327_repeated_content_new_position_is_not_frozen() -> None:
     assert captured["frozen_message_count"] == 8
 
 
-def test_issue_327_pipeline_preserves_frozen_prefix_byte_for_byte() -> None:
+def test_issue_327_pipeline_preserves_frozen_prefix_byte_for_byte(monkeypatch) -> None:
     """Invariant: messages[:frozen_message_count] passed to the pipeline are
     byte-identical to the messages received from the client (modulo the
-    `apply_cached` swap, which is byte-stable). Lock the cache-floor."""
+    `apply_cached` swap, which is byte-stable). Lock the cache-floor.
+
+    Observation masking is pinned off via the fake tracker's config: a fresh
+    tracker reports the prefix as churn-dead, which legitimately admits gated
+    masking of the frozen range. This test locks the UN-admitted path only."""
     captured: dict = {}
     with _make_optimize_proxy_client(mode="token") as client:
         fake_cache = _IssueFakeCompCache(frozen_via_compute=10)

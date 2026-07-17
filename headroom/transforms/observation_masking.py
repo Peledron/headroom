@@ -11,8 +11,15 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 MASK_PREFIX = "[Tool result masked:"
+INPUT_MASK_PREFIX = "[Tool input masked:"
 _RECOVERY_MARKER = "Retrieve original: hash="
 _EXCERPT_CHARS = 80
+
+# tool_use input keys that carry bulk content worth masking. Deliberately a
+# short allowlist: these are file bodies and edit payloads that are
+# recoverable from the CCR store (and usually from disk), never control
+# arguments the model reasons about later.
+_MASKABLE_INPUT_KEYS = ("content", "file_text", "new_string", "old_string")
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +36,9 @@ class MaskCandidate:
     original_tokens: int
     marker_tokens: int
     original_bytes: int
+    input_key: str | None = None
+    """None targets tool_result content; a key name targets that field of a
+    tool_use block's input dict instead."""
 
     @property
     def tokens_saved(self) -> int:
@@ -69,6 +79,7 @@ def _already_compact(content: str) -> bool:
     stripped = content.lstrip()
     return (
         stripped.startswith(MASK_PREFIX)
+        or stripped.startswith(INPUT_MASK_PREFIX)
         or _RECOVERY_MARKER in content
         or stripped.startswith("[Read content stale:")
         or stripped.startswith("[Read content superseded:")
@@ -116,55 +127,114 @@ def discover_candidates(
     """Prepare eligible markers without mutating messages or writing CCR."""
     metadata, assistant_turns = _tool_metadata(messages)
     candidates: list[MaskCandidate] = []
-    for message_index, message in enumerate(messages):
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block_index, block in enumerate(content):
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            original = block.get("content")
-            if not isinstance(original, str) or _already_compact(original):
-                continue
-            tool_use_id = block.get("tool_use_id")
-            if not isinstance(tool_use_id, str):
-                tool_use_id = ""
-            tool_name, source_turn = metadata.get(tool_use_id, ("unknown", assistant_turns))
-            if assistant_turns - source_turn - 1 < max(0, mask_after_turns):
-                continue
-            original_tokens = max(0, int(count_tokens(original)))
-            if original_tokens < max(0, mask_min_tokens):
-                continue
-            try:
-                encoded = original.encode("utf-8")
-            except UnicodeEncodeError:
-                # Unpaired surrogates cannot round-trip through the CCR
-                # store, so the block is left untouched.
-                continue
-            original_bytes = len(encoded)
-            content_hash = hashlib.sha256(encoded).hexdigest()[:24]
+
+    def prepare(
+        message_index: int,
+        block_index: int,
+        tool_use_id: str,
+        tool_name: str,
+        source_turn: int,
+        original: str,
+        input_key: str | None,
+    ) -> MaskCandidate | None:
+        if _already_compact(original):
+            return None
+        if assistant_turns - source_turn - 1 < max(0, mask_after_turns):
+            return None
+        original_tokens = max(0, int(count_tokens(original)))
+        if original_tokens < max(0, mask_min_tokens):
+            return None
+        try:
+            encoded = original.encode("utf-8")
+        except UnicodeEncodeError:
+            # Unpaired surrogates cannot round-trip through the CCR
+            # store, so the block is left untouched.
+            return None
+        original_bytes = len(encoded)
+        content_hash = hashlib.sha256(encoded).hexdigest()[:24]
+        if input_key is None:
             marker = (
                 f"[Tool result masked: tool={tool_name}, tokens={original_tokens}, "
                 f"bytes={original_bytes}, head={_excerpt(original)}. "
                 f"Retrieve original: hash={content_hash}]"
             )
-            marker_tokens = max(0, int(count_tokens(marker)))
-            if marker_tokens >= original_tokens:
-                continue
-            candidates.append(
-                MaskCandidate(
-                    message_index=message_index,
-                    block_index=block_index,
-                    tool_use_id=tool_use_id,
-                    tool_name=tool_name,
-                    original=original,
-                    marker=marker,
-                    content_hash=content_hash,
-                    original_tokens=original_tokens,
-                    marker_tokens=marker_tokens,
-                    original_bytes=original_bytes,
-                )
+        else:
+            marker = (
+                f"[Tool input masked: tool={tool_name}, key={input_key}, "
+                f"tokens={original_tokens}, bytes={original_bytes}, "
+                f"head={_excerpt(original)}. "
+                f"Retrieve original: hash={content_hash}]"
             )
+        marker_tokens = max(0, int(count_tokens(marker)))
+        if marker_tokens >= original_tokens:
+            return None
+        return MaskCandidate(
+            message_index=message_index,
+            block_index=block_index,
+            tool_use_id=tool_use_id,
+            tool_name=tool_name,
+            original=original,
+            marker=marker,
+            content_hash=content_hash,
+            original_tokens=original_tokens,
+            marker_tokens=marker_tokens,
+            original_bytes=original_bytes,
+            input_key=input_key,
+        )
+
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        is_assistant = message.get("role") == "assistant"
+        for block_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "tool_result":
+                original = block.get("content")
+                if not isinstance(original, str):
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str):
+                    tool_use_id = ""
+                tool_name, source_turn = metadata.get(
+                    tool_use_id, ("unknown", assistant_turns)
+                )
+                candidate = prepare(
+                    message_index,
+                    block_index,
+                    tool_use_id,
+                    tool_name,
+                    source_turn,
+                    original,
+                    None,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+            elif block_type == "tool_use" and is_assistant:
+                tool_use_id = block.get("id")
+                if not isinstance(tool_use_id, str) or tool_use_id not in metadata:
+                    continue
+                block_input = block.get("input")
+                if not isinstance(block_input, dict):
+                    continue
+                tool_name, source_turn = metadata[tool_use_id]
+                for input_key in _MASKABLE_INPUT_KEYS:
+                    original = block_input.get(input_key)
+                    if not isinstance(original, str):
+                        continue
+                    candidate = prepare(
+                        message_index,
+                        block_index,
+                        tool_use_id,
+                        tool_name,
+                        source_turn,
+                        original,
+                        input_key,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
     return candidates
 
 
@@ -177,7 +247,7 @@ def apply_candidates(
     """Persist and apply an admitted batch, retaining originals on store failure."""
     if not candidates:
         return MaskResult(messages=messages)
-    replacements: dict[tuple[int, int], MaskCandidate] = {}
+    replacements: dict[tuple[int, int, str | None], MaskCandidate] = {}
     for candidate in candidates:
         try:
             stored_hash = compression_store.store(
@@ -194,7 +264,9 @@ def apply_candidates(
         if stored_hash != candidate.content_hash:
             logger.warning("observation_masking: CCR store returned an unexpected hash")
             continue
-        replacements[(candidate.message_index, candidate.block_index)] = candidate
+        replacements[
+            (candidate.message_index, candidate.block_index, candidate.input_key)
+        ] = candidate
     if not replacements:
         return MaskResult(messages=messages)
 
@@ -209,15 +281,37 @@ def apply_candidates(
         new_content = list(content)
         changed = False
         for block_index, block in enumerate(content):
-            candidate = replacements.get((message_index, block_index))
-            if candidate is None or not isinstance(block, dict):
+            if not isinstance(block, dict):
                 continue
-            if block.get("content") != candidate.original:
-                continue
-            new_content[block_index] = {**block, "content": candidate.marker}
-            tokens_saved += candidate.tokens_saved
-            bytes_saved += candidate.original_bytes - len(candidate.marker.encode("utf-8"))
-            changed = True
+            candidate = replacements.get((message_index, block_index, None))
+            if candidate is not None and block.get("content") == candidate.original:
+                block = {**block, "content": candidate.marker}
+                new_content[block_index] = block
+                tokens_saved += candidate.tokens_saved
+                bytes_saved += candidate.original_bytes - len(
+                    candidate.marker.encode("utf-8")
+                )
+                changed = True
+            for input_key in _MASKABLE_INPUT_KEYS:
+                candidate = replacements.get((message_index, block_index, input_key))
+                if candidate is None:
+                    continue
+                block_input = block.get("input")
+                if (
+                    not isinstance(block_input, dict)
+                    or block_input.get(input_key) != candidate.original
+                ):
+                    continue
+                block = {
+                    **block,
+                    "input": {**block_input, input_key: candidate.marker},
+                }
+                new_content[block_index] = block
+                tokens_saved += candidate.tokens_saved
+                bytes_saved += candidate.original_bytes - len(
+                    candidate.marker.encode("utf-8")
+                )
+                changed = True
         output.append({**message, "content": new_content} if changed else message)
     return MaskResult(
         messages=output,

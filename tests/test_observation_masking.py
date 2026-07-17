@@ -12,9 +12,39 @@ from headroom.transforms.observation_masking import (
 
 
 def _count(text: str) -> int:
-    if text.startswith("[Tool result masked:"):
+    if text.startswith("[Tool result masked:") or text.startswith("[Tool input masked:"):
         return 1
     return len(text.split())
+
+
+def _write_messages(payload: str, later_turns: int = 3) -> list[dict]:
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "write-1",
+                    "name": "Write",
+                    "input": {"file_path": "/tmp/x.py", "content": payload},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "write-1", "content": "ok"}
+            ],
+        },
+    ]
+    for turn in range(later_turns):
+        messages.extend(
+            [
+                {"role": "assistant", "content": f"turn {turn}"},
+                {"role": "user", "content": "continue"},
+            ]
+        )
+    return messages
 
 
 def _messages(payload: str, later_turns: int = 3) -> list[dict]:
@@ -117,6 +147,69 @@ def test_non_string_and_store_failure_leave_messages_unchanged():
     assert result.messages == original
     assert result.messages is messages
     assert result.masked_count == 0
+
+
+@pytest.mark.parametrize("later_turns, expected", [(2, 0), (3, 1)])
+def test_tool_use_input_age_threshold(later_turns: int, expected: int):
+    candidates = discover_candidates(
+        _write_messages("word " * 20, later_turns),
+        count_tokens=_count,
+        mask_min_tokens=10,
+    )
+    assert len(candidates) == expected
+    if expected:
+        assert candidates[0].input_key == "content"
+
+
+def test_tool_use_input_masks_and_recovers():
+    payload = "word " * 30
+    messages = _write_messages(payload)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    assert [c.input_key for c in candidates] == ["content"]
+    marker = candidates[0].marker
+    assert marker.startswith("[Tool input masked: tool=Write, key=content")
+
+    store = _Store()
+    result = apply_candidates(messages, candidates, compression_store=store)
+    assert result.masked_count == 1
+    assert store.calls[0]["original"] == payload
+    masked_input = result.messages[0]["content"][0]["input"]
+    assert masked_input["content"] == marker
+    assert masked_input["file_path"] == "/tmp/x.py"
+    # source list untouched (copy on write)
+    assert messages[0]["content"][0]["input"]["content"] == payload
+
+    second = discover_candidates(result.messages, count_tokens=_count, mask_min_tokens=10)
+    assert second == []
+
+
+def test_tool_use_non_allowlisted_and_non_dict_input_untouched():
+    messages = _write_messages("word " * 30)
+    messages[0]["content"][0]["input"] = {"command": "word " * 30}
+    assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10) == []
+    messages[0]["content"][0]["input"] = "word " * 30
+    assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10) == []
+
+
+def test_tool_use_multiple_keys_same_block():
+    messages = _write_messages("word " * 30)
+    messages[0]["content"][0]["name"] = "Edit"
+    messages[0]["content"][0]["input"] = {
+        "file_path": "/tmp/x.py",
+        "old_string": "old " * 30,
+        "new_string": "new " * 40,
+    }
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    assert sorted(c.input_key for c in candidates if c.input_key) == [
+        "new_string",
+        "old_string",
+    ]
+    result = apply_candidates(messages, candidates, compression_store=_Store())
+    assert result.masked_count == 2
+    masked_input = result.messages[0]["content"][0]["input"]
+    assert masked_input["old_string"].startswith("[Tool input masked:")
+    assert masked_input["new_string"].startswith("[Tool input masked:")
+    assert masked_input["file_path"] == "/tmp/x.py"
 
 
 class _Policy:
