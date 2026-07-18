@@ -1346,6 +1346,46 @@ class AnthropicHandlerMixin:
                 # Sticky value can only equal "" when both client and
                 # session are empty; preserve the (absent) client state.
                 pass
+            # A tool-search beta (sticky-replayed OR client-sent) on a
+            # request whose tools array is missing tools referenced by
+            # message history guarantees an upstream 400 ("Tool reference
+            # 'X' not found"): under that beta Anthropic strictly
+            # validates historical tool_use names. Claude Code compaction
+            # requests send a minimal tools array and hit exactly this.
+            # Dropping the beta for the single request is strictly better
+            # than the rejection.
+            _final_beta = headers.get("anthropic-beta")
+            if _final_beta and any(
+                m in _final_beta for m in ("advanced-tool-use", "tool-search-tool")
+            ):
+                from headroom.proxy.helpers import referenced_tool_names
+
+                _available_tool_names = {
+                    str(t.get("name", "")).lower()
+                    for t in (body.get("tools") or [])
+                    if isinstance(t, dict)
+                }
+                _missing_refs = (
+                    referenced_tool_names(body.get("messages"))
+                    - _available_tool_names
+                )
+                if _missing_refs:
+                    _kept_betas = [
+                        t
+                        for t in _final_beta.split(",")
+                        if t.strip()
+                        and "advanced-tool-use" not in t
+                        and "tool-search-tool" not in t
+                    ]
+                    logger.info(
+                        f"[{request_id}] STICKY_BETA_GUARD: dropped tool-search "
+                        f"beta (history references {sorted(_missing_refs)[:5]} "
+                        f"absent from the tools array)"
+                    )
+                    if _kept_betas:
+                        headers["anthropic-beta"] = ",".join(_kept_betas)
+                    else:
+                        headers.pop("anthropic-beta", None)
             # HR_FORCE_BETA (2026-07-11, local fork): re-append beta tokens the
             # client is entitled to but silently dropped. Observed: after a 429
             # Claude Code removes context-1m-2025-08-07 for the rest of the
@@ -1492,13 +1532,10 @@ class AnthropicHandlerMixin:
                     _masking_config = prefix_tracker.hybrid_controller.config
                     if getattr(_masking_config, "observation_masking", True):
                         from headroom.transforms.observation_masking import (
+                            _MASKABLE_INPUT_KEYS,
                             apply_candidates,
                             discover_candidates,
                             masking_gate_gain,
-                        )
-
-                        from headroom.transforms.observation_masking import (
-                            _MASKABLE_INPUT_KEYS,
                         )
 
                         _mask_candidates = discover_candidates(
@@ -1553,11 +1590,12 @@ class AnthropicHandlerMixin:
                                     f"shapes={_tr_shapes}"
                                 )
 
-                        _masking_admitted = bool(_mask_candidates) and (
+                        _masking_structural_admission = bool(_mask_candidates) and (
                             client_prefix_alive_fraction == 0.0
                             or _hybrid_should_rebase
                             or _hybrid_alive <= 0.05
                         )
+                        _masking_admitted = _masking_structural_admission
                         if _mask_candidates and not _masking_admitted and context_limit:
                             from headroom.transforms.compression_policy import (
                                 write_multiplier_for_ttl,
@@ -1598,6 +1636,26 @@ class AnthropicHandlerMixin:
                                     f"p_alive={_mask_alive:.3f} ttl={_mask_ttl})"
                                 )
 
+                        if _masking_structural_admission:
+                            _bust_candidates = discover_candidates(
+                                messages,
+                                count_tokens=tokenizer.count_text,
+                                mask_after_turns=getattr(
+                                    _masking_config, "mask_after_turns", 2
+                                ),
+                                mask_min_tokens=getattr(
+                                    _masking_config, "mask_min_tokens_at_bust", 60
+                                ),
+                                mask_input_keys=(
+                                    _MASKABLE_INPUT_KEYS
+                                    if getattr(
+                                        _masking_config, "mask_tool_inputs", False
+                                    )
+                                    else ()
+                                ),
+                            )
+                            _mask_candidates = _bust_candidates
+
                         if _masking_admitted:
                             from headroom.cache.compression_store import (
                                 get_compression_store,
@@ -1609,6 +1667,47 @@ class AnthropicHandlerMixin:
                                 compression_store=get_compression_store(),
                             )
                             messages = _hoisted_mask_result.messages
+                            if getattr(_masking_config, "history_sweep", True):
+                                from headroom.transforms.compression_units import (
+                                    find_content_router,
+                                )
+                                from headroom.transforms.observation_masking import (
+                                    MaskResult,
+                                    sweep_history,
+                                )
+
+                                _history_router = find_content_router(
+                                    self.anthropic_pipeline
+                                )
+                                if _history_router is not None:
+                                    _sweep_result = sweep_history(
+                                        messages,
+                                        router=_history_router,
+                                        tokenizer=tokenizer,
+                                        compression_store=get_compression_store(),
+                                        sweep_assistant_text=getattr(
+                                            _masking_config,
+                                            "sweep_assistant_text",
+                                            False,
+                                        ),
+                                    )
+                                    if _sweep_result.swept_count:
+                                        messages = _sweep_result.messages
+                                        _hoisted_mask_result = MaskResult(
+                                            messages=messages,
+                                            masked_count=(
+                                                _hoisted_mask_result.masked_count
+                                            ),
+                                            tokens_saved=(
+                                                _hoisted_mask_result.tokens_saved
+                                                + _sweep_result.tokens_saved
+                                            ),
+                                            bytes_saved=(
+                                                _hoisted_mask_result.bytes_saved
+                                                + _sweep_result.bytes_saved
+                                            ),
+                                            swept_count=_sweep_result.swept_count,
+                                        )
                             optimized_messages = messages
                             optimized_tokens = tokenizer.count_messages(messages)
 
@@ -2232,6 +2331,17 @@ class AnthropicHandlerMixin:
                         )
                         if _mask_tag not in transforms_applied:
                             transforms_applied = list(transforms_applied) + [_mask_tag]
+                        if (
+                            _hoisted_mask_result is not None
+                            and _hoisted_mask_result.swept_count
+                        ):
+                            _sweep_tag = (
+                                f"history_sweep:{_hoisted_mask_result.swept_count}"
+                            )
+                            if _sweep_tag not in transforms_applied:
+                                transforms_applied = list(transforms_applied) + [
+                                    _sweep_tag
+                                ]
 
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()

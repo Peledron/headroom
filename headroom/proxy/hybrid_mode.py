@@ -44,6 +44,9 @@ class HybridModeConfig:
     # binding lever and age 2 keeps a safety margin behind the working set.
     mask_after_turns: int = 2
     mask_min_tokens: int = 150
+    mask_min_tokens_at_bust: int = 60
+    history_sweep: bool = True
+    sweep_assistant_text: bool = False
     # DEFAULT OFF after the 2026-07-17 mimicry incident: masking
     # model-authored tool inputs taught the model to emit fabricated
     # markers as real Write contents (live file corruption, original
@@ -79,6 +82,9 @@ class HybridModeConfig:
             canon_model_id=enabled("HR_CANON_MODEL_ID"),
             mask_after_turns=integer("HR_MASK_AFTER_TURNS", 2),
             mask_min_tokens=integer("HR_MASK_MIN_TOKENS", 150),
+            mask_min_tokens_at_bust=integer("HR_MASK_MIN_TOKENS_AT_BUST", 60),
+            history_sweep=enabled("HR_HISTORY_SWEEP"),
+            sweep_assistant_text=os.environ.get("HR_SWEEP_ASSISTANT_TEXT") == "1",
             mask_tool_inputs=os.environ.get("HR_MASK_TOOL_INPUTS") == "1",
         )
 

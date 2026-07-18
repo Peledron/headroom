@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class MaskResult:
     masked_count: int = 0
     tokens_saved: int = 0
     bytes_saved: int = 0
+    swept_count: int = 0
 
 
 def masking_gate_gain(
@@ -89,9 +91,218 @@ def _already_compact(content: str) -> bool:
         stripped.startswith(MASK_PREFIX)
         or stripped.startswith(INPUT_MASK_PREFIX)
         or _RECOVERY_MARKER in content
+        or "<<ccr:" in content
         or stripped.startswith("[Read content stale:")
         or stripped.startswith("[Read content superseded:")
         or stripped.startswith("[Read content matured:")
+    )
+
+
+def sweep_history(
+    messages: list[dict[str, Any]],
+    *,
+    router: Any,
+    tokenizer: Any,
+    compression_store: Any,
+    sweep_assistant_text: bool = False,
+    minimum_savings_fraction: float = 0.15,
+) -> MaskResult:
+    """Compress old result residue after an admitted cache-busting mutation."""
+    from headroom.transforms.compression_units import (
+        CompressionUnit,
+        compress_unit_with_router,
+    )
+
+    metadata, assistant_turns = _tool_metadata(messages)
+    replacements: dict[tuple[int, int], tuple[str, str, bool]] = {}
+    tokens_saved = 0
+    bytes_saved = 0
+
+    def prepare(
+        *,
+        message_index: int,
+        block_index: int,
+        original: str,
+        role: str,
+        item_type: str,
+        tool_name: str,
+        tool_use_id: str,
+        text_block: bool,
+    ) -> None:
+        nonlocal tokens_saved, bytes_saved
+        if not original or _already_compact(original):
+            return
+        unit = CompressionUnit(
+            text=original,
+            provider="anthropic",
+            endpoint="/v1/messages",
+            role=role,
+            item_type=item_type,
+            min_bytes=0,
+            metadata={"compress_assistant": "true"} if role == "assistant" else {},
+        )
+        result = compress_unit_with_router(unit, router=router, tokenizer=tokenizer)
+        if not result.modified:
+            return
+        try:
+            encoded = original.encode("utf-8")
+        except UnicodeEncodeError:
+            return
+        content_hash = hashlib.sha256(encoded).hexdigest()[:24]
+        marker = f"<<ccr:{content_hash},string,{len(encoded)}B>>"
+        replacement = f"{result.compressed.rstrip()}\n{marker}"
+        replacement_bytes = len(replacement.encode("utf-8"))
+        if replacement_bytes > len(encoded) * (1.0 - minimum_savings_fraction):
+            return
+        replacement_tokens = max(0, int(tokenizer.count_text(replacement)))
+        original_tokens = max(0, int(tokenizer.count_text(original)))
+        if replacement_tokens >= original_tokens:
+            return
+        compression_store.store(
+            original=original,
+            compressed=replacement,
+            original_tokens=original_tokens,
+            compressed_tokens=replacement_tokens,
+            tool_name=tool_name,
+            tool_call_id=tool_use_id,
+            compression_strategy="history_sweep",
+            explicit_hash=content_hash,
+        )
+        replacements[(message_index, block_index)] = (
+            original,
+            replacement,
+            text_block,
+        )
+        tokens_saved += original_tokens - replacement_tokens
+        bytes_saved += len(encoded) - replacement_bytes
+
+    assistant_turn = 0
+    for message_index, message in enumerate(messages):
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(content, list):
+            if (
+                sweep_assistant_text
+                and role == "assistant"
+                and isinstance(content, str)
+                and assistant_turns - assistant_turn - 1 >= 3
+            ):
+                prepare(
+                    message_index=message_index,
+                    block_index=-1,
+                    original=content,
+                    role="assistant",
+                    item_type="text",
+                    tool_name="assistant",
+                    tool_use_id="",
+                    text_block=False,
+                )
+            if role == "assistant":
+                assistant_turn += 1
+            continue
+        for block_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "tool_result":
+                original = block.get("content")
+                text_block = False
+                if (
+                    isinstance(original, list)
+                    and len(original) == 1
+                    and isinstance(original[0], dict)
+                    and original[0].get("type") == "text"
+                    and isinstance(original[0].get("text"), str)
+                ):
+                    original = original[0]["text"]
+                    text_block = True
+                if not isinstance(original, str):
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str):
+                    tool_use_id = ""
+                tool_name, source_turn = metadata.get(
+                    tool_use_id, ("unknown", assistant_turns)
+                )
+                if assistant_turns - source_turn - 1 < 1:
+                    continue
+                prepare(
+                    message_index=message_index,
+                    block_index=block_index,
+                    original=original,
+                    role="tool",
+                    item_type="tool_result",
+                    tool_name=tool_name,
+                    tool_use_id=tool_use_id,
+                    text_block=text_block,
+                )
+            elif (
+                sweep_assistant_text
+                and role == "assistant"
+                and block_type == "text"
+                and isinstance(block.get("text"), str)
+                and assistant_turns - assistant_turn - 1 >= 3
+            ):
+                prepare(
+                    message_index=message_index,
+                    block_index=block_index,
+                    original=block["text"],
+                    role="assistant",
+                    item_type="text",
+                    tool_name="assistant",
+                    tool_use_id="",
+                    text_block=True,
+                )
+        if role == "assistant":
+            assistant_turn += 1
+
+    if not replacements:
+        return MaskResult(messages=messages)
+    output = list(messages)
+    for (message_index, block_index), (original, replacement, text_block) in replacements.items():
+        message = output[message_index]
+        if block_index == -1:
+            if message.get("content") != original:
+                continue
+            output[message_index] = {**message, "content": replacement}
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        block = content[block_index]
+        if not isinstance(block, dict):
+            continue
+        new_block = block
+        if block.get("type") == "tool_result":
+            block_content = block.get("content")
+            if text_block:
+                if not (
+                    isinstance(block_content, list)
+                    and len(block_content) == 1
+                    and isinstance(block_content[0], dict)
+                    and block_content[0].get("text") == original
+                ):
+                    continue
+                new_block = {
+                    **block,
+                    "content": [{**block_content[0], "text": replacement}],
+                }
+            elif block_content == original:
+                new_block = {**block, "content": replacement}
+            else:
+                continue
+        elif block.get("type") == "text" and block.get("text") == original:
+            new_block = {**block, "text": replacement}
+        else:
+            continue
+        new_content = list(content)
+        new_content[block_index] = new_block
+        output[message_index] = {**message, "content": new_content}
+    return MaskResult(
+        messages=output,
+        tokens_saved=tokens_saved,
+        bytes_saved=bytes_saved,
+        swept_count=len(replacements),
     )
 
 
