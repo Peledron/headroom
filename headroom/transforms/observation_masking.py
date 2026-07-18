@@ -158,16 +158,25 @@ def sweep_history(
         original_tokens = max(0, int(tokenizer.count_text(original)))
         if replacement_tokens >= original_tokens:
             return
-        compression_store.store(
-            original=original,
-            compressed=replacement,
-            original_tokens=original_tokens,
-            compressed_tokens=replacement_tokens,
-            tool_name=tool_name,
-            tool_call_id=tool_use_id,
-            compression_strategy="history_sweep",
-            explicit_hash=content_hash,
-        )
+        try:
+            compression_store.store(
+                original=original,
+                compressed=replacement,
+                original_tokens=original_tokens,
+                compressed_tokens=replacement_tokens,
+                tool_name=tool_name,
+                tool_call_id=tool_use_id,
+                compression_strategy="history_sweep",
+                explicit_hash=content_hash,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A transient store fault must cost one block, not the whole
+            # request. Skipping keeps the invariant: no marker without a
+            # stored original.
+            logger.warning(
+                "history_sweep: CCR store failed for %s: %s", tool_use_id, exc
+            )
+            return
         replacements[(message_index, block_index)] = (
             original,
             replacement,
