@@ -10,6 +10,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -37,6 +38,105 @@ from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
+
+_RECOVERY_MARKER_PREFIXES = (
+    "[Tool input masked:",
+    "[Tool result masked:",
+    "Retrieve original: hash=",
+)
+_RECOVERY_HASH_RE = re.compile(r"hash=([0-9a-fA-F]{24})")
+
+
+def _guard_anthropic_tool_use_markers(response_json: dict[str, Any], *, request_id: str) -> bool:
+    """Expand genuine recovery markers and block fabricated tool calls.
+
+    Returns True when the response was changed. This guard runs only on complete
+    Anthropic responses. Direct upstream SSE cannot be repaired safely after a
+    tool input delta has reached the client, so request-side tool-input masking
+    is disabled for that path below.
+    """
+    content = response_json.get("content")
+    if not isinstance(content, list):
+        return False
+
+    from headroom.cache.compression_store import get_compression_store
+
+    store = get_compression_store()
+    changed = False
+    guarded_content: list[Any] = []
+
+    def expand_value(value: Any) -> tuple[Any, str | None]:
+        nonlocal changed
+        if isinstance(value, dict):
+            expanded: dict[Any, Any] = {}
+            for key, child in value.items():
+                expanded_child, missing_hash = expand_value(child)
+                if missing_hash is not None:
+                    return value, missing_hash
+                expanded[key] = expanded_child
+            return expanded, None
+        if isinstance(value, list):
+            expanded_list: list[Any] = []
+            for child in value:
+                expanded_child, missing_hash = expand_value(child)
+                if missing_hash is not None:
+                    return value, missing_hash
+                expanded_list.append(expanded_child)
+            return expanded_list, None
+        if not isinstance(value, str) or not any(
+            marker in value for marker in _RECOVERY_MARKER_PREFIXES
+        ):
+            return value, None
+
+        hash_match = _RECOVERY_HASH_RE.search(value)
+        hash_key = hash_match.group(1).lower() if hash_match else "unknown"
+        entry = store.retrieve(hash_key) if hash_match else None
+        if entry is None:
+            return value, hash_key
+        changed = True
+        logger.warning("[%s] MARKER_GUARD: expanded hash=%s", request_id, hash_key)
+        return entry.original_content, None
+
+    blocked = False
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            guarded_content.append(block)
+            continue
+        expanded_input, missing_hash = expand_value(block.get("input"))
+        if missing_hash is None:
+            guarded_content.append(
+                block
+                if expanded_input is block.get("input")
+                else {**block, "input": expanded_input}
+            )
+            continue
+        changed = True
+        blocked = True
+        logger.warning("[%s] MARKER_GUARD: blocked hash=%s", request_id, missing_hash)
+        guarded_content.append(
+            {
+                "type": "text",
+                "text": (
+                    "Headroom blocked this tool call: its input contained a recovery "
+                    f"marker with unknown hash {missing_hash}. Re-emit the tool call "
+                    "with the real content written out in full."
+                ),
+            }
+        )
+
+    if changed:
+        response_json["content"] = guarded_content
+    if blocked:
+        # ``end_turn`` with any surviving tool_use block is an invalid
+        # Anthropic response shape. Defer every tool call in this turn so the
+        # model can re-emit a clean set after reading the guard message.
+        response_json["content"] = [
+            block
+            for block in guarded_content
+            if not isinstance(block, dict) or block.get("type") != "tool_use"
+        ]
+        response_json["stop_reason"] = "end_turn"
+    return changed
 
 
 def _strip_streaming_only_content_fields(messages: Any) -> None:
@@ -1354,10 +1454,12 @@ class AnthropicHandlerMixin:
             # requests send a minimal tools array and hit exactly this.
             # Dropping the beta for the single request is strictly better
             # than the rejection.
-            _final_beta = headers.get("anthropic-beta")
-            if _final_beta and any(
-                m in _final_beta for m in ("advanced-tool-use", "tool-search-tool")
-            ):
+            # Tool-reference guard, independent of any beta header: a
+            # non-empty tools array (GA tool-search shape included) makes
+            # Anthropic strictly validate historical tool_use names. A
+            # request with no tools at all is never validated, so it needs
+            # no stubs.
+            if body.get("tools"):
                 from headroom.proxy.helpers import referenced_tool_names
 
                 _available_tool_names = {
@@ -1365,27 +1467,49 @@ class AnthropicHandlerMixin:
                     for t in (body.get("tools") or [])
                     if isinstance(t, dict)
                 }
-                _missing_refs = (
-                    referenced_tool_names(body.get("messages"))
-                    - _available_tool_names
-                )
+                _missing_refs = referenced_tool_names(body.get("messages")) - _available_tool_names
                 if _missing_refs:
-                    _kept_betas = [
-                        t
-                        for t in _final_beta.split(",")
-                        if t.strip()
-                        and "advanced-tool-use" not in t
-                        and "tool-search-tool" not in t
+                    # Dropping the beta header is NOT sufficient: the GA
+                    # tool-search shape (defer_loading entries or a search
+                    # tool in the client's own array) triggers the same
+                    # strict validation with no header at all (verified
+                    # 2026-07-18, the 400 survived the header drop). Stub
+                    # definitions for historically-referenced tools satisfy
+                    # validation in every variant, and are semantically
+                    # honest: the tool existed when history was written
+                    # (compaction's minimal array, MCP servers that
+                    # disconnected mid-session).
+                    _tools_list = body.get("tools")
+                    if not isinstance(_tools_list, list):
+                        _tools_list = []
+                        body["tools"] = _tools_list
+                    _name_case = {}
+                    for _m in body.get("messages") or []:
+                        _c = _m.get("content") if isinstance(_m, dict) else None
+                        if isinstance(_c, list):
+                            for _b in _c:
+                                if isinstance(_b, dict) and _b.get("type") == "tool_use":
+                                    _n = _b.get("name")
+                                    if isinstance(_n, str):
+                                        _name_case[_n.lower()] = _n
+                    _stubs = [
+                        {
+                            "name": _name_case.get(_ref, _ref),
+                            "description": (
+                                "Historical tool no longer available in this "
+                                "session. Do not call it."
+                            ),
+                            "input_schema": {"type": "object"},
+                        }
+                        for _ref in sorted(_missing_refs)[:128]
                     ]
+                    _tools_list.extend(_stubs)
                     logger.info(
-                        f"[{request_id}] STICKY_BETA_GUARD: dropped tool-search "
-                        f"beta (history references {sorted(_missing_refs)[:5]} "
-                        f"absent from the tools array)"
+                        f"[{request_id}] TOOL_REF_GUARD: injected "
+                        f"{len(_stubs)} stub definition(s) for "
+                        f"history-referenced tools absent from the array "
+                        f"({sorted(_missing_refs)[:5]}...)"
                     )
-                    if _kept_betas:
-                        headers["anthropic-beta"] = ",".join(_kept_betas)
-                    else:
-                        headers.pop("anthropic-beta", None)
             # HR_FORCE_BETA (2026-07-11, local fork): re-append beta tokens the
             # client is entitled to but silently dropped. Observed: after a 429
             # Claude Code removes context-1m-2025-08-07 for the rest of the
@@ -1538,20 +1662,34 @@ class AnthropicHandlerMixin:
                             masking_gate_gain,
                         )
 
+                        # A direct upstream SSE tool input cannot be recalled once
+                        # a delta reaches the client. Only mask tool inputs when
+                        # the complete response will pass through the guard.
+                        _marker_guard_buffered = bool(
+                            not stream
+                            or (
+                                self.ccr_response_handler
+                                and getattr(
+                                    getattr(self.ccr_response_handler, "config", None),
+                                    "enabled",
+                                    True,
+                                )
+                                and (
+                                    self.config.ccr_inject_tool
+                                    or self._has_headroom_retrieve_tool(body.get("tools"))
+                                )
+                            )
+                        )
+                        _mask_tool_inputs = bool(
+                            getattr(_masking_config, "mask_tool_inputs", False)
+                            and _marker_guard_buffered
+                        )
                         _mask_candidates = discover_candidates(
                             messages,
                             count_tokens=tokenizer.count_text,
-                            mask_after_turns=getattr(
-                                _masking_config, "mask_after_turns", 2
-                            ),
-                            mask_min_tokens=getattr(
-                                _masking_config, "mask_min_tokens", 150
-                            ),
-                            mask_input_keys=(
-                                _MASKABLE_INPUT_KEYS
-                                if getattr(_masking_config, "mask_tool_inputs", False)
-                                else ()
-                            ),
+                            mask_after_turns=getattr(_masking_config, "mask_after_turns", 2),
+                            mask_min_tokens=getattr(_masking_config, "mask_min_tokens", 150),
+                            mask_input_keys=_MASKABLE_INPUT_KEYS if _mask_tool_inputs else (),
                         )
                         if not _mask_candidates:
                             _tr_shapes: dict[str, int] = {}
@@ -1560,10 +1698,7 @@ class AnthropicHandlerMixin:
                                 if not isinstance(_c, list):
                                     continue
                                 for _b in _c:
-                                    if (
-                                        isinstance(_b, dict)
-                                        and _b.get("type") == "tool_result"
-                                    ):
+                                    if isinstance(_b, dict) and _b.get("type") == "tool_result":
                                         _inner = _b.get("content")
                                         if isinstance(_inner, list):
                                             _k = (
@@ -1610,8 +1745,7 @@ class AnthropicHandlerMixin:
                                 _mask_ttl_s,
                                 max(
                                     0.0,
-                                    1.0
-                                    - (netcost_idle_seconds or 0.0) / _mask_ttl_s,
+                                    1.0 - (netcost_idle_seconds or 0.0) / _mask_ttl_s,
                                 ),
                             )
                             _mask_alive *= client_prefix_alive_fraction
@@ -1626,8 +1760,7 @@ class AnthropicHandlerMixin:
                             _masking_admitted = _mask_gain > 0.0
                             if not _masking_admitted:
                                 _mask_dt = sum(
-                                    candidate.tokens_saved
-                                    for candidate in _mask_candidates
+                                    candidate.tokens_saved for candidate in _mask_candidates
                                 )
                                 logger.info(
                                     f"[{request_id}] MASKING_GATE: declined "
@@ -1640,19 +1773,11 @@ class AnthropicHandlerMixin:
                             _bust_candidates = discover_candidates(
                                 messages,
                                 count_tokens=tokenizer.count_text,
-                                mask_after_turns=getattr(
-                                    _masking_config, "mask_after_turns", 2
-                                ),
+                                mask_after_turns=getattr(_masking_config, "mask_after_turns", 2),
                                 mask_min_tokens=getattr(
                                     _masking_config, "mask_min_tokens_at_bust", 60
                                 ),
-                                mask_input_keys=(
-                                    _MASKABLE_INPUT_KEYS
-                                    if getattr(
-                                        _masking_config, "mask_tool_inputs", False
-                                    )
-                                    else ()
-                                ),
+                                mask_input_keys=_MASKABLE_INPUT_KEYS if _mask_tool_inputs else (),
                             )
                             _mask_candidates = _bust_candidates
 
@@ -1676,9 +1801,7 @@ class AnthropicHandlerMixin:
                                     sweep_history,
                                 )
 
-                                _history_router = find_content_router(
-                                    self.anthropic_pipeline
-                                )
+                                _history_router = find_content_router(self.anthropic_pipeline)
                                 if _history_router is not None:
                                     _sweep_result = sweep_history(
                                         messages,
@@ -1695,9 +1818,7 @@ class AnthropicHandlerMixin:
                                         messages = _sweep_result.messages
                                         _hoisted_mask_result = MaskResult(
                                             messages=messages,
-                                            masked_count=(
-                                                _hoisted_mask_result.masked_count
-                                            ),
+                                            masked_count=(_hoisted_mask_result.masked_count),
                                             tokens_saved=(
                                                 _hoisted_mask_result.tokens_saved
                                                 + _sweep_result.tokens_saved
@@ -1756,12 +1877,8 @@ class AnthropicHandlerMixin:
                             _mask_candidates = discover_candidates(
                                 messages,
                                 count_tokens=tokenizer.count_text,
-                                mask_after_turns=getattr(
-                                    _masking_config, "mask_after_turns", 2
-                                ),
-                                mask_min_tokens=getattr(
-                                    _masking_config, "mask_min_tokens", 150
-                                ),
+                                mask_after_turns=getattr(_masking_config, "mask_after_turns", 2),
+                                mask_min_tokens=getattr(_masking_config, "mask_min_tokens", 150),
                             )
                             if not _mask_candidates:
                                 # Zero candidates on a large session means the
@@ -1777,16 +1894,20 @@ class AnthropicHandlerMixin:
                                         if isinstance(_b, dict) and _b.get("type") == "tool_result":
                                             _inner = _b.get("content")
                                             if isinstance(_inner, list):
-                                                _k = "list[" + ",".join(
-                                                    sorted(
-                                                        {
-                                                            _x.get("type", "?")
-                                                            if isinstance(_x, dict)
-                                                            else type(_x).__name__
-                                                            for _x in _inner
-                                                        }
+                                                _k = (
+                                                    "list["
+                                                    + ",".join(
+                                                        sorted(
+                                                            {
+                                                                _x.get("type", "?")
+                                                                if isinstance(_x, dict)
+                                                                else type(_x).__name__
+                                                                for _x in _inner
+                                                            }
+                                                        )
                                                     )
-                                                ) + f"]x{len(_inner)}"
+                                                    + f"]x{len(_inner)}"
+                                                )
                                             else:
                                                 _k = type(_inner).__name__
                                             _tr_shapes[_k] = _tr_shapes.get(_k, 0) + 1
@@ -1878,9 +1999,7 @@ class AnthropicHandlerMixin:
                             _ttl_s = 3600.0 if _ttl == "1h" else 300.0
                             # Cadence-forecast expected reads (env override
                             # stays authoritative when set).
-                            _R_env = os.environ.get(
-                                "HEADROOM_NET_COST_EXPECTED_READS", ""
-                            )
+                            _R_env = os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "")
                             try:
                                 if _R_env:
                                     _R = float(_R_env)
@@ -1894,9 +2013,7 @@ class AnthropicHandlerMixin:
                             # history predicts whether the written prefix gets
                             # read again inside the TTL, with the old linear
                             # idle proxy as the low-evidence fallback.
-                            _p_linear = max(
-                                0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s
-                            )
+                            _p_linear = max(0.0, 1.0 - (netcost_idle_seconds or 0.0) / _ttl_s)
                             _p_alive = prefix_tracker.survival_p_alive(_ttl_s, _p_linear)
                             # Bust piggybacking: client churn already killed
                             # part of the cached suffix this turn, so only the
@@ -1969,9 +2086,7 @@ class AnthropicHandlerMixin:
                                 # clusters just below zero across sessions means
                                 # expected_reads/p_alive are estimated too
                                 # conservatively and are worth recalibrating.
-                                _mask_dt = sum(
-                                    c.tokens_saved for c in _mask_candidates
-                                )
+                                _mask_dt = sum(c.tokens_saved for c in _mask_candidates)
                                 logger.info(
                                     f"[{request_id}] MASKING_GATE: declined "
                                     f"(gain={_mask_gain:.0f} dT={_mask_dt} "
@@ -2220,10 +2335,7 @@ class AnthropicHandlerMixin:
                             previous_original_messages,
                             previous_forwarded_messages,
                         )
-                        if (
-                            _hoisted_mask_result is not None
-                            and _hoisted_mask_result.masked_count
-                        ):
+                        if _hoisted_mask_result is not None and _hoisted_mask_result.masked_count:
                             # An admitted historical mutation intentionally rebases
                             # the prefix, so replaying the previous forwarded prefix
                             # would silently restore the unmasked bytes.
@@ -2312,36 +2424,20 @@ class AnthropicHandlerMixin:
                             # messages may carry hoisted masking mutations, so
                             # original_tokens would overstate what is forwarded
                             # and hide masking savings from PERF accounting.
-                            optimized_tokens = (
-                                original_tokens
-                                - (
-                                    _hoisted_mask_result.tokens_saved
-                                    if _hoisted_mask_result is not None
-                                    else 0
-                                )
+                            optimized_tokens = original_tokens - (
+                                _hoisted_mask_result.tokens_saved
+                                if _hoisted_mask_result is not None
+                                else 0
                             )
 
-                    if (
-                        _hoisted_mask_result is not None
-                        and _hoisted_mask_result.masked_count
-                    ):
-                        _mask_tag = (
-                            f"observation_masking:"
-                            f"{_hoisted_mask_result.masked_count}"
-                        )
+                    if _hoisted_mask_result is not None and _hoisted_mask_result.masked_count:
+                        _mask_tag = f"observation_masking:{_hoisted_mask_result.masked_count}"
                         if _mask_tag not in transforms_applied:
                             transforms_applied = list(transforms_applied) + [_mask_tag]
-                        if (
-                            _hoisted_mask_result is not None
-                            and _hoisted_mask_result.swept_count
-                        ):
-                            _sweep_tag = (
-                                f"history_sweep:{_hoisted_mask_result.swept_count}"
-                            )
+                        if _hoisted_mask_result is not None and _hoisted_mask_result.swept_count:
+                            _sweep_tag = f"history_sweep:{_hoisted_mask_result.swept_count}"
                             if _sweep_tag not in transforms_applied:
-                                transforms_applied = list(transforms_applied) + [
-                                    _sweep_tag
-                                ]
+                                transforms_applied = list(transforms_applied) + [_sweep_tag]
 
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
@@ -2432,17 +2528,12 @@ class AnthropicHandlerMixin:
             # worst forces one re-write on a surprise >5 min idle), never a wrong
             # response. Both flags off by default.
             _client_message_ttl = latest_message_cache_control_ttl(
-                [
-                    message
-                    for message in original_client_messages
-                    if isinstance(message, dict)
-                ]
+                [message for message in original_client_messages if isinstance(message, dict)]
             )
             _force_ttl = None
             _hybrid_policy = prefix_tracker.hybrid_controller.config
             if (
-                is_hybrid_mode(getattr(self.config, "mode", None))
-                and _hybrid_policy.adaptive_ttl
+                is_hybrid_mode(getattr(self.config, "mode", None)) and _hybrid_policy.adaptive_ttl
             ) or os.environ.get("HEADROOM_ADAPTIVE_TTL") == "1":
                 _force_ttl = prefix_tracker.recommended_ttl()
             if (
@@ -3483,6 +3574,7 @@ class AnthropicHandlerMixin:
                 try:
                     _msgs = body.get("messages") or []
                     if len(_msgs) > 1:
+
                         def _is_deep_hook_reminder(block: Any) -> bool:
                             if not isinstance(block, dict) or block.get("type") != "text":
                                 return False
@@ -3505,11 +3597,7 @@ class AnthropicHandlerMixin:
                         for _idx, _m in enumerate(_msgs):
                             _c = _m.get("content")
                             if _idx < _last and isinstance(_c, list) and len(_c) > 1:
-                                _f = [
-                                    _b
-                                    for _b in _c
-                                    if not _is_deep_hook_reminder(_b)
-                                ]
+                                _f = [_b for _b in _c if not _is_deep_hook_reminder(_b)]
                                 if len(_f) != len(_c) and _f:
                                     _out.append({**_m, "content": _f})
                                     _changed = True
@@ -4152,6 +4240,23 @@ class AnthropicHandlerMixin:
                         except Exception as e:
                             logger.warning(f"[{request_id}] Memory: Tool call handling failed: {e}")
                             # Continue with original response
+
+                    # Last response mutation before metrics, cache tracking, and
+                    # client delivery. This covers ordinary non-stream responses,
+                    # CCR continuations, memory continuations, and buffered SSE
+                    # resynthesis from the same complete response object.
+                    if resp_json and response.status_code == 200:
+                        if _guard_anthropic_tool_use_markers(resp_json, request_id=request_id):
+                            guarded_headers = {
+                                k: v
+                                for k, v in response.headers.items()
+                                if k.lower() not in ("content-encoding", "content-length")
+                            }
+                            response = httpx.Response(
+                                status_code=200,
+                                content=json.dumps(resp_json).encode(),
+                                headers=guarded_headers,
+                            )
 
                     total_latency = (time.time() - start_time) * 1000
 

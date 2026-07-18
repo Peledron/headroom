@@ -47,12 +47,11 @@ class HybridModeConfig:
     mask_min_tokens_at_bust: int = 60
     history_sweep: bool = True
     sweep_assistant_text: bool = False
-    # DEFAULT OFF after the 2026-07-17 mimicry incident: masking
-    # model-authored tool inputs taught the model to emit fabricated
-    # markers as real Write contents (live file corruption, original
-    # unrecoverable). Opt back in only with HR_MASK_TOOL_INPUTS=1 and
-    # only for experiments.
-    mask_tool_inputs: bool = False
+    # The 2026-07-17 mimicry incident showed that masked model-authored tool
+    # inputs can teach the model to emit fabricated markers as real Write
+    # contents. The response-side marker guard now expands valid markers and
+    # blocks fabricated ones before a tool call reaches the client.
+    mask_tool_inputs: bool = True
 
     @classmethod
     def from_environment(cls) -> HybridModeConfig:
@@ -85,7 +84,7 @@ class HybridModeConfig:
             mask_min_tokens_at_bust=integer("HR_MASK_MIN_TOKENS_AT_BUST", 60),
             history_sweep=enabled("HR_HISTORY_SWEEP"),
             sweep_assistant_text=os.environ.get("HR_SWEEP_ASSISTANT_TEXT") == "1",
-            mask_tool_inputs=os.environ.get("HR_MASK_TOOL_INPUTS") == "1",
+            mask_tool_inputs=enabled("HR_MASK_TOOL_INPUTS"),
         )
 
 
