@@ -1459,7 +1459,11 @@ class AnthropicHandlerMixin:
             # Anthropic strictly validate historical tool_use names. A
             # request with no tools at all is never validated, so it needs
             # no stubs.
-            if body.get("tools"):
+            if "tools" in body and not isinstance(body.get("tools"), list):
+                # Malformed tools payloads previously got coerced by the
+                # truthiness guard; keep that tolerance explicit.
+                body["tools"] = []
+            if isinstance(body.get("tools"), list):
                 from headroom.proxy.helpers import referenced_tool_names
 
                 _available_tool_names = {
@@ -1501,7 +1505,7 @@ class AnthropicHandlerMixin:
                             ),
                             "input_schema": {"type": "object"},
                         }
-                        for _ref in sorted(_missing_refs)[:128]
+                        for _ref in sorted(_missing_refs)[:1024]
                     ]
                     _tools_list.extend(_stubs)
                     logger.info(

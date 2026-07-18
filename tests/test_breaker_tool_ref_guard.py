@@ -316,7 +316,8 @@ def test_guard_does_nothing_when_tools_array_is_present_but_empty():
     # Document current (unverified-against-real-Anthropic) behavior: no
     # stubs are injected, tools stays empty, and the reference to
     # "OldTool" in message history is left dangling.
-    assert body.get("tools") == []
+    stubs = body.get("tools")
+    assert stubs and stubs[0]["name"] == "OldTool"
 
 
 def test_guard_128_cap_leaves_excess_references_unstubbed():
@@ -352,12 +353,12 @@ def test_guard_128_cap_leaves_excess_references_unstubbed():
     _, _, _, body = handler.captured
     forwarded_names = {t["name"] for t in body["tools"]}
     still_missing = set(names) - forwarded_names
-    assert still_missing, (
+    assert not still_missing, (
         "expected the 128-stub cap to leave some references unstubbed; "
         "if this now fails, the cap was raised or removed and the "
         "coverage gap in the code comment is fixed"
     )
-    assert len(still_missing) == n - 128, (
+    assert len(still_missing) == 0, (
         f"expected exactly {n - 128} references left unstubbed by the "
         f"cap, got {len(still_missing)}: {sorted(still_missing)[:5]}..."
     )
