@@ -864,6 +864,30 @@ def test_resolve_1m_model_is_idempotent() -> None:
     assert wrap_mod._resolve_1m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
 
 
+def test_configure_claude_subagent_model_uses_native_selector() -> None:
+    env: dict[str, str] = {}
+    assert wrap_mod._configure_claude_subagent_model(env) == "claude-sonnet-5"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "claude-sonnet-5"
+
+
+def test_native_subagent_selector_does_not_change_fable_main_model() -> None:
+    env = {"ANTHROPIC_MODEL": "claude-fable-5[1m]"}
+    assert wrap_mod._configure_claude_subagent_model(env) == "claude-sonnet-5"
+    assert env["ANTHROPIC_MODEL"] == "claude-fable-5[1m]"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "claude-sonnet-5"
+
+
+def test_configure_claude_subagent_model_preserves_explicit_choice() -> None:
+    env = {"CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku-4-5"}
+    assert wrap_mod._configure_claude_subagent_model(env) == "claude-haiku-4-5"
+
+
+def test_configure_claude_subagent_model_can_be_disabled() -> None:
+    env = {"HR_SUBAGENT_MODEL_CAP": "0"}
+    assert wrap_mod._configure_claude_subagent_model(env) is None
+    assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
+
+
 def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
     """With no model selected, fall back to the default Opus carrying [1m]."""
     assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"

@@ -1,15 +1,14 @@
 """Pure output-effort policy decisions.
 
 The output shaper mutates provider request bodies. This module owns the
-provider-neutral decisions behind those mutations so rank comparisons and
-legacy budget clamping stay testable without request dictionaries.
+provider-neutral decisions behind those mutations so rank comparisons stay
+testable without request dictionaries.
 """
 
 from __future__ import annotations
 
 EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
 TEXT_VERBOSITY_RANK = {"low": 0, "medium": 1, "high": 2}
-LEGACY_THINKING_FLOOR = 1024
 
 
 def lower_effort_value(current: object, target: str) -> str | None:
@@ -21,22 +20,6 @@ def lower_effort_value(current: object, target: str) -> str | None:
     if EFFORT_RANK[current] <= EFFORT_RANK[target]:
         return None
     return target
-
-
-def clamp_legacy_thinking_budget(
-    *,
-    thinking_type: object,
-    budget_tokens: object,
-    floor: int = LEGACY_THINKING_FLOOR,
-) -> int | None:
-    """Return the clamped budget for legacy enabled thinking, else ``None``."""
-    if thinking_type != "enabled":
-        return None
-    if not isinstance(budget_tokens, int):
-        return None
-    if budget_tokens <= floor:
-        return None
-    return floor
 
 
 def can_create_openai_text_verbosity(model: object) -> bool:

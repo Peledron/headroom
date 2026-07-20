@@ -14,8 +14,9 @@ output tokens, so every lever here works by reshaping the request:
    bills as output tokens, and harnesses like Claude Code pin
    ``output_config.effort`` at ``xhigh`` for every turn. On turns classified
    as mechanical we lower an explicitly-present effort; on errors or new user
-   asks we leave it alone. For legacy models still sending
-   ``thinking.budget_tokens`` we clamp the budget to the API floor instead.
+   asks we leave it alone. A request carrying a ``cache_control`` breakpoint
+   pins the effort instead of lowering it (measured 2026-07-19: flipping
+   ``output_config.effort`` busts the Anthropic prompt cache).
 
 Safety rules (each prevents a concrete failure mode):
 - Never INJECT ``output_config.effort`` where the client didn't send it —
@@ -51,9 +52,7 @@ from headroom.proxy.output_effort_policy import (
     EFFORT_RANK as _EFFORT_RANK,
 )
 from headroom.proxy.output_effort_policy import (
-    LEGACY_THINKING_FLOOR,
     can_create_openai_text_verbosity,
-    clamp_legacy_thinking_budget,
     lower_effort_value,
     lower_text_verbosity_value,
 )
@@ -72,7 +71,6 @@ from headroom.proxy.output_turn_policy import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "LEGACY_THINKING_FLOOR",
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
@@ -80,6 +78,7 @@ __all__ = [
     "apply_verbosity_steering",
     "classify_openai_responses_input",
     "classify_turn",
+    "request_uses_prompt_caching",
     "resolve_verbosity_level",
     "route_effort",
     "route_openai_reasoning_effort",
@@ -189,51 +188,90 @@ class ShapeResult:
 
     changed: bool = False
     labels: list[str] | None = None
+    effort_decision: str | None = None
 
     def __post_init__(self) -> None:
         if self.labels is None:
             self.labels = []
 
 
+def request_uses_prompt_caching(body: dict[str, Any]) -> bool:
+    """Whether any cache_control breakpoint is present in the request."""
+    if not isinstance(body, dict):
+        return False
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and "cache_control" in tool:
+                return True
+
+    system = body.get("system")
+    if isinstance(system, dict) and "cache_control" in system:
+        return True
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and "cache_control" in block:
+                return True
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if "cache_control" in block:
+                    return True
+                # Breakpoints can sit one level deeper, on a sub-block of a
+                # tool_result's own content list. Missing one means mutating
+                # effort on a cached request, a full-prefix rewrite.
+                inner = block.get("content")
+                if isinstance(inner, list):
+                    for sub in inner:
+                        if isinstance(sub, dict) and "cache_control" in sub:
+                            return True
+
+    return False
+
+
 def route_effort(
     body: dict[str, Any],
     kind: TurnKind,
     settings: OutputShaperSettings,
-) -> list[str]:
-    """Lower thinking/effort spend on mechanical continuations.
+) -> tuple[list[str], str | None]:
+    """Lower effort spend on mechanical continuations.
 
-    Returns labels for each mutation made (empty list = untouched).
+    Returns (labels, decision). labels holds a mutation label when the body
+    was edited (empty list = untouched). decision is "lowered", "pinned", or
+    None.
     """
     if kind is not TurnKind.MECHANICAL_CONTINUATION:
-        return []
-
-    labels: list[str] = []
+        return [], None
 
     # Modern lever: output_config.effort. Only lower a value the client
     # explicitly sent — presence proves the target model accepts the param.
     output_config = body.get("output_config")
-    if isinstance(output_config, dict):
-        effort = output_config.get("effort")
-        lowered = lower_effort_value(effort, settings.mechanical_effort)
-        if lowered is not None:
-            output_config["effort"] = lowered
-            labels.append(f"output_shaper:effort:{effort}->{lowered}")
+    if not isinstance(output_config, dict):
+        return [], None
 
-    # Legacy lever: clamp thinking.budget_tokens on models still using the
-    # enabled/budget_tokens form. The type field itself is never touched.
-    thinking = body.get("thinking")
-    if isinstance(thinking, dict):
-        budget = thinking.get("budget_tokens")
-        clamped = clamp_legacy_thinking_budget(
-            thinking_type=thinking.get("type"),
-            budget_tokens=budget,
-            floor=LEGACY_THINKING_FLOOR,
-        )
-        if clamped is not None:
-            thinking["budget_tokens"] = clamped
-            labels.append(f"output_shaper:thinking_budget:{budget}->{clamped}")
+    effort = output_config.get("effort")
+    lowered = lower_effort_value(effort, settings.mechanical_effort)
+    if lowered is None:
+        return [], None
 
-    return labels
+    # Flipping output_config.effort busts the Anthropic prompt cache (measured
+    # 2026-07-19, two full-prefix rewrites per flip), so a cached request
+    # keeps its current effort instead.
+    if request_uses_prompt_caching(body):
+        return [], "pinned"
+
+    output_config["effort"] = lowered
+    return [f"output_shaper:effort:{effort}->{lowered}"], "lowered"
 
 
 def route_openai_reasoning_effort(
@@ -343,11 +381,17 @@ def shape_request(
 
     if settings.effort_router_enabled:
         kind = classify_turn(body.get("messages", []))
-        labels = route_effort(body, kind, settings)
+        labels, effort_decision = route_effort(body, kind, settings)
         if labels:
             result.changed = True
             result.labels.extend(labels)
-        logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
+        result.effort_decision = effort_decision
+        logger.debug(
+            "OutputShaper: turn=%s mutations=%s decision=%s",
+            kind.value,
+            labels,
+            effort_decision,
+        )
 
     return result
 

@@ -202,6 +202,9 @@ _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
 # ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
 # so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
+_CLAUDE_SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
+_HEADROOM_SUBAGENT_MODEL_CAP_ENV = "HR_SUBAGENT_MODEL_CAP"
+_DEFAULT_SUBAGENT_MODEL_CAP = "claude-sonnet-5"
 _CONTEXT_1M_SUFFIX = "[1m]"
 # Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
 # current default Opus; the suffix logic preserves any model the user did set.
@@ -219,6 +222,23 @@ def _resolve_1m_model(current: str | None) -> str:
     """
     base = (current or "").strip() or _DEFAULT_1M_MODEL
     return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+
+
+def _configure_claude_subagent_model(env: dict[str, str]) -> str | None:
+    """Pin Claude Code subagents through its native model-selection signal.
+
+    This avoids inferring agent identity from mutable system-prompt text at the
+    proxy. An explicit ``CLAUDE_CODE_SUBAGENT_MODEL`` always wins. Set
+    ``HR_SUBAGENT_MODEL_CAP=0`` to leave Claude Code's default untouched.
+    """
+    existing = env.get(_CLAUDE_SUBAGENT_MODEL_ENV, "").strip()
+    if existing:
+        return existing
+    cap = env.get(_HEADROOM_SUBAGENT_MODEL_CAP_ENV, _DEFAULT_SUBAGENT_MODEL_CAP).strip()
+    if not cap or cap == "0":
+        return None
+    env[_CLAUDE_SUBAGENT_MODEL_ENV] = cap
+    return cap
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -4454,6 +4474,13 @@ def claude(
             click.echo(
                 f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
                 "(1M context window; issue #1158)"
+            )
+
+        _subagent_model = _configure_claude_subagent_model(env)
+        if _subagent_model and verbose:
+            click.echo(
+                f"  {_CLAUDE_SUBAGENT_MODEL_ENV}={_subagent_model} "
+                "(native Claude Code subagent model cap)"
             )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)

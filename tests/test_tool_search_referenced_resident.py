@@ -22,6 +22,23 @@ def test_referenced_tool_names_extraction() -> None:
     assert referenced_tool_names(None) == frozenset()
 
 
+def test_referenced_tool_names_includes_server_tool_use() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "tool_search_tool_regex",
+                    "input": {"query": "WebSearch"},
+                }
+            ],
+        }
+    ]
+    assert referenced_tool_names(messages) == frozenset({"tool_search_tool_regex"})
+
+
 def test_referenced_tool_stays_resident() -> None:
     tools = _tools()
     referenced = frozenset({"tool3"})

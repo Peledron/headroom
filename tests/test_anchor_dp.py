@@ -6,7 +6,9 @@ from headroom.cache.anchor_dp import (
     MIN_DEPTH,
     QUANTUM,
     TAIL_GUARD,
+    AbstractVsKeepWarmArmStats,
     _candidate_positions,
+    decide_abstract_vs_keep_warm,
     fallback_anchor_depth,
     optimal_anchor_depths,
 )
@@ -84,3 +86,62 @@ class TestOptimality:
         depths = optimal_anchor_depths(n, [0.3, 0.3, 0.3, 0.8, 0.8, 0.8], 2)
         assert len(depths) == 2
         assert depths[0] <= 0.3 * n < depths[1] <= 0.8 * n
+
+
+class TestAbstractVsKeepWarmArm:
+    """Log-only pricing arm: keep-warm cost per turn vs one-time bust cost."""
+
+    def test_keep_warm_wins_for_short_remaining_conversation(self) -> None:
+        # A single expected future turn barely accrues keep-warm cost, so
+        # busting the suffix to save it is not worth it.
+        decision = decide_abstract_vs_keep_warm(
+            history_tokens=1000,
+            summary_tokens=200,
+            suffix_tokens=500,
+            expected_remaining_turns=1.0,
+        )
+        assert decision.would_abstract is False
+        assert decision.keep_warm_cost < decision.abstract_cost
+
+    def test_abstract_wins_for_long_remaining_conversation(self) -> None:
+        # Many expected future turns make keeping a large history span warm
+        # expensive enough that a one-time bust to summarize it pays off.
+        decision = decide_abstract_vs_keep_warm(
+            history_tokens=5000,
+            summary_tokens=200,
+            suffix_tokens=500,
+            expected_remaining_turns=50.0,
+        )
+        assert decision.would_abstract is True
+        assert decision.keep_warm_cost > decision.abstract_cost
+
+    def test_negative_inputs_are_clamped_not_rejected(self) -> None:
+        decision = decide_abstract_vs_keep_warm(
+            history_tokens=-10,
+            summary_tokens=-5,
+            suffix_tokens=-5,
+            expected_remaining_turns=-1.0,
+        )
+        assert decision.history_tokens == 0
+        assert decision.summary_tokens == 0
+        assert decision.suffix_tokens == 0
+        assert decision.expected_remaining_turns == 0.0
+        assert decision.would_abstract is False
+
+    def test_stats_tally_agreement_with_current_always_keep_warm(self) -> None:
+        # The production DP arm never abstracts today, so recording against
+        # current_would_abstract=False must count every abstain as agreement
+        # and every would_abstract=True as a disagreement, purely for the
+        # log-only counters, without changing production behavior.
+        stats = AbstractVsKeepWarmArmStats()
+        keep_warm_decision = decide_abstract_vs_keep_warm(1000, 200, 500, 1.0)
+        abstract_decision = decide_abstract_vs_keep_warm(5000, 200, 500, 50.0)
+
+        stats.record(keep_warm_decision, production_would_abstract=False)
+        stats.record(abstract_decision, production_would_abstract=False)
+
+        snapshot = stats.snapshot()
+        assert snapshot["would_keep_warm"] == 1
+        assert snapshot["would_abstract"] == 1
+        assert snapshot["agrees_with_production"] == 1
+        assert snapshot["disagrees_with_production"] == 1

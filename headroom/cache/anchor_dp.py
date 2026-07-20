@@ -27,6 +27,9 @@ respecting the provider's 4-breakpoint budget.
 
 from __future__ import annotations
 
+import threading
+from dataclasses import dataclass
+
 MIN_DEPTH = 32
 """Shallowest anchorable message index. Above this the head breakpoints the
 client already places cover the loss, and an anchor would waste budget."""
@@ -146,3 +149,109 @@ def optimal_anchor_depths(
         else:  # pragma: no cover - table invariant: a predecessor always exists
             break
     return sorted(chosen)
+
+
+_KEEP_WARM_PRICE_PER_TOKEN_TURN = 0.1
+"""Price of keeping one history token warm for one expected future turn,
+relative to the write premium below."""
+
+_ABSTRACT_BUST_PRICE = 1.25
+"""Price of a summary-triggered suffix bust, per replaced-plus-busted token.
+Matches the provider's 5m cache write multiplier, the closest priced analogue
+to a forced rewrite of the summarized span and everything after it."""
+
+
+@dataclass(frozen=True)
+class AbstractVsKeepWarmDecision:
+    """Priced comparison between two futures for the same history span.
+
+    ``keep_warm_cost`` is what the span costs left untouched: ``history_tokens``
+    re-read at the keep-warm rate, once per expected remaining turn.
+    ``abstract_cost`` is the one-time price of replacing the span with a
+    ``summary_tokens``-token summary, which busts the ``suffix_tokens`` after
+    it. Abstraction wins only when it is strictly cheaper over the horizon.
+    """
+
+    would_abstract: bool
+    keep_warm_cost: float
+    abstract_cost: float
+    history_tokens: int
+    summary_tokens: int
+    suffix_tokens: int
+    expected_remaining_turns: float
+
+
+def decide_abstract_vs_keep_warm(
+    history_tokens: int,
+    summary_tokens: int,
+    suffix_tokens: int,
+    expected_remaining_turns: float,
+) -> AbstractVsKeepWarmDecision:
+    """Price abstracting a history span against leaving it warm in cache.
+
+    Pure and log-only: the caller decides whether to act on the result, this
+    function only computes it. Negative inputs are clamped to zero so a bad
+    upstream estimate cannot flip the sign of either cost.
+    """
+    history_tokens = max(0, history_tokens)
+    summary_tokens = max(0, summary_tokens)
+    suffix_tokens = max(0, suffix_tokens)
+    expected_remaining_turns = max(0.0, expected_remaining_turns)
+
+    keep_warm_cost = (
+        _KEEP_WARM_PRICE_PER_TOKEN_TURN * history_tokens * expected_remaining_turns
+    )
+    abstract_cost = _ABSTRACT_BUST_PRICE * (summary_tokens + suffix_tokens)
+    return AbstractVsKeepWarmDecision(
+        would_abstract=keep_warm_cost > abstract_cost,
+        keep_warm_cost=keep_warm_cost,
+        abstract_cost=abstract_cost,
+        history_tokens=history_tokens,
+        summary_tokens=summary_tokens,
+        suffix_tokens=suffix_tokens,
+        expected_remaining_turns=expected_remaining_turns,
+    )
+
+
+class AbstractVsKeepWarmArmStats:
+    """Log-only tally of the priced arm's recommendation versus production.
+
+    Nothing here changes a request. It exists so a canary comparison (see
+    workstream E) can ask "how often would this arm have disagreed" without
+    replaying traffic.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._would_abstract = 0
+        self._would_keep_warm = 0
+        self._agrees_with_production = 0
+        self._disagrees_with_production = 0
+
+    def record(
+        self, decision: AbstractVsKeepWarmDecision, *, production_would_abstract: bool
+    ) -> None:
+        with self._lock:
+            if decision.would_abstract:
+                self._would_abstract += 1
+            else:
+                self._would_keep_warm += 1
+            if decision.would_abstract == production_would_abstract:
+                self._agrees_with_production += 1
+            else:
+                self._disagrees_with_production += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "would_abstract": self._would_abstract,
+                "would_keep_warm": self._would_keep_warm,
+                "agrees_with_production": self._agrees_with_production,
+                "disagrees_with_production": self._disagrees_with_production,
+            }
+
+
+abstract_vs_keep_warm_stats = AbstractVsKeepWarmArmStats()
+"""Process-wide singleton, mirroring the OperationalAudit/TouchRegistry
+pattern of one counters object exposed through the module and read by
+/stats. Safe under the GIL plus its own lock; no request state lives here."""

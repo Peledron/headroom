@@ -6,6 +6,10 @@ survival_p_alive (the empirical-hazard replacement for the linear idle proxy).
 """
 
 from headroom.cache.prefix_tracker import PrefixCacheTracker
+from headroom.proxy.handlers.anthropic import (
+    _first_diverged_index_from_fraction,
+    _structural_bust_requires_fresh_5m,
+)
 
 
 def _msg(role: str, text: str) -> dict:
@@ -21,6 +25,38 @@ def _tracker_with_history(messages: list[dict]) -> PrefixCacheTracker:
         original_messages=messages,
     )
     return tracker
+
+
+def test_structural_bust_uses_fresh_5m_only_for_material_warm_prefix_loss() -> None:
+    assert _structural_bust_requires_fresh_5m(0.33, 10)
+    assert not _structural_bust_requires_fresh_5m(0.50, 10)
+    assert not _structural_bust_requires_fresh_5m(0.10, 0)
+
+
+class TestFirstDivergedIndexFromFraction:
+    def test_no_prior_turn_returns_none(self) -> None:
+        assert _first_diverged_index_from_fraction(1.0, 0) is None
+
+    def test_fully_alive_returns_prior_length(self) -> None:
+        assert _first_diverged_index_from_fraction(1.0, 4) == 4
+
+    def test_mid_divergence_recovers_exact_index(self) -> None:
+        # Mirrors TestObserveClientChurn.test_mid_divergence_reports_surviving_fraction:
+        # k=2 of n=4, fraction 0.5.
+        assert _first_diverged_index_from_fraction(0.5, 4) == 2
+
+    def test_head_rewrite_recovers_zero(self) -> None:
+        assert _first_diverged_index_from_fraction(0.0, 2) == 0
+
+    def test_end_to_end_with_real_tracker(self) -> None:
+        # The full pipeline: PrefixCacheTracker computes the fraction,
+        # get_last_original_messages supplies n, the helper recovers k.
+        history = [_msg("user", str(i)) for i in range(4)]
+        tracker = _tracker_with_history(history)
+        current = history[:2] + [_msg("user", "REWRITTEN")] + history[3:]
+        fraction = tracker.observe_client_churn(current)
+        prev_n = len(tracker.get_last_original_messages())
+        assert _first_diverged_index_from_fraction(fraction, prev_n) == 2
 
 
 class TestObserveClientChurn:

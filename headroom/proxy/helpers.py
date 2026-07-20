@@ -2748,6 +2748,7 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "todowrite",
         "todoread",
         "webfetch",
+        "websearch",
         "question",
         "skill",
     }
@@ -2778,7 +2779,10 @@ def referenced_tool_names(messages: Any) -> frozenset[str]:
         if not isinstance(content, list):
             continue
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
+            if isinstance(block, dict) and block.get("type") in (
+                "tool_use",
+                "server_tool_use",
+            ):
                 name = block.get("name")
                 if isinstance(name, str) and name:
                     names.add(name.lower())

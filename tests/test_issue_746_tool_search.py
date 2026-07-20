@@ -247,6 +247,14 @@ def test_claude_code_core_tool_names_are_case_insensitive() -> None:
     assert "defer_loading" not in by_name["Read"]
 
 
+def test_websearch_stays_resident() -> None:
+    tools = _tools(15)
+    tools[0]["name"] = "WebSearch"
+    out = inject_tool_search_deferral(tools)
+    by_name = {tool.get("name"): tool for tool in out if isinstance(tool, dict)}
+    assert "defer_loading" not in by_name["WebSearch"]
+
+
 def test_tokensave_and_serena_tool_families_stay_resident() -> None:
     tools = _tools(15)
     tools[0]["name"] = "mcp__tokensave__tokensave_context"

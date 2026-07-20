@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -202,6 +203,7 @@ class StreamingMixin:
                         delta_usage = data.get("usage", {})
                         if delta_usage:
                             usage["output_tokens"] = delta_usage.get("output_tokens", 0)
+                            usage.update(_anthropic_iteration_metrics(delta_usage))
 
                 elif provider == "openai":
                     # OpenAI sends usage in final chunk (when stream_options.include_usage=true)
@@ -293,10 +295,11 @@ class StreamingMixin:
                             f"cache_read={usage_found.get('cache_read_input_tokens')}, "
                             f"cache_write={usage_found.get('cache_creation_input_tokens')}"
                         )
-                elif event_type == "message_delta":
-                    delta_usage = data.get("usage", {})
-                    if delta_usage:
-                        usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
+                    elif event_type == "message_delta":
+                        delta_usage = data.get("usage", {})
+                        if delta_usage:
+                            usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
+                            usage_found.update(_anthropic_iteration_metrics(delta_usage))
 
             elif provider == "openai":
                 chunk_usage = data.get("usage")
@@ -871,6 +874,64 @@ class StreamingMixin:
             effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
         )
 
+        # Workstream H, closed-loop cache accounting: join the predicted cache
+        # read (the DP's implicit assumption of what should have been warm)
+        # against what upstream actually billed. Log-only, best-effort, must
+        # never affect the response being built around it.
+        try:
+            from headroom.proxy.cache_reconciliation import get_reconciliation_log
+            from headroom.proxy.touch_registry import session_fingerprint
+
+            _alive_fraction, _first_diverged_index = getattr(
+                prefix_tracker, "_hr_last_churn_observation", (1.0, None)
+            )
+            _session_key = session_fingerprint(body) or request_id
+            get_reconciliation_log().record(
+                session_key=_session_key,
+                request_id=request_id,
+                model=model,
+                billed_cache_read=cache_read_tokens,
+                billed_cache_creation=cache_write_tokens,
+                alive_fraction=_alive_fraction,
+                first_diverged_index=_first_diverged_index,
+                transforms=transforms_applied,
+            )
+        except Exception:
+            logger.debug(
+                "[%s] cache_reconciliation wiring failed, skipping", request_id, exc_info=True
+            )
+
+        # Workstream E, phase 0 replay corpus: opt-in capture of the request
+        # actually sent upstream plus the billed usage, for
+        # benchmarks/claude_stack_canary.py replay. Off unless
+        # HEADROOM_REPLAY_CAPTURE is set, best-effort so a capture failure
+        # never fails the response it is describing.
+        try:
+            from headroom.proxy.replay_capture import get_replay_capture
+
+            _capture = get_replay_capture()
+            if _capture is not None:
+                _capture.record(
+                    request_body=body,
+                    response_usage={
+                        "input_tokens": provider_input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cache_read_tokens,
+                        "cache_creation_input_tokens": cache_write_tokens,
+                        "cache_creation_ephemeral_5m_input_tokens": cache_write_5m_tokens,
+                        "cache_creation_ephemeral_1h_input_tokens": cache_write_1h_tokens,
+                    },
+                    transforms_applied=transforms_applied,
+                    model=model,
+                    request_id=request_id,
+                    provider=provider,
+                    timestamp=start_time,
+                )
+        except Exception:
+            logger.debug(
+                "[%s] replay_capture wiring failed, skipping", request_id, exc_info=True
+            )
+
         # Prefix-tracker mutation is provider-specific state that lives
         # outside the metric funnel. Run it before the funnel so the next
         # request inherits correct prefix state regardless of metric path.
@@ -1126,6 +1187,10 @@ class StreamingMixin:
             "cache_creation_input_tokens": 0,
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
+            "internal_iteration_count": 0,
+            "internal_iteration_input_tokens": 0,
+            "internal_iteration_cache_read_tokens": 0,
+            "internal_iteration_cache_write_tokens": 0,
             "total_bytes": 0,
             # Buffer for incomplete SSE events (bytes, per PR-A8 / P1-8).
             # We split events on the ``\n\n`` byte sequence and decode
@@ -1356,6 +1421,24 @@ class StreamingMixin:
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
 
+        # Streaming half of the recovery-marker guard: the buffered path
+        # repairs mimicry on the complete response, this transformer covers
+        # tool_use blocks on direct SSE. Anthropic wire format only.
+        _sse_guard = None
+        if provider == "anthropic" and os.environ.get("HR_SSE_MARKER_GUARD", "1") != "0":
+            from headroom.proxy.sse_marker_guard import SseToolUseMarkerGuard
+
+            def _sse_guard_retrieve(hash_key: str) -> str | None:
+                try:
+                    from headroom.cache.compression_store import get_compression_store
+
+                    entry = get_compression_store().retrieve(hash_key)
+                except Exception:
+                    return None
+                return getattr(entry, "original_content", None) if entry else None
+
+            _sse_guard = SseToolUseMarkerGuard(_sse_guard_retrieve, request_id)
+
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
 
@@ -1401,8 +1484,16 @@ class StreamingMixin:
                             stream_state["sse_buffer"] = bytearray(tail)
 
                         # Always stream immediately — buffering breaks
-                        # real-time clients (LangGraph, LangChain, etc.)
-                        yield chunk
+                        # real-time clients (LangGraph, LangChain, etc.).
+                        # The marker guard holds back only in-flight
+                        # tool_use blocks, everything else passes through
+                        # unchanged.
+                        if _sse_guard is not None:
+                            guarded = _sse_guard.feed(chunk)
+                            if guarded:
+                                yield guarded
+                        else:
+                            yield chunk
 
                         if _codex_wire_debug:
                             capture_codex_wire_debug(
@@ -1459,6 +1550,14 @@ class StreamingMixin:
                                 stream_state["cache_creation_ephemeral_1h_input_tokens"] = usage[
                                     "cache_creation_ephemeral_1h_input_tokens"
                                 ]
+                            for _iteration_key in (
+                                "internal_iteration_count",
+                                "internal_iteration_input_tokens",
+                                "internal_iteration_cache_read_tokens",
+                                "internal_iteration_cache_write_tokens",
+                            ):
+                                if _iteration_key in usage:
+                                    stream_state[_iteration_key] = usage[_iteration_key]
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -1470,6 +1569,26 @@ class StreamingMixin:
                 # complete events). Invalid UTF-8 at this point would
                 # be an upstream protocol violation — surface loudly.
                 full_sse_data: str = full_sse_bytes.decode("utf-8") if full_sse_bytes else ""
+
+                _iteration_count = int(stream_state.get("internal_iteration_count", 0) or 0)
+                if provider == "anthropic" and _iteration_count > 1:
+                    _iteration_input = int(
+                        stream_state.get("internal_iteration_input_tokens", 0) or 0
+                    )
+                    logger.error(
+                        "[%s] ANTHROPIC-ITERATION-FANOUT: iterations=%d input_tokens=%d "
+                        "cache_read=%d cache_write=%d",
+                        request_id,
+                        _iteration_count,
+                        _iteration_input,
+                        int(stream_state.get("internal_iteration_cache_read_tokens", 0) or 0),
+                        int(stream_state.get("internal_iteration_cache_write_tokens", 0) or 0),
+                    )
+                    _audit = getattr(self, "operational_audit", None)
+                    if _audit is not None:
+                        _audit.record_anthropic_iteration_fanout(
+                            _iteration_count, _iteration_input
+                        )
 
                 if memory_enabled and full_sse_data:
                     # Check for Claude Code credential error
@@ -1519,6 +1638,11 @@ class StreamingMixin:
                     )
                     if ccr_parsed:
                         self._record_ccr_feedback_from_response(ccr_parsed, provider, request_id)
+                if _sse_guard is not None:
+                    _guard_tail = _sse_guard.flush()
+                    if _guard_tail:
+                        yield _guard_tail
+
                 if _codex_wire_debug:
                     _debug_parsed_response = (
                         parsed_response
@@ -1993,3 +2117,25 @@ class StreamingMixin:
             generate(),
             media_type="text/event-stream",
         )
+def _anthropic_iteration_metrics(usage: Any) -> dict[str, int]:
+    """Summarize provider-internal inference iterations from Anthropic usage."""
+    if not isinstance(usage, dict):
+        return {}
+    iterations = usage.get("iterations")
+    if not isinstance(iterations, list):
+        return {}
+    valid = [item for item in iterations if isinstance(item, dict)]
+    if not valid:
+        return {}
+    return {
+        "internal_iteration_count": len(valid),
+        "internal_iteration_input_tokens": sum(
+            int(item.get("input_tokens", 0) or 0) for item in valid
+        ),
+        "internal_iteration_cache_read_tokens": sum(
+            int(item.get("cache_read_input_tokens", 0) or 0) for item in valid
+        ),
+        "internal_iteration_cache_write_tokens": sum(
+            int(item.get("cache_creation_input_tokens", 0) or 0) for item in valid
+        ),
+    }

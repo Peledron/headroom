@@ -195,11 +195,18 @@ class HybridModeController:
         )
         pressure = context_pressure if math.isfinite(context_pressure) else 0.0
         aged = self._warm_turns >= self.config.min_warm_turns
+        # No pressure clause here. The old 0.50 floor made this branch
+        # unreachable in the exact regime it was built for: CCR deferral keeps
+        # pressure low, so the queued savings never flushed (126 deferrals,
+        # 0 rebases in five days of production logs). The gain formula already
+        # carries every relevant cost: p_alive discounts the rewrite penalty
+        # when the prefix is dying, and expected remaining reads let a warm
+        # long session justify a voluntary rewrite once the queue is large
+        # enough. Pressure keeps its own dedicated branches below.
         economic_rebase = (
             aged
             and savings_fraction >= self.config.minimum_savings_fraction
             and gain >= self.config.minimum_net_gain_tokens
-            and pressure >= 0.50
         )
         pressure_rebase = aged and pressure >= self.config.pressure_rebase_threshold and gain > 0.0
         emergency_rebase = pressure >= self.config.pressure_hard_limit

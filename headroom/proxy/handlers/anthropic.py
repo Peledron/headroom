@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +38,7 @@ from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy import structural_ledger
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -176,7 +179,10 @@ def _flatten_system_text(system: Any) -> str:
             for block in system
             if isinstance(block, dict) and isinstance(block.get("text"), str)
         ]
-        return "\n".join(parts)
+        # The [1m] marker can straddle a block boundary ("...<id>" + "[1m]...").
+        # A separator-free join keeps that marker intact for detection. The
+        # newline join stays available for callers that need readable text.
+        return "".join(parts)
     return ""
 
 
@@ -273,6 +279,210 @@ def _token_prefix_mutation_worth_it(
     if p_alive <= p_alive_floor:
         return True
     return context_pressure >= pressure_threshold
+
+
+def _first_diverged_index_from_fraction(
+    alive_fraction: float, prev_message_count: int
+) -> int | None:
+    """Recover the first diverged message index k from observe_client_churn's k/n.
+
+    ``observe_client_churn`` returns only the fraction; this reconstructs the
+    index without touching ``PrefixCacheTracker`` (out of ownership for this
+    change). The fraction is an exact ``k / n``, so ``round()`` recovers ``k``
+    losslessly at the message-count sizes a session runs at. Returns ``None``
+    when there is no prior turn to compare against (``prev_message_count == 0``).
+    """
+    if prev_message_count <= 0:
+        return None
+    if alive_fraction >= 1.0:
+        return prev_message_count
+    return round(alive_fraction * prev_message_count)
+
+
+def _structural_bust_requires_fresh_5m(
+    alive_fraction: float,
+    frozen_message_count: int,
+    *,
+    threshold: float = 0.5,
+) -> bool:
+    """Return whether an already-broken warm prefix should use a cheap fresh write."""
+    return frozen_message_count > 0 and alive_fraction < threshold
+
+
+def _wire_subagent_cap_target(
+    *,
+    fallback_enabled: bool,
+    is_subagent_request: bool,
+    model: Any,
+    system: Any,
+    cap: str | None,
+) -> str | None:
+    """Return the compatibility-fallback target, or ``None`` for no rewrite."""
+    if not fallback_enabled or not is_subagent_request or not isinstance(model, str):
+        return None
+    if not cap or cap == "0":
+        return None
+    if not model.startswith(("claude-fable", "claude-opus")):
+        return None
+    return cap if _system_looks_subagent(system, model) else None
+
+
+# The one positive signal the wire-level cap acts on: the exact bare model id
+# rendered as a standalone token in a Claude-Code-shaped system head, with no
+# accompanying "[1m]" marker. Named so the rewrite log records WHY a request
+# matched, not just that it did, and so a second positive signal (if one is
+# ever added) gets its own name instead of overloading this string.
+SUBAGENT_CAP_POSITIVE_SIGNAL = "bare_model_id_token_no_1m_marker"
+
+_SUBAGENT_CAP_REWRITE_RING_SIZE = 20
+_subagent_cap_rewrite_lock = threading.Lock()
+_subagent_cap_rewrite_count = 0
+_subagent_cap_rewrite_log: deque[dict[str, Any]] = deque(
+    maxlen=_SUBAGENT_CAP_REWRITE_RING_SIZE
+)
+
+
+def _record_subagent_cap_rewrite(request_id: str, model_before: str, model_after: str) -> None:
+    """Record one applied cap rewrite for /stats visibility.
+
+    Separate from ``operational_audit.record_model_substitution``: that counter
+    is a per-(source, target, reason) tally, this keeps the last N individual
+    rewrites with the request id and the matched signal, so a misfire is
+    readable from /stats the day it happens instead of requiring a log grep.
+    """
+    global _subagent_cap_rewrite_count
+    with _subagent_cap_rewrite_lock:
+        _subagent_cap_rewrite_count += 1
+        _subagent_cap_rewrite_log.append(
+            {
+                "request_id": request_id,
+                "model_before": model_before,
+                "model_after": model_after,
+                "signal": SUBAGENT_CAP_POSITIVE_SIGNAL,
+            }
+        )
+
+
+def subagent_cap_rewrite_snapshot() -> dict[str, Any]:
+    """Rewrite count and the last N rewrite reasons, for the /stats payload."""
+    with _subagent_cap_rewrite_lock:
+        return {
+            "rewrite_count": _subagent_cap_rewrite_count,
+            "recent_rewrites": list(_subagent_cap_rewrite_log),
+        }
+
+
+def _should_inject_server_tool_search(
+    *,
+    provider_name: str,
+    anthropic_backend: Any,
+    client: str | None,
+    setting: str | None,
+) -> bool:
+    """Limit proxy-owned Tool Search to non-Claude direct Anthropic clients."""
+    return (
+        provider_name == "anthropic"
+        and anthropic_backend is None
+        and client != "claude-code"
+        and (setting or "").strip().lower() in ("1", "true", "yes", "on", "auto")
+    )
+
+
+def _guard_large_claude_tool_search(
+    tools: Any,
+    *,
+    client: str | None,
+    input_tokens: int,
+    threshold: int = 100_000,
+) -> list[dict[str, Any]] | Any:
+    """Materialize deferred tools before a large Claude context can search-loop.
+
+    Keep the server Tool Search definition because older assistant messages may
+    reference it. Removing the definition makes Anthropic reject the whole
+    continuation before inference.
+    """
+    if (
+        client != "claude-code"
+        or threshold <= 0
+        or input_tokens < threshold
+        or not isinstance(tools, list)
+    ):
+        return tools
+    has_deferred = any(isinstance(tool, dict) and tool.get("defer_loading") for tool in tools)
+    has_search = any(
+        isinstance(tool, dict)
+        and str(tool.get("type", "")).startswith("tool_search_tool_")
+        for tool in tools
+    )
+    if not has_deferred or not has_search:
+        return tools
+    materialized: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            materialized.append(tool)
+            continue
+        copied = dict(tool)
+        copied.pop("defer_loading", None)
+        materialized.append(copied)
+    return materialized
+
+
+def _ensure_claude_tool_search_history_compatibility(
+    tools: Any,
+    messages: Any,
+    *,
+    client: str | None,
+) -> list[dict[str, Any]] | Any:
+    """Restore a referenced Tool Search definition without deferring tools."""
+    if client != "claude-code" or not isinstance(tools, list) or not isinstance(messages, list):
+        return tools
+
+    history_references_search = False
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if (
+                isinstance(block, dict)
+                and block.get("type") in ("tool_use", "server_tool_use")
+                and block.get("name") == "tool_search_tool_regex"
+            ):
+                history_references_search = True
+                break
+        if history_references_search:
+            break
+
+    if not history_references_search:
+        return tools
+
+    has_search_definition = any(
+        isinstance(tool, dict)
+        and (
+            tool.get("name") == "tool_search_tool_regex"
+            or str(tool.get("type", "")).startswith("tool_search_tool_")
+        )
+        for tool in tools
+    )
+    has_deferred = any(isinstance(tool, dict) and tool.get("defer_loading") for tool in tools)
+    if has_search_definition and not has_deferred:
+        return tools
+
+    compatible: list[Any] = []
+    if not has_search_definition:
+        compatible.append(
+            {
+                "type": "tool_search_tool_regex_20251119",
+                "name": "tool_search_tool_regex",
+            }
+        )
+    for tool in tools:
+        if not isinstance(tool, dict):
+            compatible.append(tool)
+            continue
+        copied = dict(tool)
+        copied.pop("defer_loading", None)
+        compatible.append(copied)
+    return compatible
 
 
 class AnthropicHandlerMixin:
@@ -930,7 +1140,51 @@ class AnthropicHandlerMixin:
             # missed them and they busted). Drives both the 5m ttl prior and the
             # token-mode sub-agent freeze below.
             _is_subagent_request = _system_lacks_1m_marker(body.get("system"), model)
+            # Wire-level backstop for the client-side agent-model-cap hook: a
+            # sub-agent spawned on a premium model (an inherited Fable or Opus
+            # session model) is rewritten to the cap model before it can cold
+            # write a premium-priced context. The STRICT detector is required
+            # here, a false positive would change the answering model for
+            # non-Claude-Code traffic, so only Claude-Code-shaped heads that
+            # render the exact bare model id are eligible. HR_SUBAGENT_MODEL_CAP
+            # sets the cap model, "0" or empty disables.
+            # Claude Code has a native, process-local subagent selector
+            # (CLAUDE_CODE_SUBAGENT_MODEL), configured by ``headroom wrap
+            # claude``. Prompt-text inference remains available only as an
+            # explicit compatibility fallback because a main-session retry can
+            # lose its rendered [1m] marker and otherwise be downgraded.
+            _wire_cap_fallback = os.environ.get(
+                "HR_SUBAGENT_MODEL_CAP_WIRE_FALLBACK", "0"
+            ) == "1"
+            _cap = _wire_subagent_cap_target(
+                fallback_enabled=_wire_cap_fallback,
+                is_subagent_request=_is_subagent_request,
+                model=model,
+                system=body.get("system"),
+                cap=os.environ.get("HR_SUBAGENT_MODEL_CAP", "claude-sonnet-5"),
+            )
+            if _cap is not None:
+                    logger.info(
+                        "SUBAGENT_MODEL_CAP: %s rewriting subagent model %s -> %s "
+                        "(signal=%s)",
+                        request_id,
+                        model,
+                        _cap,
+                        SUBAGENT_CAP_POSITIVE_SIGNAL,
+                    )
+                    _audit = getattr(self, "operational_audit", None)
+                    if _audit is not None:
+                        _audit.record_model_substitution(
+                            model, _cap, "wire_subagent_cap_fallback"
+                        )
+                    _record_subagent_cap_rewrite(request_id, model, _cap)
+                    body["model"] = _cap
+                    model = _cap
+                    body_mutation_tracker.mark_mutated("subagent_model_cap")
             messages = body.get("messages", [])
+            _audit = getattr(self, "operational_audit", None)
+            if _audit is not None:
+                _audit.observe_anthropic_tools(body)
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
             # tags assistant blocks with an "index" for SSE re-emission; clients (e.g.
@@ -1315,6 +1569,23 @@ class AnthropicHandlerMixin:
                     f"alive_fraction={client_prefix_alive_fraction:.2f} "
                     "(bust penalty scaled down for this turn)"
                 )
+            # Recover the first diverged message index from the fraction
+            # observe_client_churn already computed (k / n against last turn's
+            # stored originals), without re-touching PrefixCacheTracker: fraction
+            # is an exact k/n, so round() recovers k for the message-count sizes
+            # this runs at. Stashed on the tracker instance (not a declared
+            # attribute of that class) so the cache-reconciliation join in
+            # streaming.py's _finalize_stream_response can read it once the
+            # billed usage for this same request comes back, without threading a
+            # new parameter through every call site between here and there.
+            _churn_prev_messages = prefix_tracker.get_last_original_messages()
+            first_diverged_index = _first_diverged_index_from_fraction(
+                client_prefix_alive_fraction, len(_churn_prev_messages)
+            )
+            prefix_tracker._hr_last_churn_observation = (  # noqa: SLF001
+                client_prefix_alive_fraction,
+                first_diverged_index,
+            )
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
@@ -1492,21 +1763,33 @@ class AnthropicHandlerMixin:
                         _c = _m.get("content") if isinstance(_m, dict) else None
                         if isinstance(_c, list):
                             for _b in _c:
-                                if isinstance(_b, dict) and _b.get("type") == "tool_use":
+                                if isinstance(_b, dict) and _b.get("type") in (
+                                    "tool_use",
+                                    "server_tool_use",
+                                ):
                                     _n = _b.get("name")
                                     if isinstance(_n, str):
                                         _name_case[_n.lower()] = _n
-                    _stubs = [
-                        {
-                            "name": _name_case.get(_ref, _ref),
-                            "description": (
-                                "Historical tool no longer available in this "
-                                "session. Do not call it."
-                            ),
-                            "input_schema": {"type": "object"},
-                        }
-                        for _ref in sorted(_missing_refs)[:1024]
-                    ]
+                    _stubs = []
+                    for _ref in sorted(_missing_refs)[:1024]:
+                        if _ref == "tool_search_tool_regex":
+                            _stubs.append(
+                                {
+                                    "type": "tool_search_tool_regex_20251119",
+                                    "name": "tool_search_tool_regex",
+                                }
+                            )
+                        else:
+                            _stubs.append(
+                                {
+                                    "name": _name_case.get(_ref, _ref),
+                                    "description": (
+                                        "Historical tool no longer available in this "
+                                        "session. Do not call it."
+                                    ),
+                                    "input_schema": {"type": "object"},
+                                }
+                            )
                     _tools_list.extend(_stubs)
                     logger.info(
                         f"[{request_id}] TOOL_REF_GUARD: injected "
@@ -1684,9 +1967,15 @@ class AnthropicHandlerMixin:
                                 )
                             )
                         )
+                        # The SSE transformer guards the direct-stream path,
+                        # so buffering is no longer a precondition for input
+                        # masking when it is enabled.
                         _mask_tool_inputs = bool(
                             getattr(_masking_config, "mask_tool_inputs", False)
-                            and _marker_guard_buffered
+                            and (
+                                _marker_guard_buffered
+                                or os.environ.get("HR_SSE_MARKER_GUARD", "1") != "0"
+                            )
                         )
                         _mask_candidates = discover_candidates(
                             messages,
@@ -2536,9 +2825,45 @@ class AnthropicHandlerMixin:
             )
             _force_ttl = None
             _hybrid_policy = prefix_tracker.hybrid_controller.config
+            try:
+                _structural_bust_threshold = float(
+                    os.environ.get("HEADROOM_STRUCTURAL_BUST_ALIVE_THRESHOLD", "0.5")
+                )
+            except ValueError:
+                _structural_bust_threshold = 0.5
             if (
-                is_hybrid_mode(getattr(self.config, "mode", None)) and _hybrid_policy.adaptive_ttl
-            ) or os.environ.get("HEADROOM_ADAPTIVE_TTL") == "1":
+                os.environ.get("HEADROOM_STRUCTURAL_BUST_TTL_5M", "1") != "0"
+                and _structural_bust_requires_fresh_5m(
+                    client_prefix_alive_fraction,
+                    frozen_message_count,
+                    threshold=max(0.0, min(1.0, _structural_bust_threshold)),
+                )
+            ):
+                _force_ttl = "5m"
+                logger.info(
+                    "[%s] STRUCTURAL-BUST: alive_fraction=%.2f forcing fresh 5m write",
+                    request_id,
+                    client_prefix_alive_fraction,
+                )
+                # The prefix is being re-billed regardless, so render what the
+                # conversation had accumulated for the log. Log-only: never
+                # feeds back into the request or the cache decision above.
+                try:
+                    _ledger = structural_ledger.build_structural_ledger(
+                        original_client_messages
+                    )
+                    logger.info("[%s] %s", request_id, _ledger.render())
+                except Exception:  # noqa: BLE001 - never let logging break the bust path
+                    logger.debug(
+                        "[%s] STRUCTURAL-BUST: ledger render failed", request_id, exc_info=True
+                    )
+            if _force_ttl is None and (
+                (
+                    is_hybrid_mode(getattr(self.config, "mode", None))
+                    and _hybrid_policy.adaptive_ttl
+                )
+                or os.environ.get("HEADROOM_ADAPTIVE_TTL") == "1"
+            ):
                 _force_ttl = prefix_tracker.recommended_ttl()
             if (
                 _force_ttl is None
@@ -2715,6 +3040,46 @@ class AnthropicHandlerMixin:
             # `frozen_message_count > 0` guard below).
             tools = body.get("tools")
             _original_tools = tools  # Preserve for diagnostic / future retry
+
+            _history_compatible_tools = _ensure_claude_tool_search_history_compatibility(
+                tools,
+                body.get("messages"),
+                client=client,
+            )
+            if _history_compatible_tools is not tools:
+                body["tools"] = _history_compatible_tools
+                tools = _history_compatible_tools
+                body_mutation_tracker.mark_mutated("tool_search_history_compatibility")
+                transforms_applied.append("tool_search_history_compatibility")
+                logger.warning(
+                    "[%s] TOOL-SEARCH-HISTORY-COMPAT: restored referenced search "
+                    "definition and materialized tools",
+                    request_id,
+                )
+
+            try:
+                _large_tool_search_threshold = int(
+                    os.environ.get("HEADROOM_LARGE_TOOL_SEARCH_GUARD_TOKENS", "100000")
+                )
+            except ValueError:
+                _large_tool_search_threshold = 100_000
+            _guarded_tools = _guard_large_claude_tool_search(
+                tools,
+                client=client,
+                input_tokens=optimized_tokens,
+                threshold=_large_tool_search_threshold,
+            )
+            if _guarded_tools is not tools:
+                body["tools"] = _guarded_tools
+                tools = _guarded_tools
+                body_mutation_tracker.mark_mutated("large_context_tool_search_guard")
+                transforms_applied.append("large_context_tool_search_guard")
+                logger.error(
+                    "[%s] LARGE-CONTEXT-TOOL-SEARCH-GUARD: input_tokens=%d; "
+                    "materialized deferred tools to prevent full-context iteration fan-out",
+                    request_id,
+                    optimized_tokens,
+                )
 
             # Issue #746: when Claude Code talks to a custom ANTHROPIC_BASE_URL
             # with ENABLE_TOOL_SEARCH unset, it stops deferring tool schemas and
@@ -3225,11 +3590,11 @@ class AnthropicHandlerMixin:
             # (``anthropic_backend``) and Vertex/gateway providers gate tool search
             # differently, so scope the injection to provider "anthropic" over the
             # direct API and leave those paths untouched.
-            if (
-                provider_name == "anthropic"
-                and getattr(self, "anthropic_backend", None) is None
-                and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
-                in ("1", "true", "yes", "on", "auto")
+            if _should_inject_server_tool_search(
+                provider_name=provider_name,
+                anthropic_backend=getattr(self, "anthropic_backend", None),
+                client=client,
+                setting=os.environ.get("HEADROOM_TOOL_SEARCH"),
             ):
                 from headroom.proxy.helpers import (
                     inject_tool_search_deferral,
@@ -3340,6 +3705,10 @@ class AnthropicHandlerMixin:
                     if _arm == "treatment":
                         _level, _src = resolve_verbosity_level(_shaper_settings)
                         shape_result = shape_request(body, _shaper_settings, level_override=_level)
+                        if shape_result.effort_decision is not None:
+                            _audit = getattr(self, "operational_audit", None)
+                            if _audit is not None:
+                                _audit.record_effort_routing(shape_result.effort_decision)
                         if shape_result.changed:
                             body_mutation_tracker.mark_mutated("output_shaper")
                             transforms_applied.extend(shape_result.labels or [])
@@ -3676,6 +4045,44 @@ class AnthropicHandlerMixin:
                         else:
                             _anchor = max(32, (len(_msgs) - 16) // 64 * 64)
                             _targets = [min(_anchor, len(_msgs) - 16)]
+
+                        # Workstream C, abstract-vs-keep-warm DP arm (2026-07-19,
+                        # log-only): price replacing the earliest anchor's history
+                        # span with a summary against keeping it warm. Never
+                        # changes anchor placement, only tallies what the priced
+                        # arm would have chosen for later comparison. Message
+                        # counts stand in for token counts here (no per-message
+                        # token counter is available at this call site), so the
+                        # costs are rough, log-only estimates, not billing figures.
+                        try:
+                            from headroom.cache.anchor_dp import (
+                                abstract_vs_keep_warm_stats,
+                                decide_abstract_vs_keep_warm,
+                            )
+
+                            _earliest_target = min(_targets) if _targets else 0
+                            _avg_tokens_per_msg = 200
+                            _history_tokens = _earliest_target * _avg_tokens_per_msg
+                            _summary_tokens = max(200, _history_tokens // 10)
+                            _suffix_tokens = (len(_msgs) - _earliest_target) * _avg_tokens_per_msg
+                            _dp_arm_decision = decide_abstract_vs_keep_warm(
+                                _history_tokens,
+                                _summary_tokens,
+                                _suffix_tokens,
+                                expected_remaining_turns=8.0,
+                            )
+                            abstract_vs_keep_warm_stats.record(
+                                _dp_arm_decision, production_would_abstract=False
+                            )
+                            logger.debug(
+                                "abstract_vs_keep_warm_dp_arm would_abstract=%s "
+                                "keep_warm_cost=%.1f abstract_cost=%.1f",
+                                _dp_arm_decision.would_abstract,
+                                _dp_arm_decision.keep_warm_cost,
+                                _dp_arm_decision.abstract_cost,
+                            )
+                        except Exception:
+                            pass
 
                         _taken: set[int] = set()
                         for _target in _targets:

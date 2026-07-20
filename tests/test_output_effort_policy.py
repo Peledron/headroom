@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from headroom.proxy.output_effort_policy import (
-    LEGACY_THINKING_FLOOR,
     can_create_openai_text_verbosity,
-    clamp_legacy_thinking_budget,
     lower_effort_value,
     lower_text_verbosity_value,
 )
@@ -22,25 +20,6 @@ def test_lower_effort_value_keeps_lower_equal_unknown_or_non_string_values() -> 
     assert lower_effort_value("turbo", "low") is None
     assert lower_effort_value("high", "turbo") is None
     assert lower_effort_value(None, "low") is None
-
-
-def test_clamp_legacy_thinking_budget_only_clamps_enabled_over_floor() -> None:
-    assert (
-        clamp_legacy_thinking_budget(
-            thinking_type="enabled",
-            budget_tokens=32_000,
-        )
-        == LEGACY_THINKING_FLOOR
-    )
-    assert (
-        clamp_legacy_thinking_budget(
-            thinking_type="enabled",
-            budget_tokens=LEGACY_THINKING_FLOOR,
-        )
-        is None
-    )
-    assert clamp_legacy_thinking_budget(thinking_type="adaptive", budget_tokens=32_000) is None
-    assert clamp_legacy_thinking_budget(thinking_type="enabled", budget_tokens="32000") is None
 
 
 def test_can_create_openai_text_verbosity_only_for_gpt5_family() -> None:
