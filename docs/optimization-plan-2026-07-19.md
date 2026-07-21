@@ -213,6 +213,59 @@ expiry and hidden from the alarm. Fix: thread the actual per-request TTL
 the churn observation) into `record()`, and classify expiry against the real
 tier rather than a flat 300s.
 
+## Workstream K, judge-driven pruning with dual payback (planned)
+
+The point that reframes the objective: pruning pays back twice, not once. The
+cost model prices tokens, dropping dead content saves reads at 0.1x every turn,
+and at a bust the suffix cost is sunk so a deep drop is free (workstreams C, J).
+But models also degrade at high context. The multi-turn degradation baseline
+(arXiv 2505.06120) measured a 39 percent average quality drop with unreliable
+history, and the lost-in-the-middle effect adds to it. So a prune that is
+cost-neutral can still pay back in accuracy. The objective becomes cost plus a
+quality term, minimize tokens plus lambda times the accuracy loss that context
+length imposes. Pruning dead content shortens context, recovers accuracy, and
+the quality term rewards the cut even when the token math is flat.
+
+The judge is deterministic, not an LLM policy-maker (the project stance: the
+model is only ever the generator). Each context region is scored keep versus
+cut by deterministic signals only:
+- Solved: a resolved error supersedes its error text, a completed subtask
+  supersedes its exploration, a superseded file read (read_lifecycle,
+  cross_turn_dedup, headroom/audit/reads.py).
+- Irrelevant: low novelty against the recent query and the unresolved-error set
+  (workstream B embedding score), no rare-token overlap with recent assistant
+  turns.
+- Active, so keep: referenced in the last N turns, part of an open error, or
+  matching the current task line (workstream D structural ledger).
+The judge classifies with embeddings and rules and never generates.
+
+Two cut destinations, chosen by what the region carries:
+- Reference, reversible: solved-but-recoverable content is masked to a
+  retrievable marker on the existing CCR headroom_retrieve path. Cheap,
+  reversible, already built.
+- Summary into durable memory, lossy but state-preserving: a bulky region that
+  carries a mental model (a long file survey, a multi-step investigation) is
+  summarized into a memory file and the raw dropped, the summary stays in
+  context. The structural ledger (D) is the deterministic half and already
+  renders file, command, and task state. The generative half (prose summary of
+  intent and findings) runs the model as generator, at a bust or offline, never
+  per-request in the warm path.
+- Dead, irreversible drop: superseded or irrelevant with no state to preserve is
+  dropped outright, the ledger records that it happened.
+
+Timing follows the cost model: judge and cut hardest at busts (suffix sunk) and
+at the frontier (small suffix), never rewrite deep-warm content mid-conversation.
+
+Safety and graduation: the CCR retrieve path and the ledger are the safety nets,
+nothing is dropped that is not either recoverable by reference or preserved in
+state. Log-only first, the judge emits keep versus cut plus the would-be token
+and accuracy delta, and graduates to live cutting only after the replay corpus
+(E) shows the cut set never removes a later-needed region above the workstream B
+decision rule. The lambda weight on the quality term stays a guess until the
+corpus yields a measured accuracy-versus-context-length curve for this workload,
+so the first live policy is cost-only with the quality delta logged, and lambda
+is fit once the corpus supports it.
+
 ## Later phases, carried from the session plan
 
 - Output regularization beyond the current shaper: per-request-shape output
