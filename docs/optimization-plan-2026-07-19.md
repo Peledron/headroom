@@ -23,7 +23,9 @@
 Standing plan for the next round of headroom work. Ordered by expected payoff
 per unit of risk. Everything lands log-only first unless marked otherwise.
 Companion docs: local-change-ledger-2026-07-19.md (what already shipped),
-session-investigation-2026-07-19.md.
+session-investigation-2026-07-19.md, and
+upstream-integration-plan-2026-07-20.md (the tiered plan for merging the 130
+upstream commits and open PRs into this fork).
 
 ## Measured finding driving workstream A
 
@@ -183,6 +185,33 @@ Expected yield is small (user prose is tens of tokens inside contexts
 re-read at 0.1x), so this ships log-only first: record would-be token delta
 per message and per session before any mutation is enabled. Build only after
 A through H have landed and the reconciliation data is clean.
+
+## Workstream J, bust-time flush and tier-aware reconciliation (active, 2026-07-20)
+
+Two connected defects found while watching live traffic after the workstream
+A through H deploy.
+
+J1, flush deferred injection into a forced write. The structural-bust path
+(`_structural_bust_requires_fresh_5m`, handlers/anthropic.py) forces a fresh
+5m write when the client prefix has diverged past threshold, but the CCR
+injection deferral 300 lines later still defers "to preserve cache", holding
+back the retrieve tool and system instructions to protect a cache the same
+request already decided to discard. Fix: set a bust-forced flag at the force
+point, and at both deferral sites flush (inject now) when the flag is set,
+since the suffix is re-billed regardless. The flag is set only inside the
+bust branch, which already gates on alive_fraction below threshold, so the
+flush never fires speculatively. This is the flush the session's rebase work
+was meant to deliver on the external-bust path, distinct from the hybrid
+economic rebase (which fires on the mode's own deferred queue).
+
+J2, tier-aware reconciliation TTL. cache_reconciliation uses a flat
+CACHE_TTL_SECONDS of 300, correct for a forced 5m write but wrong for any
+session adaptive_ttl placed on the 1h tier, where a cold read at 400 seconds
+is a real bust inside the 1h window yet gets misclassified as scheduled
+expiry and hidden from the alarm. Fix: thread the actual per-request TTL
+(from `_force_ttl` or the breakpoint ttl, stashed on the prefix tracker like
+the churn observation) into `record()`, and classify expiry against the real
+tier rather than a flat 300s.
 
 ## Later phases, carried from the session plan
 

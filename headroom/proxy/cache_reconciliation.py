@@ -30,6 +30,47 @@ CACHE_TTL_SECONDS = 300.0
 # Transform labels that mark a bust headroom chose on purpose. A cold read on
 # a request carrying one of these is priced work, not an alarm condition.
 PLANNED_BUST_MARKERS = ("hybrid_rebase", "structural_bust", "history_rebase")
+# Anthropic cache tiers in seconds. The write ttl on a breakpoint sets how long
+# a read stays cheap before scheduled expiry.
+_TTL_LABEL_SECONDS = {"5m": 300.0, "1h": 3600.0}
+
+
+def message_segment_ttl_seconds(body: dict | None) -> float:
+    """The cache_control ttl of the message-history segment only.
+
+    Reconciliation tracks whether the message-history prefix stayed warm. This
+    proxy deliberately keeps the system and tools HEAD on the 1h tier so it stays
+    cache-shared across sessions, even on a turn where the message tail is forced
+    to 5m by the structural-bust or adaptive-ttl path. Scanning every breakpoint
+    and taking the max would let that 1h HEAD mask a genuine 5m message tail, so
+    a real 5m expiry would be misread as a within-window bust. Only the message
+    segment governs history warmth, so only it is scanned here. Defaults to the
+    Anthropic 5m default. Never raises.
+
+    When the message segment carries multiple anchors at differing tiers, the max
+    among them is used, since the most durable message anchor bounds how long any
+    message-prefix read can still hit.
+    """
+    longest = CACHE_TTL_SECONDS
+    try:
+        if isinstance(body, dict):
+            for msg in body.get("messages", []) or []:
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    cc = block.get("cache_control") if isinstance(block, dict) else None
+                    if isinstance(cc, dict):
+                        label = cc.get("ttl")
+                        seconds = (
+                            _TTL_LABEL_SECONDS.get(label, CACHE_TTL_SECONDS)
+                            if isinstance(label, str)
+                            else CACHE_TTL_SECONDS
+                        )
+                        longest = max(longest, seconds)
+    except Exception:
+        return CACHE_TTL_SECONDS
+    return longest
 
 
 @dataclass(frozen=True)
@@ -118,6 +159,7 @@ class CacheReconciliationLog:
         first_diverged_index: int | None,
         transforms: list[str] | None = None,
         now: float | None = None,
+        ttl_seconds: float = CACHE_TTL_SECONDS,
     ) -> CacheReconciliationRecord:
         """Assemble, count, ring, and log one record. Never raises."""
         try:
@@ -131,6 +173,7 @@ class CacheReconciliationLog:
                 alive_fraction=alive_fraction,
                 first_diverged_index=first_diverged_index,
                 transforms=transforms,
+                ttl_seconds=ttl_seconds,
             )
         except Exception:
             logger.debug(
@@ -160,17 +203,22 @@ class CacheReconciliationLog:
         first_diverged_index: int | None,
         transforms: list[str] | None,
         now: float | None = None,
+        ttl_seconds: float = CACHE_TTL_SECONDS,
     ) -> CacheReconciliationRecord:
         billed_cache_read = max(0, int(billed_cache_read))
         billed_cache_creation = max(0, int(billed_cache_creation))
         if now is None:
             now = time.monotonic()
+        # A 1h-tier write stays warm 12x longer than the 5m default, so a flat
+        # threshold would flag a genuine 1h bust as benign expiry. Judge expiry
+        # against the actual TTL the prior request was written with.
+        ttl_seconds = ttl_seconds if ttl_seconds > 0 else CACHE_TTL_SECONDS
         with self._lock:
             prior = self._session_prior.get(session_key)
             predicted = (prior[0] + prior[1]) if prior else 0
             prior_age = (now - prior[2]) if prior else 0.0
             self._session_prior[session_key] = (billed_cache_read, billed_cache_creation, now)
-        ttl_expired = prior is not None and prior_age > CACHE_TTL_SECONDS
+        ttl_expired = prior is not None and prior_age > ttl_seconds
         unplanned_bust = (
             not ttl_expired
             and not is_planned_bust(transforms)

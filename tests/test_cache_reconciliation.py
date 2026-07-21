@@ -281,3 +281,61 @@ class TestTtlAwareness:
         assert record.unplanned_bust is False
         snap = log.snapshot()
         assert snap["ttl_expiry_colds"] == 0
+
+
+class TestTierAwareTtl:
+    def test_1h_tier_cold_read_at_400s_is_a_real_bust_not_expiry(self, tmp_path) -> None:
+        log, _ = _log(tmp_path)
+        log.record(session_key="s", request_id="r1", model="m",
+                   billed_cache_read=1000, billed_cache_creation=100,
+                   alive_fraction=1.0, first_diverged_index=None,
+                   ttl_seconds=3600.0, now=0.0)
+        rec = log.record(session_key="s", request_id="r2", model="m",
+                         billed_cache_read=0, billed_cache_creation=1200,
+                         alive_fraction=1.0, first_diverged_index=None,
+                         ttl_seconds=3600.0, now=400.0)
+        assert rec.ttl_expired is False
+        assert rec.unplanned_bust is True
+
+    def test_5m_tier_cold_read_at_400s_is_scheduled_expiry(self, tmp_path) -> None:
+        log, _ = _log(tmp_path)
+        log.record(session_key="s", request_id="r1", model="m",
+                   billed_cache_read=1000, billed_cache_creation=100,
+                   alive_fraction=1.0, first_diverged_index=None,
+                   ttl_seconds=300.0, now=0.0)
+        rec = log.record(session_key="s", request_id="r2", model="m",
+                         billed_cache_read=0, billed_cache_creation=1200,
+                         alive_fraction=1.0, first_diverged_index=None,
+                         ttl_seconds=300.0, now=400.0)
+        assert rec.ttl_expired is True
+        assert rec.unplanned_bust is False
+
+
+class TestMaxCacheTtlSeconds:
+    def test_reads_1h_from_message_segment(self) -> None:
+        from headroom.proxy.cache_reconciliation import message_segment_ttl_seconds
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}]}
+        assert message_segment_ttl_seconds(body) == 3600.0
+
+    def test_defaults_to_5m_when_no_ttl(self) -> None:
+        from headroom.proxy.cache_reconciliation import message_segment_ttl_seconds
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        assert message_segment_ttl_seconds(body) == 300.0
+
+    def test_none_body_is_5m(self) -> None:
+        from headroom.proxy.cache_reconciliation import message_segment_ttl_seconds
+        assert message_segment_ttl_seconds(None) == 300.0
+
+    def test_1h_system_head_does_not_mask_5m_message_tail(self) -> None:
+        # The breaker's finding 6: the deliberately-1h system HEAD must not
+        # inflate the message segment's real 5m tier.
+        from headroom.proxy.cache_reconciliation import message_segment_ttl_seconds
+        body = {
+            "system": [{"type": "text", "text": "s",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "m",
+                 "cache_control": {"type": "ephemeral", "ttl": "5m"}}]}],
+        }
+        assert message_segment_ttl_seconds(body) == 300.0

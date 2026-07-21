@@ -879,7 +879,10 @@ class StreamingMixin:
         # against what upstream actually billed. Log-only, best-effort, must
         # never affect the response being built around it.
         try:
-            from headroom.proxy.cache_reconciliation import get_reconciliation_log
+            from headroom.proxy.cache_reconciliation import (
+                get_reconciliation_log,
+                message_segment_ttl_seconds,
+            )
             from headroom.proxy.touch_registry import session_fingerprint
 
             _alive_fraction, _first_diverged_index = getattr(
@@ -895,6 +898,7 @@ class StreamingMixin:
                 alive_fraction=_alive_fraction,
                 first_diverged_index=_first_diverged_index,
                 transforms=transforms_applied,
+                ttl_seconds=message_segment_ttl_seconds(body),
             )
         except Exception:
             logger.debug(

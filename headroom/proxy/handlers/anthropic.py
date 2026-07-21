@@ -2824,6 +2824,11 @@ class AnthropicHandlerMixin:
                 [message for message in original_client_messages if isinstance(message, dict)]
             )
             _force_ttl = None
+            # Set only when a structural bust forces a fresh write this request.
+            # The suffix is then re-billed regardless, so deferred injection can
+            # ride along for free instead of being held back to preserve a cache
+            # that is already being discarded (see the CCR flush below).
+            structural_bust_forced_write = False
             _hybrid_policy = prefix_tracker.hybrid_controller.config
             try:
                 _structural_bust_threshold = float(
@@ -2840,6 +2845,7 @@ class AnthropicHandlerMixin:
                 )
             ):
                 _force_ttl = "5m"
+                structural_bust_forced_write = True
                 logger.info(
                     "[%s] STRUCTURAL-BUST: alive_fraction=%.2f forcing fresh 5m write",
                     request_id,
@@ -3122,14 +3128,37 @@ class AnthropicHandlerMixin:
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
                 inject_system_instructions = self.config.ccr_inject_system_instructions
-                if inject_system_instructions and frozen_message_count > 0:
+                # A structural bust already forces a fresh write this request, so
+                # the frozen suffix is re-billed no matter what. Holding injection
+                # back "to preserve cache" would preserve a cache that is being
+                # discarded. Flush instead: fold the deferred system instructions
+                # and retrieval tool into the write we are already paying for. The
+                # flag is set only inside the alive_fraction bust branch, so this
+                # never fires speculatively on a still-warm prefix.
+                flush_into_forced_write = (
+                    structural_bust_forced_write and frozen_message_count > 0
+                )
+                if flush_into_forced_write:
+                    logger.info(
+                        f"[{request_id}] CCR: flushing deferred injection into forced "
+                        f"write (structural bust, frozen_message_count={frozen_message_count})"
+                    )
+                if (
+                    inject_system_instructions
+                    and frozen_message_count > 0
+                    and not flush_into_forced_write
+                ):
                     logger.info(
                         f"[{request_id}] CCR: skipping system instruction injection "
                         f"(frozen prefix={frozen_message_count}) to preserve cache"
                     )
                     inject_system_instructions = False
                 configured_inject_tool = self.config.ccr_inject_tool
-                if configured_inject_tool and frozen_message_count > 0:
+                if (
+                    configured_inject_tool
+                    and frozen_message_count > 0
+                    and not flush_into_forced_write
+                ):
                     logger.info(
                         f"[{request_id}] CCR: deferring tool injection "
                         f"(frozen_message_count={frozen_message_count}) to preserve cache"
@@ -3180,6 +3209,21 @@ class AnthropicHandlerMixin:
                     frozen_message_count=frozen_message_count,
                     has_compressed_content=has_new_compressed_content,
                 )
+                # Workstream J: on a structural bust the frozen prefix (and the
+                # sticky retrieve tool it carried) is discarded, so any
+                # <<ccr:hash>> markers still in history would become
+                # unredeemable. Re-enter the injection path so a session with
+                # sticky CCR state reinjects the tool into the forced write. A
+                # session with nothing to redeem skips inside the helper, so the
+                # flush log below is gated on an actual injection, no false claim.
+                is_bust_flush = False
+                if (
+                    not should_inject
+                    and configured_inject_tool
+                    and flush_into_forced_write
+                ):
+                    should_inject = True
+                    is_bust_flush = True
                 if should_inject:
                     if is_marker_override:
                         logger.info(
@@ -3198,6 +3242,12 @@ class AnthropicHandlerMixin:
                         has_compressed_content_this_turn=has_new_compressed_content,
                     )
                     if ccr_tool_injected:
+                        if is_bust_flush:
+                            logger.info(
+                                f"[{request_id}] CCR: flushed sticky retrieve tool "
+                                f"into forced write (structural bust, "
+                                f"frozen_message_count={frozen_message_count})"
+                            )
                         logger.debug(
                             f"[{request_id}] CCR: tool registered (session={session_id}, "
                             f"compressed_this_turn={injector.has_compressed_content}, "

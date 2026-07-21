@@ -54,12 +54,20 @@ The careful tier. Each one touches code we changed or a measurement we rely on.
   which is currently synchronous inside a try/except.
 - #2382 (merged) preserve client cache_control ttl when consolidating
   breakpoints. Reconcile against our `_hr_last_churn_observation` stash on the
-  prefix tracker and against the effort-pin gate, both read cache_control.
+  prefix tracker and against the effort-pin gate, both read cache_control. Note
+  our J2 change now also reads cache_control ttl (`max_cache_ttl_seconds` in
+  `cache_reconciliation.py`) to make bust classification tier-aware, so the two
+  cache_control readers must agree on tier after integration.
 - #2365 (open) compress cache-mode cold starts and tag prefix-mismatch
-  passthrough. The key overlap. This is upstream independently building
-  compress-on-bust, the same idea as tonight's hybrid rebase-flush. Read it
-  first, then decide adopt-theirs, keep-ours, or merge-concepts. Do not apply
-  blind.
+  passthrough. The key overlap, but name it precisely: this is upstream's
+  fix for the CACHE mode (compress on a cold start, when there is no warm
+  prefix to protect). It is a cousin of our compress-on-bust, not the same
+  mechanism. Our nearest analog is J1, the structural-bust flush in
+  `handlers/anthropic.py` that injects deferred content into a write already
+  being paid for, plus the hybrid economic rebase. Reconcile #2365 against J1
+  so cache-mode cold-start and hybrid bust-flush become one coherent
+  "compress when the cache is not at risk" policy, not two code paths. Read it
+  first, decide adopt-theirs, keep-ours, or merge-concepts. Do not apply blind.
 - #2444 (open) redeclare the CCR tool from sessionless Anthropic history.
   Reconcile in `handlers/anthropic.py` alongside #2365.
 
@@ -106,6 +114,13 @@ Recommended sequence:
    against #2365, #2444, and the registry call sites. This is the real work.
 5. Fold the Tier 1 accounting fixes, adopting upstream's cost model over our
    hardcoded multipliers.
+
+Hard invariant through all of it: hybrid mode is a local feature, not upstream.
+`--mode hybrid` and the freeze / compress-delta / rebase behavior must still
+exist and still fire after integration. The registry refactor touches the same
+`handlers/anthropic.py` call sites hybrid wires into, so the real risk is not a
+conflict marker but silently dropping hybrid. Treat "hybrid still rebases on
+replay" as a required post-integration check, not an assumption.
 
 ## Verification
 
