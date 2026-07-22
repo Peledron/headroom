@@ -996,6 +996,7 @@ class AnthropicHandlerMixin:
             read_request_json_with_bytes,
         )
         from headroom.proxy.modes import (
+            is_cache_mode,
             is_hybrid_mode,
             is_token_mode,
             preserves_warm_prefix,
@@ -2707,7 +2708,9 @@ class AnthropicHandlerMixin:
                             # gate's next-turn saving estimate self-corrects off real
                             # data instead of the static prior.
                             prefix_tracker.note_compression(original_tokens, optimized_tokens)
-                    elif not preserves_warm_prefix(self.config.mode) or _hybrid_should_rebase:
+                    elif is_hybrid_mode(self.config.mode) and (
+                        not preserves_warm_prefix(self.config.mode) or _hybrid_should_rebase
+                    ):
                         skip_ccr_request_compression = should_skip_ccr_request_compression(
                             frozen_message_count
                         )
@@ -2734,30 +2737,12 @@ class AnthropicHandlerMixin:
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
 
-                        # Cache newly compressed messages (index-aligned diff)
-                        if result.messages != working_messages:
-                            comp_cache.update_from_result(messages, result.messages)
-
-                        # Always use pipeline result — Zone 1 swaps are already applied
-                        optimized_messages = result.messages
-                        transforms_applied = result.transforms_applied
-                        pipeline_timing = result.timing
-                        # Issue #327 / Bug 3: pipeline.apply uses the provider-
-                        # side tokenizer (AnthropicProvider tiktoken estimator),
-                        # which counts ~25% higher than the proxy-side
-                        # EstimatingTokenCounter used to set `original_tokens`
-                        # at line 634. Reusing `result.tokens_after` here
-                        # produced an apples-vs-oranges comparison against
-                        # `original_tokens` in the inflation guard below
-                        # (line ~901): even after a real 12% compression the
-                        # provider-tokenizer figure was higher than the proxy-
-                        # tokenizer baseline, triggering a spurious revert.
-                        # Recount optimized_messages with the proxy tokenizer
-                        # so original_tokens vs optimized_tokens is self-
-                        # consistent. The recount cost (~ms on a 50K-token
-                        # request) is paid once per request and is dwarfed by
-                        # the upstream call latency.
-                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                            if result.messages != messages:
+                                optimized_messages = result.messages
+                                transforms_applied = result.transforms_applied
+                                pipeline_timing = result.timing
+                                original_tokens = result.tokens_before
+                                optimized_tokens = result.tokens_after
                     elif not is_cache_mode(self.config.mode):
                         async with stage_timer.measure("compression_first_stage"):
                             result = await self._run_compression_in_executor(
