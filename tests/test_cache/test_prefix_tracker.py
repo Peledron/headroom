@@ -370,6 +370,26 @@ class TestSessionTrackerStore:
         id3 = store.compute_session_id(MockRequest(), "gpt-4", messages)
         assert id3 != id1
 
+    def test_compute_session_id_includes_anthropic_top_level_system(self, store):
+        class MockRequest:
+            headers = {}
+
+        messages = [{"role": "user", "content": "same user turn"}]
+        id_a = store.compute_session_id(
+            MockRequest(),
+            "claude-sonnet-5",
+            messages,
+            system=[{"type": "text", "text": "session A"}],
+        )
+        id_b = store.compute_session_id(
+            MockRequest(),
+            "claude-sonnet-5",
+            messages,
+            system=[{"type": "text", "text": "session B"}],
+        )
+
+        assert id_a != id_b
+
     def test_compute_session_id_distinguishes_leading_system_run(self, store):
         """Different dynamic LEADING system messages should not collide."""
 

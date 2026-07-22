@@ -71,6 +71,20 @@ fn cursor_ua_classified_subscription() {
 }
 
 #[test]
+fn codex_tui_ua_classified_subscription() {
+    // Current Codex Rust CLI uses `codex-tui`, while older builds and
+    // wrappers may use `codex-cli`. Both are subscription-bound clients.
+    let h = headers(&[
+        (
+            "user-agent",
+            "codex-tui/0.144.1 (Fedora 44.0.0; x86_64) Konsole/260403",
+        ),
+        ("authorization", "Bearer header.payload.signature"),
+    ]);
+    assert_eq!(classify(&h), AuthMode::Subscription);
+}
+
+#[test]
 fn no_auth_no_user_agent_default_payg() {
     // Empty headers → safest default is PAYG. The OAuth/bedrock
     // branch fires only when there's a positive non-Bearer auth

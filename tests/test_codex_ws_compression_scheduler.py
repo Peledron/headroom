@@ -13,8 +13,8 @@ The fix:
 * Processes routed units serially inside the frame-level worker thread
   (``self._compression_executor`` already provides frame-level parallelism
   via the proxy-wide bounded executor).
-* Adds a ``PERF`` log emission from ``handle_openai_responses_ws`` so
-  Codex traffic is no longer invisible to ``headroom perf``.
+* Routes completed turns through the request-outcome funnel, which emits
+  exactly one ``PERF`` line per turn for ``headroom perf``.
 
 These tests verify that future contributors cannot silently re-introduce
 either bottleneck.
@@ -88,6 +88,14 @@ def test_no_per_call_threadpool_inside_compress_routed_units() -> None:
         "Submit work to `self._compression_executor` (instrumented and "
         "lifecycle-managed) instead of creating a new pool per frame."
     )
+
+
+def test_ws_perf_is_owned_only_by_request_outcome_funnel() -> None:
+    """The handler must not duplicate the funnel's structured PERF line."""
+    source = OPENAI_HANDLER.read_text()
+
+    assert "_perf_input_tokens" not in source
+    assert "_record_request_outcome(" in source
 
 
 # ── PERF log emission from the Codex WS path ────────────────────────────

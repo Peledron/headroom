@@ -153,10 +153,12 @@ from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
+    PROXY_MODE_HYBRID,
     PROXY_MODE_TOKEN,
     is_token_mode,
     normalize_proxy_mode,
 )
+from headroom.proxy.operational_audit import OperationalAudit
 from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
@@ -170,6 +172,7 @@ from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+from headroom.proxy.touch_registry import TouchRegistry
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -805,6 +808,8 @@ class HeadroomProxy(
             else None
         )
         self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
+        self.touch_registry = TouchRegistry()
+        self.operational_audit = OperationalAudit()
 
         # Cost-aware model routing (issue #1706). Disabled unless configured, so
         # the default request path is unchanged.
@@ -1609,9 +1614,83 @@ class HeadroomProxy(
                 transform_statuses.append(transform_status)
         return eager_status, transform_statuses
 
+    async def run_due_touches(self, *, force: bool = False) -> list[dict[str, Any]]:
+        """Replay due cache-capable requests at max_tokens=0 to re-arm the
+        provider cache TTL. Shared by /admin/touch and the auto-touch loop.
+        Upstreams that still 400 the sanctioned max_tokens=0 shape get one
+        retry at max_tokens=1, logged so persistent rejections are visible."""
+        results: list[dict[str, Any]] = []
+        for key, entry in self.touch_registry.replayable(due_only=not force):
+            body = self.touch_registry.touch_body(entry)
+            try:
+                response = await self._retry_request(
+                    "POST", entry.url, entry.headers, body, forwarder_name="touch"
+                )
+                if response.status_code == 400:
+                    logger.warning(
+                        "touch: upstream rejected max_tokens=0 for session %s, "
+                        "retrying with max_tokens=1",
+                        key,
+                    )
+                    fallback_body = self.touch_registry.touch_body_fallback(entry)
+                    response = await self._retry_request(
+                        "POST",
+                        entry.url,
+                        entry.headers,
+                        fallback_body,
+                        forwarder_name="touch",
+                    )
+                usage = {}
+                if response.status_code == 200:
+                    usage = (response.json() or {}).get("usage", {})
+                refreshed = response.status_code == 200
+                self.touch_registry.mark_touched(key, refreshed=refreshed)
+                results.append(
+                    {
+                        "session": key,
+                        "status": response.status_code,
+                        "cache_read": usage.get("cache_read_input_tokens"),
+                        "cache_write": usage.get("cache_creation_input_tokens"),
+                    }
+                )
+            except Exception as exc:
+                # A transport failure is not a spent touch: the upstream never
+                # saw the request, so burning the per-entry budget here would
+                # let two network blips permanently retire a warm session.
+                # The loop interval bounds the retry rate instead.
+                results.append({"session": key, "error": str(exc)[:200]})
+        return results
+
+    async def _auto_touch_loop(self, interval_seconds: float = 60.0) -> None:
+        """Opt-in keep-warm daemon (HEADROOM_AUTO_TOUCH=1). Every interval it
+        fires the due-only touches the ski-rental math already gates, so a
+        warm prefix is refreshed just before its TTL lapses instead of paying
+        a full re-write on the next real request. Quiet hours mirror
+        /admin/touch: no touches between 03:00 and 08:00 local."""
+        shutdown = self._get_shutdown_event()
+        while not shutdown.is_set():
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=interval_seconds)
+                break
+            except asyncio.TimeoutError:
+                pass
+            import datetime as _dt
+
+            if 3 <= _dt.datetime.now().hour < 8:
+                continue
+            try:
+                results = await self.run_due_touches()
+                if results:
+                    logger.info("auto-touch: refreshed %d session(s)", len(results))
+            except Exception:
+                logger.exception("auto-touch iteration failed")
+
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
+        if os.environ.get("HEADROOM_AUTO_TOUCH") == "1":
+            self._auto_touch_task = asyncio.create_task(self._auto_touch_loop())
+            logger.info("Auto-touch keep-warm: ENABLED (60s interval, due-only)")
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -1640,6 +1719,9 @@ class HeadroomProxy(
         if self.config.mode == PROXY_MODE_CACHE:
             logger.info("  Prefix freeze: strict (all prior turns immutable)")
             logger.info("  Mutations: latest turn only")
+        if self.config.mode == PROXY_MODE_HYBRID:
+            logger.info("  Prefix freeze: stable compressed generations")
+            logger.info("  Mutations: live delta plus cost-gated rebases")
         logger.info(f"Caching: {'ENABLED' if self.config.cache_enabled else 'DISABLED'}")
         logger.info(f"Rate Limiting: {'ENABLED' if self.config.rate_limit_enabled else 'DISABLED'}")
         logger.info(
@@ -2036,6 +2118,18 @@ class HeadroomProxy(
             body_mutated=body_mutated,
         )
         outbound_headers = {**headers, "content-type": "application/json"}
+
+        # Retain the wire-form request for TTL touches. The touch forwarder is
+        # excluded so a replay never re-records itself and resets entry age.
+        if (
+            forwarder_name != "touch"
+            and method.upper() == "POST"
+            and url.endswith("/v1/messages")
+            and isinstance(body, dict)
+        ):
+            registry = getattr(self, "touch_registry", None)
+            if registry is not None:
+                registry.record(url, headers, body)
 
         log_outbound_request(
             forwarder=forwarder_name,
@@ -2854,9 +2948,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         config.compress_system_messages,
                     )
                 ),
-                "protect_recent": profile_kwargs.get(
-                    "read_protection_window",
-                    config.protect_recent,
+                "protect_recent": (
+                    config.protect_recent
+                    if config.protect_recent is not None
+                    else profile_kwargs.get("read_protection_window")
                 ),
                 "protect_analysis_context": profile_kwargs.get(
                     "protect_analysis_context",
@@ -3259,6 +3354,37 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload = warmup_registry.to_dict() if warmup_registry is not None else {}
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
+
+    @app.post("/admin/touch", dependencies=[Depends(_require_loopback)])
+    async def admin_touch(request: Request):
+        """Replay recent cache-capable requests at max_tokens=0 to re-arm the
+        provider cache TTL. Called by the desktop lock/sleep listener; the
+        touch reads the warm prefix at the cached-read rate instead of letting
+        it lapse into a full re-write. Upstreams that still 400 the sanctioned
+        max_tokens=0 shape get one retry at max_tokens=1, logged so persistent
+        rejections are visible."""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        import datetime as _dt
+
+        force = bool(payload.get("force"))
+        hour = _dt.datetime.now().hour
+        if not force and 3 <= hour < 8:
+            return JSONResponse(
+                status_code=200,
+                content={"results": [], "skipped": "quiet_hours"},
+            )
+
+        results = await proxy.run_due_touches(force=force)
+        record_admin_action(
+            request=request, action="touch", status_code=200, details={"results": results}
+        )
+        return JSONResponse(status_code=200, content={"results": results})
 
     @app.post("/admin/runtime-env", dependencies=[Depends(_require_loopback)])
     async def admin_runtime_env(request: Request):
@@ -3772,9 +3898,41 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:  # pragma: no cover - defensive
             pass
 
+        # Workstreams G and H: model-cap rewrites and cache-reconciliation
+        # busts are otherwise invisible until a transcript audit finds them.
+        # Best-effort, never break /stats over a stats-only import failing.
+        subagent_cap_rewrites: dict[str, Any] = {}
+        cache_reconciliation: dict[str, Any] = {}
+        try:
+            from headroom.proxy.handlers.anthropic import subagent_cap_rewrite_snapshot
+
+            subagent_cap_rewrites = subagent_cap_rewrite_snapshot()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            from headroom.proxy.cache_reconciliation import get_reconciliation_log
+
+            cache_reconciliation = get_reconciliation_log().snapshot()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        # Workstream C: log-only abstract-vs-keep-warm DP arm counters.
+        abstract_vs_keep_warm: dict[str, Any] = {}
+        try:
+            from headroom.cache.anchor_dp import abstract_vs_keep_warm_stats
+
+            abstract_vs_keep_warm = abstract_vs_keep_warm_stats.snapshot()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
         return {
             "summary": summary,
             "agent_usage": agent_usage,
+            "operational_audit": proxy.operational_audit.snapshot(),
+            "subagent_cap_rewrites": subagent_cap_rewrites,
+            "cache_reconciliation": cache_reconciliation,
+            "touch_registry": proxy.touch_registry.snapshot(),
+            "abstract_vs_keep_warm_arm": abstract_vs_keep_warm,
             "savings": {
                 "total_tokens": total_tokens_all_layers,
                 "per_project": persistent_savings.get("projects", {}),
@@ -4116,7 +4274,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "compress_system_messages": bool(
                 profile_kwargs.get("compress_system_messages", config.compress_system_messages)
             ),
-            "protect_recent": profile_kwargs.get("read_protection_window", config.protect_recent),
+            "protect_recent": (
+                config.protect_recent
+                if config.protect_recent is not None
+                else profile_kwargs.get("read_protection_window")
+            ),
             "protect_analysis_context": config.protect_analysis_context,
             "min_tokens_to_crush": profile_kwargs.get(
                 "min_tokens_to_compress", config.min_tokens_to_crush

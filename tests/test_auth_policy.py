@@ -20,6 +20,16 @@ def test_subscription_user_agent_wins_over_oauth_token() -> None:
     assert classify_auth_signals(signals) is AuthMode.SUBSCRIPTION
 
 
+def test_codex_tui_is_a_subscription_client() -> None:
+    signals = AuthSignals(
+        user_agent="codex-tui/0.144.1 (linux; x86_64)",
+        authorization="Bearer header.payload.signature",
+    )
+
+    assert classify_auth_signals(signals) is AuthMode.SUBSCRIPTION
+    assert classify_client_signals(signals) == "codex"
+
+
 def test_oauth_bearer_token_shapes_are_oauth() -> None:
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature"
 

@@ -21,6 +21,13 @@ import headroom.proxy.handlers.openai as openai_module
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 
+
+@pytest.fixture(autouse=True)
+def _isolate_output_shaper_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep production output-shaper settings out of lifecycle-only tests."""
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------

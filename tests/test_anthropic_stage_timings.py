@@ -96,11 +96,24 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.image_compressor = None
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
+            peek_idle_seconds=lambda *a, **k: 0.0,
             get_or_create=lambda *a, **k: SimpleNamespace(
                 get_frozen_message_count=lambda: 0,
                 get_last_original_messages=lambda: [],
                 get_last_forwarded_messages=lambda: [],
                 record_request=lambda *a, **k: None,
+                # Telemetry surface the handler drives on the real tracker.
+                peek_idle_seconds=lambda *a, **k: 0.0,
+                record_turn_gap=lambda *a, **k: None,
+                note_compression=lambda *a, **k: None,
+                recommended_ttl=lambda *a, **k: None,
+                cached_token_count=lambda: 0,
+                turn_number=lambda: 0,
+                compress_latched=False,
+                latch_compress=lambda: None,
+                recent_compression_ratio=lambda *a, **k: 0.8,
+                conservative_compression_ratio=lambda *a, **k: 0.8,
+                compression_ratio_stddev=lambda: 0.0,
             ),
             resolve_tracker=lambda *a, **k: SimpleNamespace(
                 get_frozen_message_count=lambda: 0,

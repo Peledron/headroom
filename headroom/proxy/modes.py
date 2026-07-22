@@ -3,6 +3,7 @@
 Canonical modes:
 - token: prioritize compression (history may be rewritten for max savings)
 - cache: prioritize provider prefix cache stability (freeze prior turns)
+- hybrid: freeze a stable compressed prefix, compress live deltas, and rebase deliberately
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import logging
 
 from headroom.proxy.proxy_mode_policy import (
     PROXY_MODE_CACHE,
+    PROXY_MODE_HYBRID,
     PROXY_MODE_TOKEN,
     normalize_proxy_mode_decision,
 )
@@ -36,3 +38,13 @@ def is_token_mode(mode: str | None) -> bool:
 def is_cache_mode(mode: str | None) -> bool:
     """Return True when mode resolves to cache mode."""
     return normalize_proxy_mode(mode) == PROXY_MODE_CACHE
+
+
+def is_hybrid_mode(mode: str | None) -> bool:
+    """Return True when mode resolves to hybrid mode."""
+    return normalize_proxy_mode(mode) == PROXY_MODE_HYBRID
+
+
+def preserves_warm_prefix(mode: str | None) -> bool:
+    """Return True for modes that keep a provider-cached prefix immutable."""
+    return normalize_proxy_mode(mode) in {PROXY_MODE_CACHE, PROXY_MODE_HYBRID}

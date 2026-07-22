@@ -1153,3 +1153,57 @@ def test_openai_responses_adapter_floors_when_aggregate_below_threshold():
     assert saved == 0
     assert units_by_category == {"size_floor": len(outputs)}
     assert new_payload == payload
+
+
+def test_openai_responses_adapter_preserves_serena_lifecycle_outputs():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed lifecycle output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    lifecycle_output = " ".join(f"instruction{i}" for i in range(180))
+
+    for tool_name in (
+        "mcp__serena__activate_project",
+        "mcp__serena__initial_instructions",
+        "serena.activate_project",
+        "serena.initial_instructions",
+    ):
+        payload = {
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_lifecycle",
+                    "name": tool_name,
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_lifecycle",
+                    "output": lifecycle_output,
+                },
+            ],
+        }
+
+        new_payload, modified, saved, transforms, units_by_category, strategy_chain, _ = (
+            handler._compress_openai_responses_live_text_units_with_router(
+                payload,
+                model="gpt-5",
+                request_id="req_test",
+            )
+        )
+
+        assert modified is False
+        assert saved == 0
+        assert transforms == []
+        assert new_payload == payload
+        assert units_by_category == {}
+        assert strategy_chain == []

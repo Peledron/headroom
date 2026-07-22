@@ -316,6 +316,42 @@ class _CapturingTransport(httpx.AsyncBaseTransport):
 
 
 class _FakePrefixTracker:
+    # --- telemetry stub (real PrefixCacheTracker interface) ---
+    # No-op/default versions of the methods the handler calls on the real
+    # PrefixCacheTracker regardless of mode, so these doubles don't need to
+    # track the interface by hand as it grows.
+    def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
+        return None
+
+    def note_compression(self, tokens_before, tokens_after):  # noqa: ANN001, ANN201
+        return None
+
+    def recommended_ttl(self, **kwargs):  # noqa: ANN003, ANN201
+        return None
+
+    def latch_compress(self):  # noqa: ANN201
+        return None
+
+    @property
+    def compress_latched(self):  # noqa: ANN201
+        return False
+
+    def cached_token_count(self):  # noqa: ANN201
+        return 0
+
+    def turn_number(self):  # noqa: ANN201
+        return 0
+
+    def recent_compression_ratio(self, default=0.8):  # noqa: ANN001, ANN201
+        return default
+
+    def conservative_compression_ratio(self, *, default=0.8, k=1.0):  # noqa: ANN001, ANN201
+        return default
+
+    def compression_ratio_stddev(self):  # noqa: ANN201
+        return 0.0
+
+    # --- end telemetry stub ---
     def __init__(self, frozen_count: int = 0):
         self._frozen_count = frozen_count
         self._cached_token_count = 0

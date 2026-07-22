@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay real Claude Code sessions through baseline/token/cache simulations."""
+"""Replay real Claude Code sessions through baseline/token/cache/hybrid simulations."""
 
 from __future__ import annotations
 
@@ -25,9 +25,10 @@ from headroom.tokenizers import get_tokenizer
 from headroom.utils import extract_user_query
 
 try:
-    from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_TOKEN
+    from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_HYBRID, PROXY_MODE_TOKEN
 except ImportError:
     PROXY_MODE_CACHE = "cache"
+    PROXY_MODE_HYBRID = "hybrid"
     PROXY_MODE_TOKEN = "token"
 
 DEFAULT_ROOT = Path.home() / ".claude" / "projects"
@@ -818,7 +819,27 @@ def _apply_mode_to_messages(
 
     assert proxy is not None
     assert prefix_tracker is not None
-    if mode == PROXY_MODE_CACHE:
+    hybrid_rebase = False
+    if mode == PROXY_MODE_HYBRID:
+        tokenizer = get_tokenizer(model)
+        total_tokens = tokenizer.count_messages(messages)
+        frozen = prefix_tracker.get_frozen_message_count()
+        kept = prefix_tracker.conservative_compression_ratio(k=1.0)
+        decision = prefix_tracker.hybrid_controller.decide(
+            frozen_message_count=frozen,
+            message_count=len(messages),
+            total_tokens=total_tokens,
+            estimated_savings_tokens=max(0, int(total_tokens * (1.0 - kept))),
+            cached_suffix_tokens=prefix_tracker.cached_token_count(),
+            expected_reads=10.0,
+            p_alive=1.0,
+            context_pressure=total_tokens
+            / max(1, proxy.anthropic_provider.get_context_limit(model)),
+            write_multiplier=1.25,
+        )
+        hybrid_rebase = decision.should_rebase
+
+    if mode in {PROXY_MODE_CACHE, PROXY_MODE_HYBRID} and not hybrid_rebase:
         supports_delta_replay = hasattr(
             AnthropicHandlerMixin, "_extract_cache_stable_last_message_suffix"
         )
@@ -869,7 +890,7 @@ def _apply_mode_to_messages(
 
         compressor = _get_image_compressor()
         if compressor and compressor.has_images(working_messages):
-            if mode == PROXY_MODE_CACHE:
+            if mode in {PROXY_MODE_CACHE, PROXY_MODE_HYBRID}:
                 working_messages = (
                     AnthropicHandlerMixin._compress_latest_user_turn_images_cache_safe(
                         working_messages,
@@ -897,7 +918,7 @@ def _apply_mode_to_messages(
 
     if mode == PROXY_MODE_TOKEN and comp_cache is not None and forwarded != working_messages:
         comp_cache.update_from_result(messages, forwarded)
-    if mode == PROXY_MODE_CACHE:
+    if mode in {PROXY_MODE_CACHE, PROXY_MODE_HYBRID} and not hybrid_rebase:
         forwarded, _ = AnthropicHandlerMixin._restore_frozen_prefix(
             messages,
             forwarded,
@@ -1299,9 +1320,10 @@ def simulate_replays(
         "baseline": ModeSummary(mode="baseline"),
         PROXY_MODE_TOKEN: ModeSummary(mode=PROXY_MODE_TOKEN),
         PROXY_MODE_CACHE: ModeSummary(mode=PROXY_MODE_CACHE),
+        PROXY_MODE_HYBRID: ModeSummary(mode=PROXY_MODE_HYBRID),
     }
 
-    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         print(f"[simulate] mode={mode} sessions={len(replays)}", flush=True)
         worker_count = workers if workers > 0 else max(1, min(8, os.cpu_count() or 1))
         if worker_count > 1 and len(replays) > 1:
@@ -1386,10 +1408,11 @@ def simulate_session_files(
         "baseline": ModeSummary(mode="baseline"),
         PROXY_MODE_TOKEN: ModeSummary(mode=PROXY_MODE_TOKEN),
         PROXY_MODE_CACHE: ModeSummary(mode=PROXY_MODE_CACHE),
+        PROXY_MODE_HYBRID: ModeSummary(mode=PROXY_MODE_HYBRID),
     }
     total = len(session_files)
 
-    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         print(f"[simulate] mode={mode} sessions={total}", flush=True)
         worker_count = workers if workers > 0 else 1
         if worker_count > 1 and total > 1:
@@ -1526,7 +1549,9 @@ def summarize_mode_impact_vs_baseline(
 ) -> dict[str, dict[str, dict[str, float | str]]]:
     baseline = summaries["baseline"]
     result: dict[str, dict[str, dict[str, float | str]]] = {}
-    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
+        if mode not in summaries:
+            continue
         candidate = summaries[mode]
         result[mode] = {
             field: classify_metric_impact(baseline, candidate, field) for field in IMPACT_DIRECTION
@@ -1551,7 +1576,7 @@ def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSumma
     print(
         "mode      raw_tok      cache_tok    cache_read   cache_write   paid_in      paid_out     busts   ttl_exp   rewrite   stable_rw  bust_rw   noncache_rw  retro_rw   total_cost    no_cache"
     )
-    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         summary = summaries[mode]
         print(
             f"{mode:<9} {summary.raw_tokens:>11,} {summary.cache_tokens:>12,} "
@@ -1574,7 +1599,7 @@ def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSumma
     )
     print()
     print("Impact vs baseline")
-    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         impact = impacts[mode]
         print(
             f"{mode}: total_cost={impact['total_cost_usd']['impact']} "
@@ -1624,7 +1649,7 @@ def build_report_markdown(
     impacts = summarize_mode_impact_vs_baseline(summaries)
     model_lines = "\n".join(f"- `{model}`: {count}" for model, count in dataset.models.items())
     rows = []
-    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         summary = summaries[mode]
         rows.append(
             "| "
@@ -1658,7 +1683,7 @@ def build_report_markdown(
             + " |"
         )
     impact_rows = []
-    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         for metric_key, label in (
             ("total_cost_usd", "Total Cost"),
             ("cache_read_tokens", "Cache Read Tokens"),
@@ -1748,7 +1773,7 @@ def build_report_html(
         for model, count in dataset.models.items()
     )
     summary_rows = []
-    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         summary = summaries[mode]
         summary_rows.append(
             "<tr>"
@@ -1774,7 +1799,7 @@ def build_report_html(
             "</tr>"
         )
     impact_rows = []
-    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE, PROXY_MODE_HYBRID):
         for metric_key, label in (
             ("total_cost_usd", "Total Cost"),
             ("cache_read_tokens", "Cache Read Tokens"),

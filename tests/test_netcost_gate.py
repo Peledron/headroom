@@ -238,30 +238,64 @@ class TestNetCostFrozenUnlock:
         assert "router:netcost_frozen_unlock" not in result.transforms_applied
         assert any(t.startswith("netcost:skip:") for t in result.transforms_applied)
 
-    def test_flag_on_block_content_frozen_stays_frozen(self, router, tokenizer, monkeypatch):
-        # The gate is wired into the string and parallel-merge paths only;
-        # block-list frozen content (whose per-block cache_control contract
-        # is not net-cost aware) stays frozen even with a tiny suffix.
-        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
-        big = "log line of output " * 400
-        messages = [
-            {"role": "user", "content": "fetch"},
+    @staticmethod
+    def _frozen_block_messages(tool_text: str, suffix_filler_words: int) -> list[dict]:
+        """A frozen block message (Anthropic tool_result array) at index 1,
+        with a string suffix after it. frozen_message_count=2 puts the block
+        inside the provider's cached prefix."""
+        suffix = "analysis context word " * suffix_filler_words
+        return [
+            {"role": "user", "content": "fetch the records"},
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "tool_result",
                         "tool_use_id": "t1",
-                        "content": [{"type": "text", "text": big}],
+                        "content": [{"type": "text", "text": tool_text}],
                     }
                 ],
             },
+            {"role": "user", "content": suffix},
             {"role": "user", "content": "summarize"},
         ]
+
+    def test_flag_off_block_content_stays_frozen(self, router, tokenizer, monkeypatch):
+        # Default (flag off): a frozen block message is never mutated, however
+        # compressible it is -- the binary floor wins, same as string content.
+        monkeypatch.delenv("HEADROOM_NET_COST_POLICY", raising=False)
+        messages = self._frozen_block_messages(_tool_json(2000), suffix_filler_words=5)
         original = [dict(m) for m in messages]
         result = router.apply([dict(m) for m in messages], tokenizer, frozen_message_count=2)
         assert result.messages[1]["content"] == original[1]["content"]
-        assert "router:netcost_frozen_unlock" not in result.transforms_applied
+        assert "router:netcost_frozen_block_unlock" not in result.transforms_applied
+
+    def test_flag_on_block_content_unlocks_when_shave_dominates(
+        self, router, tokenizer, monkeypatch
+    ):
+        # #856 P2b-block: huge shave in a frozen tool_result array, tiny suffix
+        # after it -> the message-level break-even gate clears the deep block
+        # edit and it proceeds. Mirrors the string frozen-unlock story.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = self._frozen_block_messages(_tool_json(2000), suffix_filler_words=5)
+        original = [dict(m) for m in messages]
+        result = router.apply([dict(m) for m in messages], tokenizer, frozen_message_count=2)
+        assert result.messages[1]["content"] != original[1]["content"]
+        assert "router:netcost_frozen_block_unlock" in result.transforms_applied
+
+    def test_flag_on_block_content_stays_frozen_when_suffix_dominates(
+        self, router, tokenizer, monkeypatch
+    ):
+        # Modest shave, big cached suffix -> the floor opens (the block runs
+        # through the compressor) but the message-level gate rejects it, so the
+        # frozen block is left byte-identical and a netcost:skip marker fires.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = self._frozen_block_messages(_tool_json(300), suffix_filler_words=40000)
+        original = [dict(m) for m in messages]
+        result = router.apply([dict(m) for m in messages], tokenizer, frozen_message_count=2)
+        assert result.messages[1]["content"] == original[1]["content"]
+        assert "router:netcost_frozen_block_unlock" not in result.transforms_applied
+        assert any(t.startswith("netcost:skip:") for t in result.transforms_applied)
 
 
 class TestNetCostBatchReclaim:

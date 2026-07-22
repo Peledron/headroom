@@ -2843,23 +2843,55 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "todowrite",
         "todoread",
         "webfetch",
+        "websearch",
         "question",
         "skill",
     }
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
 _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
+_TOOL_SEARCH_CORE_PREFIXES = ("mcp__tokensave__", "mcp__serena__")
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
 # guidance: standard calling is better under ~10 tools).
 _TOOL_SEARCH_MIN_TOOLS = 12
+
+
+def referenced_tool_names(messages: Any) -> frozenset[str]:
+    """Lowercased names of tools referenced by tool_use blocks in messages.
+
+    A tool whose schema is deferred but whose name appears in a historical
+    tool_use block makes Anthropic reject the request ("Tool reference 'X'
+    not found in available tools"), which broke Claude Code compaction
+    requests on 2026-07-17. Referenced tools must stay resident.
+    """
+    names: set[str] = set()
+    if not isinstance(messages, list):
+        return frozenset()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in (
+                "tool_use",
+                "server_tool_use",
+            ):
+                name = block.get("name")
+                if isinstance(name, str) and name:
+                    names.add(name.lower())
+    return frozenset(names)
 
 
 def inject_tool_search_deferral(
     tools: Any,
     *,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    core_prefixes: tuple[str, ...] = _TOOL_SEARCH_CORE_PREFIXES,
     search_type: str = _TOOL_SEARCH_DEFAULT_TYPE,
     search_name: str = _TOOL_SEARCH_DEFAULT_NAME,
+    referenced: frozenset[str] = frozenset(),
 ) -> Any:
     """Return a new ``tools`` list with non-core tools deferred + a search tool
     injected, or the original list unchanged when injection doesn't apply.
@@ -2885,11 +2917,19 @@ def inject_tool_search_deferral(
     out: list[Any] = [search_tool]
     deferred = 0
     dropped_cache_control = False
+    dropped_cache_ttl: str | None = None
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") or tool.get("name") in core_tools:
+        tool_name = str(tool.get("name", "")).lower() if isinstance(tool, dict) else ""
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type")
+            or tool_name in core_tools
+            or tool_name in referenced
+            or any(tool_name.startswith(prefix) for prefix in core_prefixes)
+        ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)
@@ -2901,8 +2941,15 @@ def inject_tool_search_deferral(
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        if new_tool.pop("cache_control", None) is not None:
+        popped_cc = new_tool.pop("cache_control", None)
+        if popped_cc is not None:
             dropped_cache_control = True
+            # remember the client's TTL so the relocated breakpoint does not
+            # silently downgrade a 1h block to the 5m default (write cost is
+            # the lesser issue, the early expiry re-write on the next >5min
+            # pause is the real one)
+            if isinstance(popped_cc, dict) and isinstance(popped_cc.get("ttl"), str):
+                dropped_cache_ttl = popped_cc["ttl"]
         out.append(new_tool)
         deferred += 1
 
@@ -2912,7 +2959,10 @@ def inject_tool_search_deferral(
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).
     if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
-        last_resident_real["cache_control"] = {"type": "ephemeral"}
+        relocated_cc: dict[str, Any] = {"type": "ephemeral"}
+        if dropped_cache_ttl is not None:
+            relocated_cc["ttl"] = dropped_cache_ttl
+        last_resident_real["cache_control"] = relocated_cc
     return out
 
 

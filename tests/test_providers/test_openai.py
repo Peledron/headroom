@@ -3,6 +3,8 @@
 import pytest
 
 from headroom.providers.openai import (
+    _PRICING_LAST_UPDATED,
+    _PRICING_SOURCE_URL,
     _get_encoding_name_for_model,
 )
 
@@ -63,6 +65,13 @@ class TestOpenAIModelLimits:
     def test_get_context_limit_o1(self, openai_provider):
         assert openai_provider.get_context_limit("o1") == 200000
 
+    @pytest.mark.parametrize(
+        "model",
+        ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+    )
+    def test_get_context_limit_gpt56_api(self, openai_provider, model):
+        assert openai_provider.get_context_limit(model) == 1_050_000
+
     def test_get_context_limit_unknown_model(self, openai_provider):
         # Unknown models now get a fallback value instead of raising
         limit = openai_provider.get_context_limit("unknown-model")
@@ -77,6 +86,44 @@ class TestOpenAIModelLimits:
 
 
 class TestOpenAICostEstimation:
+    def test_pricing_provenance_is_current(self):
+        assert _PRICING_LAST_UPDATED.isoformat() == "2026-07-13"
+        assert _PRICING_SOURCE_URL == "https://platform.openai.com/docs/pricing"
+
+    @pytest.mark.parametrize(
+        ("model", "input_price", "cached_price", "output_price"),
+        (
+            ("gpt-5.6-sol", 5.00, 0.50, 30.00),
+            ("gpt-5.6-terra", 2.50, 0.25, 15.00),
+            ("gpt-5.6-luna", 1.00, 0.10, 6.00),
+        ),
+    )
+    def test_gpt56_official_standard_pricing(
+        self, openai_provider, model, input_price, cached_price, output_price
+    ):
+        assert openai_provider.estimate_cost(1_000_000, 0, model) == input_price
+        assert (
+            openai_provider.estimate_cost(
+                1_000_000, 0, model, cached_tokens=1_000_000
+            )
+            == cached_price
+        )
+        assert openai_provider.estimate_cost(0, 1_000_000, model) == output_price
+
+    def test_o3_uses_current_standard_price(self, openai_provider):
+        assert openai_provider.estimate_cost(1_000_000, 1_000_000, "o3") == 10.00
+
+    def test_cached_tokens_are_clamped_to_total_input(self, openai_provider):
+        assert (
+            openai_provider.estimate_cost(
+                1_000_000,
+                0,
+                "gpt-5.6-sol",
+                cached_tokens=2_000_000,
+            )
+            == 0.50
+        )
+
     def test_estimate_cost_input_only(self, openai_provider):
         cost = openai_provider.estimate_cost(
             input_tokens=1000000,

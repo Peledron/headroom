@@ -33,6 +33,7 @@ import tempfile
 import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -237,6 +238,9 @@ _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 # ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
 # so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
+_CLAUDE_SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
+_HEADROOM_SUBAGENT_MODEL_CAP_ENV = "HR_SUBAGENT_MODEL_CAP"
+_DEFAULT_SUBAGENT_MODEL_CAP = "claude-sonnet-5"
 _CONTEXT_1M_SUFFIX = "[1m]"
 # Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
 # current default Opus; the suffix logic preserves any model the user did set.
@@ -254,6 +258,23 @@ def _resolve_1m_model(current: str | None) -> str:
     """
     base = (current or "").strip() or _DEFAULT_1M_MODEL
     return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+
+
+def _configure_claude_subagent_model(env: dict[str, str]) -> str | None:
+    """Pin Claude Code subagents through its native model-selection signal.
+
+    This avoids inferring agent identity from mutable system-prompt text at the
+    proxy. An explicit ``CLAUDE_CODE_SUBAGENT_MODEL`` always wins. Set
+    ``HR_SUBAGENT_MODEL_CAP=0`` to leave Claude Code's default untouched.
+    """
+    existing = env.get(_CLAUDE_SUBAGENT_MODEL_ENV, "").strip()
+    if existing:
+        return existing
+    cap = env.get(_HEADROOM_SUBAGENT_MODEL_CAP_ENV, _DEFAULT_SUBAGENT_MODEL_CAP).strip()
+    if not cap or cap == "0":
+        return None
+    env[_CLAUDE_SUBAGENT_MODEL_ENV] = cap
+    return cap
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -2395,6 +2416,184 @@ def _offer_dangling_codex_recovery(active_home: Path) -> None:
     for candidate in candidates:
         report = recover_codex_home(source=candidate, target=active_home)
         click.echo(f"Recovered Codex state. Backup retained at {report.backup_dir}")
+# Top-level entries under the Codex home that are ephemeral caches or logs.
+# Codex recreates them on demand, and copying them into the per-session
+# overlay can push a tmpfs-backed temp dir over its per-user quota
+# (errno 122), which used to crash the wrap before Codex even launched.
+_CODEX_OVERLAY_SKIP_TOP_LEVEL = frozenset({"tmp", ".tmp", "cache", "log", "logs"})
+
+
+def _codex_overlay_ignore(source_home: Path) -> Callable[..., list[str]]:
+    """Build the copytree ignore callable for the session home overlay.
+
+    Skips Unix sockets and FIFOs anywhere (they cannot be copied) and, at the
+    top level only, the heavyweight ephemeral entries in
+    ``_CODEX_OVERLAY_SKIP_TOP_LEVEL`` plus the rolling ``logs_*.sqlite``
+    databases. Nothing written into the overlay propagates back, so the
+    skipped entries are pure scratch as far as the wrapped session goes.
+    """
+
+    def _ignore(directory: Any, names: list[str]) -> list[str]:
+        dir_path = Path(directory)
+        at_top = dir_path == source_home
+        skipped: list[str] = []
+        for name in names:
+            entry = dir_path / name
+            try:
+                if entry.is_socket() or entry.is_fifo():
+                    skipped.append(name)
+                    continue
+            except OSError:
+                skipped.append(name)
+                continue
+            if at_top and (
+                name in _CODEX_OVERLAY_SKIP_TOP_LEVEL
+                or (name.startswith("logs_") and ".sqlite" in name)
+            ):
+                skipped.append(name)
+        return skipped
+
+    return _ignore
+
+
+def _is_out_of_space_error(exc: shutil.Error) -> bool:
+    """Whether any error collected by copytree is a disk-full or quota error."""
+    markers = (f"[Errno {errno.ENOSPC}]", f"[Errno {errno.EDQUOT}]")
+    return any(
+        marker in str(entry[-1]) for entry in exc.args[0] for marker in markers
+    )
+
+
+def _warn_codex_overlay_errors(exc: shutil.Error) -> None:
+    """Report files that could not be seeded into the session home and move on.
+
+    A partial overlay still lets Codex start. Crashing here would take the
+    whole wrap down over a single uncopyable cache file.
+    """
+    copy_errors = exc.args[0]
+    first = str(copy_errors[0][-1]) if copy_errors else ""
+    click.echo(
+        f"Warning: {len(copy_errors)} file(s) could not be copied into the "
+        f"session Codex home (first: {first}). Continuing with a partial copy.",
+        err=True,
+    )
+
+
+def _seed_codex_session_home(source_home: Path, session_home: Path) -> None:
+    """Copy the active Codex home into the session overlay directory."""
+    shutil.copytree(
+        source_home,
+        session_home,
+        dirs_exist_ok=True,
+        ignore=_codex_overlay_ignore(source_home),
+    )
+
+
+# Session-home entries synced BACK to the real Codex home when the wrap
+# exits. The overlay is otherwise throwaway, which used to silently discard
+# everything Codex wrote during the wrapped run: new session rollouts (so a
+# later `codex resume` could not find them), command history, and refreshed
+# auth tokens (whose loss can log the user out when the provider rotates
+# refresh tokens). config.toml is deliberately NOT synced: the wrap injects
+# the Headroom provider into the overlay copy, and writing that back would
+# leak the injection into the user's real config.
+_CODEX_OVERLAY_SYNC_BACK_DIRS = ("sessions", "archived_sessions")
+_CODEX_OVERLAY_SYNC_BACK_FILES = ("history.jsonl", "auth.json")
+
+
+def _sync_back_file(overlay_file: Path, real_file: Path) -> bool:
+    """Copy one overlay file back to the real home if it is the newer version.
+
+    Seeding preserves mtimes (copytree copies with copy2), so a file Codex
+    touched in the overlay is strictly newer than its seeded original. A
+    real-home file newer than the overlay copy was changed by a concurrent
+    Codex instance and is left alone, never clobber newer data.
+    """
+    try:
+        if real_file.exists():
+            if overlay_file.stat().st_mtime_ns <= real_file.stat().st_mtime_ns:
+                return False
+        real_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(overlay_file, real_file)
+        return True
+    except OSError:
+        return False
+
+
+def _sync_codex_session_home_back(source_home: Path, session_home: Path) -> None:
+    """Propagate session data Codex wrote in the overlay back to the real home.
+
+    Additive only: copies new and newer files, never deletes, never touches
+    anything outside the sync-back allowlist.
+    """
+    synced = 0
+    for dir_name in _CODEX_OVERLAY_SYNC_BACK_DIRS:
+        overlay_dir = session_home / dir_name
+        if not overlay_dir.is_dir():
+            continue
+        for overlay_file in overlay_dir.rglob("*"):
+            if not overlay_file.is_file():
+                continue
+            real_file = source_home / overlay_file.relative_to(session_home)
+            synced += _sync_back_file(overlay_file, real_file)
+    for file_name in _CODEX_OVERLAY_SYNC_BACK_FILES:
+        overlay_file = session_home / file_name
+        if overlay_file.is_file():
+            synced += _sync_back_file(overlay_file, source_home / file_name)
+    if synced:
+        click.echo(
+            f"  Synced {synced} session file(s) back to {source_home}", err=True
+        )
+
+
+@contextmanager
+def _codex_session_home_overlay() -> Any:
+    """Seed a temporary Codex home from the active home and point the process at it."""
+    source_home = _codex_home_dir()
+    original_codex_home = os.environ.get("CODEX_HOME")
+
+    with ExitStack() as stack:
+        session_home = Path(
+            stack.enter_context(tempfile.TemporaryDirectory(prefix="headroom-codex-home-"))
+        )
+        if source_home.exists():
+            try:
+                _seed_codex_session_home(source_home, session_home)
+            except shutil.Error as exc:
+                if _is_out_of_space_error(exc):
+                    # The default temp dir is usually a tmpfs with a per-user
+                    # quota. Retry once on the disk-backed cache dir before
+                    # settling for a partial overlay.
+                    fallback_base = Path.home() / ".cache" / "headroom"
+                    fallback_base.mkdir(parents=True, exist_ok=True)
+                    session_home = Path(
+                        stack.enter_context(
+                            tempfile.TemporaryDirectory(
+                                prefix="headroom-codex-home-", dir=fallback_base
+                            )
+                        )
+                    )
+                    try:
+                        _seed_codex_session_home(source_home, session_home)
+                    except shutil.Error as retry_exc:
+                        _warn_codex_overlay_errors(retry_exc)
+                else:
+                    _warn_codex_overlay_errors(exc)
+
+        os.environ["CODEX_HOME"] = str(session_home)
+        try:
+            yield session_home
+        finally:
+            try:
+                _sync_codex_session_home_back(source_home, session_home)
+            except Exception as exc:
+                click.echo(
+                    f"Warning: Codex session-home sync-back failed: {exc}", err=True
+                )
+            if original_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = original_codex_home
 
 
 def _codex_config_paths() -> tuple[Path, Path]:
@@ -5301,6 +5500,13 @@ def claude(
             click.echo(
                 f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
                 "(1M context window; issue #1158)"
+            )
+
+        _subagent_model = _configure_claude_subagent_model(env)
+        if _subagent_model and verbose:
+            click.echo(
+                f"  {_CLAUDE_SUBAGENT_MODEL_ENV}={_subagent_model} "
+                "(native Claude Code subagent model cap)"
             )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)

@@ -134,6 +134,12 @@ def compute_window_tokens(start_ts: float, end_ts: float) -> WindowTokens:
     totals = WindowTokens()
     by_model: dict[str, WindowTokens] = {}
     unattributed = WindowTokens()
+    # Claude Code writes one assistant response across several transcript
+    # lines, one per content block, each carrying the same request-level
+    # message.usage. Summing per line multiplies a response by its block
+    # count and inflates the window by millions of phantom input tokens.
+    # Count each response once, keyed by the Anthropic message id.
+    seen_message_ids: set[str] = set()
 
     for path in find_transcript_files():
         for line in _read_transcript_lines(path):
@@ -160,6 +166,14 @@ def compute_window_tokens(start_ts: float, end_ts: float) -> WindowTokens:
             usage = msg.get("usage")
             if not usage:
                 continue
+
+            # Lines that carry a message id are deduped so each response is
+            # counted once. Lines without an id keep per-line behavior.
+            message_id = msg.get("id")
+            if message_id is not None:
+                if message_id in seen_message_ids:
+                    continue
+                seen_message_ids.add(message_id)
 
             _add_usage_to_tokens(totals, usage)
 

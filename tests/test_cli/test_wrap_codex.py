@@ -9,7 +9,9 @@ way a user would from the shell.
 
 from __future__ import annotations
 
+import errno
 import shutil
+import socket
 import sqlite3
 import sys
 from pathlib import Path
@@ -1054,7 +1056,234 @@ def test_wrap_codex_prepare_only_respects_codex_home(
     assert not (tmp_path / ".codex" / "config.toml").exists()
 
 
-def test_wrap_codex_launch_uses_durable_codex_home(
+def test_codex_session_home_overlay_seeds_active_home_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config_file = codex_home / "config.toml"
+    auth_file = codex_home / "auth.json"
+    original_config = '[profiles.default]\nmodel = "gpt-4o"\n'
+    original_auth = '{"auth_mode": "apikey"}'
+    config_file.write_text(original_config, encoding="utf-8")
+    auth_file.write_text(original_auth, encoding="utf-8")
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        seeded_config = (session_home / "config.toml").read_text(encoding="utf-8")
+        seeded_auth = (session_home / "auth.json").read_text(encoding="utf-8")
+        assert seeded_config == original_config
+        assert seeded_auth == original_auth
+        (session_home / "config.toml").write_text('model_provider = "headroom"\n', encoding="utf-8")
+        assert config_file.read_text(encoding="utf-8") == original_config
+
+    assert not session_home.exists()
+    assert config_file.read_text(encoding="utf-8") == original_config
+    assert auth_file.read_text(encoding="utf-8") == original_auth
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or not hasattr(socket, "AF_UNIX"),
+    reason="requires POSIX Unix domain sockets",
+)
+def test_codex_session_home_overlay_skips_unix_sockets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    socket_dir = codex_home / "vendor_imports" / "skills" / ".git"
+    socket_dir.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.chdir(codex_home)
+
+    head_file = socket_dir / "HEAD"
+    head_file.write_text("ref: refs/heads/main\n", encoding="utf-8")
+    socket_file = socket_dir / "fsmonitor--daemon.ipc"
+    relative_socket_file = socket_file.relative_to(codex_home)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as fsmonitor_socket:
+        try:
+            fsmonitor_socket.bind(str(relative_socket_file))
+        except PermissionError as exc:
+            if exc.errno in {errno.EPERM, errno.EACCES}:
+                pytest.skip("sandbox does not allow AF_UNIX socket binding")
+            raise
+
+        with wrap_mod._codex_session_home_overlay() as session_home:
+            session_socket_dir = session_home / socket_dir.relative_to(codex_home)
+            assert (session_socket_dir / "HEAD").read_text(encoding="utf-8") == (
+                "ref: refs/heads/main\n"
+            )
+            assert not (session_socket_dir / socket_file.name).exists()
+
+        assert socket_file.is_socket()
+
+
+def test_codex_session_home_overlay_skips_ephemeral_top_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    (codex_home / "config.toml").write_text("model = 'gpt-4o'\n", encoding="utf-8")
+    (codex_home / "sessions").mkdir()
+    (codex_home / "sessions" / "rollout.jsonl").write_text("{}\n", encoding="utf-8")
+    for name in ("tmp", ".tmp", "cache", "log", "logs"):
+        (codex_home / name).mkdir()
+        (codex_home / name / "scratch.bin").write_bytes(b"x" * 64)
+    (codex_home / "logs_2.sqlite").write_bytes(b"db")
+    (codex_home / "logs_2.sqlite-wal").write_bytes(b"wal")
+    (codex_home / "state_5.sqlite").write_bytes(b"state")
+    # A nested dir named tmp is real data and must survive the copy.
+    nested = codex_home / "skills" / "tmp"
+    nested.mkdir(parents=True)
+    (nested / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        assert (session_home / "config.toml").exists()
+        assert (session_home / "sessions" / "rollout.jsonl").exists()
+        assert (session_home / "state_5.sqlite").exists()
+        assert (session_home / "skills" / "tmp" / "keep.txt").exists()
+        for name in ("tmp", ".tmp", "cache", "log", "logs"):
+            assert not (session_home / name).exists()
+        assert not (session_home / "logs_2.sqlite").exists()
+        assert not (session_home / "logs_2.sqlite-wal").exists()
+
+
+def test_codex_session_home_overlay_falls_back_when_out_of_space(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "config.toml").write_text("model = 'gpt-4o'\n", encoding="utf-8")
+
+    real_seed = wrap_mod._seed_codex_session_home
+    calls: list[Path] = []
+
+    def _seed_quota_once(source_home: Path, session_home: Path) -> None:
+        calls.append(session_home)
+        if len(calls) == 1:
+            raise shutil.Error(
+                [(str(source_home), str(session_home), "[Errno 122] Disk quota exceeded")]
+            )
+        real_seed(source_home, session_home)
+
+    monkeypatch.setattr(wrap_mod, "_seed_codex_session_home", _seed_quota_once)
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        assert len(calls) == 2
+        assert session_home == calls[1]
+        fallback_base = tmp_path / ".cache" / "headroom"
+        assert fallback_base in session_home.parents
+        assert (session_home / "config.toml").exists()
+
+    assert not session_home.exists()
+
+
+def test_codex_session_home_overlay_partial_copy_warns_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "config.toml").write_text("model = 'gpt-4o'\n", encoding="utf-8")
+
+    def _seed_permission_error(source_home: Path, session_home: Path) -> None:
+        raise shutil.Error(
+            [(str(source_home), str(session_home), "[Errno 13] Permission denied")]
+        )
+
+    monkeypatch.setattr(wrap_mod, "_seed_codex_session_home", _seed_permission_error)
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        assert session_home.exists()
+
+    err = capsys.readouterr().err
+    assert "could not be copied" in err
+    assert "Permission denied" in err
+
+
+def test_codex_session_home_overlay_syncs_session_data_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os as _os
+
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    original_config = "model = 'gpt-4o'\n"
+    (codex_home / "config.toml").write_text(original_config, encoding="utf-8")
+    sessions = codex_home / "sessions"
+    sessions.mkdir()
+    (sessions / "old-rollout.jsonl").write_text('{"turn": 1}\n', encoding="utf-8")
+    # Push the seeded mtimes into the past so overlay writes are strictly newer.
+    past = 1_000_000_000
+    for f in (codex_home / "config.toml", sessions / "old-rollout.jsonl"):
+        _os.utime(f, (past, past))
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        (session_home / "sessions" / "old-rollout.jsonl").write_text(
+            '{"turn": 1}\n{"turn": 2}\n', encoding="utf-8"
+        )
+        (session_home / "sessions" / "new-rollout.jsonl").write_text(
+            '{"turn": 1}\n', encoding="utf-8"
+        )
+        (session_home / "history.jsonl").write_text('{"cmd": "ls"}\n', encoding="utf-8")
+        (session_home / "auth.json").write_text('{"token": "fresh"}', encoding="utf-8")
+        (session_home / "config.toml").write_text(
+            'model_provider = "headroom"\n', encoding="utf-8"
+        )
+
+    updated = (codex_home / "sessions" / "old-rollout.jsonl").read_text(encoding="utf-8")
+    assert updated == '{"turn": 1}\n{"turn": 2}\n'
+    assert (codex_home / "sessions" / "new-rollout.jsonl").exists()
+    assert (codex_home / "history.jsonl").read_text(encoding="utf-8") == '{"cmd": "ls"}\n'
+    assert (codex_home / "auth.json").read_text(encoding="utf-8") == '{"token": "fresh"}'
+    # The injected provider config must never leak back into the real home.
+    assert (codex_home / "config.toml").read_text(encoding="utf-8") == original_config
+
+
+def test_codex_session_home_overlay_sync_back_never_clobbers_newer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os as _os
+    import time as _time
+
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    sessions = codex_home / "sessions"
+    sessions.mkdir()
+    rollout = sessions / "rollout.jsonl"
+    rollout.write_text("seeded\n", encoding="utf-8")
+    _os.utime(rollout, (1_000_000_000, 1_000_000_000))
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        (session_home / "sessions" / "rollout.jsonl").write_text(
+            "overlay-change\n", encoding="utf-8"
+        )
+        # A concurrent Codex instance updates the real file to something newer
+        # than the overlay's version.
+        rollout.write_text("concurrent-newer\n", encoding="utf-8")
+        future = _time.time() + 3600
+        _os.utime(rollout, (future, future))
+
+    assert rollout.read_text(encoding="utf-8") == "concurrent-newer\n"
+
+
+def test_wrap_codex_launch_uses_session_scoped_codex_home(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)

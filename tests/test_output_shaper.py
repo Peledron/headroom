@@ -10,13 +10,13 @@ import copy
 from typing import Any
 
 from headroom.proxy.output_shaper import (
-    LEGACY_THINKING_FLOOR,
     OutputShaperSettings,
     TurnKind,
     apply_openai_responses_verbosity_steering,
     apply_verbosity_steering,
     classify_openai_responses_input,
     classify_turn,
+    request_uses_prompt_caching,
     route_effort,
     route_openai_reasoning_effort,
     route_openai_text_verbosity,
@@ -165,33 +165,35 @@ class TestVerbositySteering:
 class TestRouteEffort:
     def test_lowers_explicit_effort_on_mechanical_turn(self):
         body = {"output_config": {"effort": "xhigh"}}
-        labels = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
+        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
         assert body["output_config"]["effort"] == "low"
         assert labels == ["output_shaper:effort:xhigh->low"]
+        assert decision == "lowered"
 
     def test_never_injects_effort_when_absent(self):
         body: dict[str, Any] = {"messages": []}
-        labels = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
+        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
         assert "output_config" not in body
         assert labels == []
+        assert decision is None
 
     def test_effort_untouched_on_new_ask(self):
         body = {"output_config": {"effort": "xhigh"}}
-        assert route_effort(body, TurnKind.NEW_USER_ASK, ENABLED) == []
+        assert route_effort(body, TurnKind.NEW_USER_ASK, ENABLED) == ([], None)
         assert body["output_config"]["effort"] == "xhigh"
 
     def test_effort_untouched_on_error_continuation(self):
         body = {"output_config": {"effort": "xhigh"}}
-        assert route_effort(body, TurnKind.ERROR_CONTINUATION, ENABLED) == []
+        assert route_effort(body, TurnKind.ERROR_CONTINUATION, ENABLED) == ([], None)
         assert body["output_config"]["effort"] == "xhigh"
 
     def test_effort_already_at_target_untouched(self):
         body = {"output_config": {"effort": "low"}}
-        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == []
+        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == ([], None)
 
     def test_unknown_effort_value_untouched(self):
         body = {"output_config": {"effort": "turbo"}}
-        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == []
+        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == ([], None)
         assert body["output_config"]["effort"] == "turbo"
 
     def test_configurable_mechanical_effort(self):
@@ -200,21 +202,91 @@ class TestRouteEffort:
         route_effort(body, TurnKind.MECHANICAL_CONTINUATION, settings)
         assert body["output_config"]["effort"] == "medium"
 
-    def test_legacy_thinking_budget_clamped(self):
-        body = {"thinking": {"type": "enabled", "budget_tokens": 32000}}
-        labels = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert body["thinking"]["budget_tokens"] == LEGACY_THINKING_FLOOR
-        assert body["thinking"]["type"] == "enabled"  # never toggled
-        assert labels == [f"output_shaper:thinking_budget:32000->{LEGACY_THINKING_FLOOR}"]
+    def test_pins_effort_when_tool_cache_control_present(self):
+        body = {
+            "output_config": {"effort": "xhigh"},
+            "tools": [{"name": "read_file", "cache_control": {"type": "ephemeral"}}],
+        }
+        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
+        assert labels == []
+        assert decision == "pinned"
+        assert body["output_config"]["effort"] == "xhigh"
 
-    def test_legacy_budget_at_floor_untouched(self):
-        body = {"thinking": {"type": "enabled", "budget_tokens": LEGACY_THINKING_FLOOR}}
-        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == []
+    def test_pins_effort_when_system_cache_control_present(self):
+        body = {
+            "output_config": {"effort": "xhigh"},
+            "system": [{"type": "text", "text": "Sys.", "cache_control": {"type": "ephemeral"}}],
+        }
+        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
+        assert labels == []
+        assert decision == "pinned"
+        assert body["output_config"]["effort"] == "xhigh"
 
-    def test_adaptive_thinking_untouched(self):
-        body = {"thinking": {"type": "adaptive"}}
-        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == []
-        assert body["thinking"] == {"type": "adaptive"}
+    def test_pins_effort_when_message_cache_control_present(self):
+        body = {
+            "output_config": {"effort": "xhigh"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                    ],
+                }
+            ],
+        }
+        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
+        assert labels == []
+        assert decision == "pinned"
+        assert body["output_config"]["effort"] == "xhigh"
+
+    def test_no_pin_without_cache_control(self):
+        body = {"output_config": {"effort": "xhigh"}, "tools": [{"name": "read_file"}]}
+        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
+        assert labels == ["output_shaper:effort:xhigh->low"]
+        assert decision == "lowered"
+
+
+# ---------------------------------------------------------------------------
+# request_uses_prompt_caching
+# ---------------------------------------------------------------------------
+
+
+class TestRequestUsesPromptCaching:
+    def test_false_for_plain_body(self):
+        body = {
+            "system": "Sys.",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "read_file"}],
+        }
+        assert request_uses_prompt_caching(body) is False
+
+    def test_true_for_tool_cache_control(self):
+        body = {"tools": [{"name": "read_file", "cache_control": {"type": "ephemeral"}}]}
+        assert request_uses_prompt_caching(body) is True
+
+    def test_true_for_system_block_cache_control(self):
+        body = {"system": [{"type": "text", "text": "Sys.", "cache_control": {"type": "ephemeral"}}]}
+        assert request_uses_prompt_caching(body) is True
+
+    def test_true_for_message_content_cache_control(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                    ],
+                }
+            ]
+        }
+        assert request_uses_prompt_caching(body) is True
+
+    def test_false_for_string_system(self):
+        assert request_uses_prompt_caching({"system": "Sys."}) is False
+
+    def test_false_for_string_message_content(self):
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        assert request_uses_prompt_caching(body) is False
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +321,19 @@ class TestShapeRequest:
         ]
         assert body["output_config"]["effort"] == "low"
         assert body["system"][1]["text"] == steering_text(2)
+        assert result.effort_decision == "lowered"
+
+    def test_pinned_effort_leaves_body_untouched_but_reports_decision(self):
+        body = {
+            "system": "Sys.",
+            "messages": _mechanical_messages(),
+            "output_config": {"effort": "xhigh"},
+            "tools": [{"name": "read_file", "cache_control": {"type": "ephemeral"}}],
+        }
+        result = shape_request(body, ENABLED)
+        assert body["output_config"]["effort"] == "xhigh"
+        assert result.effort_decision == "pinned"
+        assert "output_shaper:effort:xhigh->low" not in result.labels
 
     def test_new_ask_gets_steering_but_keeps_effort(self):
         body = {

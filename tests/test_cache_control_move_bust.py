@@ -224,3 +224,30 @@ def test_normalize_ttl_survives_many_turns():
         conv = normalize_message_cache_control(conv)
         assert _markers(conv) == 1
         assert conv[-1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+def test_latest_message_cache_control_ttl_survives_precompression_strip():
+    from headroom.cache.prefix_tracker import latest_message_cache_control_ttl
+
+    original = [
+        B("user", "old", cc=True),
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "new delta",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        },
+    ]
+
+    ttl = latest_message_cache_control_ttl(original)
+    stripped = _strip_cache_control(original)
+    normalized = normalize_message_cache_control(stripped, force_ttl=ttl)
+
+    assert ttl == "1h"
+    assert normalized[-1]["content"][-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
+    assert _strip_cache_control(normalized) == stripped

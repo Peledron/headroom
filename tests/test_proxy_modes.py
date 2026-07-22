@@ -4,16 +4,20 @@ import pytest
 
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
+    PROXY_MODE_HYBRID,
     PROXY_MODE_TOKEN,
     is_cache_mode,
+    is_hybrid_mode,
     is_token_mode,
     normalize_proxy_mode,
+    preserves_warm_prefix,
 )
 
 
 def test_proxy_mode_normalizes_canonical_values() -> None:
     assert normalize_proxy_mode("token") == PROXY_MODE_TOKEN
     assert normalize_proxy_mode("cache") == PROXY_MODE_CACHE
+    assert normalize_proxy_mode("hybrid") == PROXY_MODE_HYBRID
 
 
 def test_proxy_mode_normalizes_legacy_aliases() -> None:
@@ -30,6 +34,10 @@ def test_proxy_mode_invalid_falls_back_to_default() -> None:
 def test_proxy_mode_predicates() -> None:
     assert is_token_mode("token_headroom") is True
     assert is_cache_mode("cost_savings") is True
+    assert is_hybrid_mode("cache_hybrid") is True
+    assert preserves_warm_prefix("cache") is True
+    assert preserves_warm_prefix("hybrid") is True
+    assert preserves_warm_prefix("token") is False
 
 
 def test_stats_reports_configured_mode_for_compression_cache() -> None:

@@ -265,8 +265,18 @@ bedrock = [
 html = [
     "trafilatura>=1.6.0",
 ]
+# Comprehensive LLM benchmarks
+optical = [
+    "pillow>=10.0.0",
+]
+benchmark = [
+    "lm-eval[api]>=0.4.0",
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+]
 # Development dependencies
 dev = [
+    "pillow>=10.0.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
@@ -325,6 +335,9 @@ sandbox = [
 
 [project.scripts]
 headroom = "headroom.cli:main"
+headroom-bootstrap-agent-tools = "headroom.cli.bootstrap_agent_tools:main"
+headroom-codex-tool-budget = "headroom.cli.codex_tool_budget:main"
+headroom-claude-tool-budget = "headroom.cli.claude_tool_budget:main"
 
 [project.urls]
 Homepage = "https://headroom-docs.vercel.app"
@@ -508,4 +521,9 @@ exclude_lines = [
     "raise NotImplementedError",
     "if TYPE_CHECKING:",
     "if __name__ == .__main__.:",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.7.0",
 ]

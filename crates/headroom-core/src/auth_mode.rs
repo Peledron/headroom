@@ -79,6 +79,7 @@ const SUBSCRIPTION_UA_PREFIXES: &[&str] = &[
     "claude-cli/",
     "claude-code/",
     "codex-cli/",
+    "codex-tui/",
     "cursor/",
     "claude-vscode/",
     "github-copilot/",

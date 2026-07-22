@@ -13,10 +13,141 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy import runtime_env
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.transforms.observation_masking import (
+    apply_candidates,
+    discover_candidates,
+    masking_gate_gain,
+)
+
+
+def _masking_fixture_messages():  # noqa: ANN202
+    return [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "mask-1", "name": "Bash", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "mask-1", "content": "large " * 40}
+            ],
+        },
+        {"role": "assistant", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "assistant", "content": "three"},
+    ]
+
+
+class _MaskGatePolicy:
+    def __init__(self, gain: float):
+        self.gain = gain
+
+    def net_mutation_gain(self, *args):  # noqa: ANN002, ANN201
+        return self.gain
+
+
+class _MaskStore:
+    def __init__(self):
+        self.calls = 0
+
+    def store(self, **kwargs):  # noqa: ANN003, ANN201
+        self.calls += 1
+        return kwargs["explicit_hash"]
+
+
+@pytest.mark.parametrize("gate_gain, should_mask", [(-1.0, False), (1.0, True)])
+def test_observation_masking_respects_explicit_mutation_gate(gate_gain, should_mask):  # noqa: ANN001
+    messages = _masking_fixture_messages()
+    original = [dict(message) for message in messages]
+    count_tokens = lambda text: 1 if text.startswith("[Tool result masked:") else len(text.split())
+    candidates = discover_candidates(
+        messages,
+        count_tokens=count_tokens,
+        mask_min_tokens=10,
+    )
+    gain = masking_gate_gain(
+        candidates,
+        compression_policy=_MaskGatePolicy(gate_gain),
+        suffix_tokens=10,
+        expected_reads=10.0,
+        p_alive=1.0,
+        write_multiplier=1.25,
+    )
+    store = _MaskStore()
+    result = (
+        apply_candidates(messages, candidates, compression_store=store)
+        if gain > 0.0
+        else messages
+    )
+    if should_mask:
+        assert result != messages
+        assert store.calls == 1
+    else:
+        assert result == original
+        assert store.calls == 0
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pipeline_stability(monkeypatch):
+    monkeypatch.setenv("HR_TOKEN_PRESSURE_THRESHOLD", "0")
+    runtime_env.clear_overrides()
+    runtime_env.set_overrides({"HEADROOM_OUTPUT_SHAPER": "0"})
+    yield
+    runtime_env.clear_overrides()
 
 
 class _FakePrefixTracker:
+    # --- telemetry stub (real PrefixCacheTracker interface) ---
+    # No-op/default versions of the methods the handler calls on the real
+    # PrefixCacheTracker regardless of mode, so these doubles don't need to
+    # track the interface by hand as it grows.
+    def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
+        return None
+
+    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+        return 1.0
+
+    @property
+    def churn_depth_samples(self):  # noqa: ANN201
+        return []
+
+    def survival_p_alive(self, ttl_seconds, fallback):  # noqa: ANN001, ANN201
+        return fallback
+
+    def expected_reads_within_ttl(self, ttl_seconds, fallback):  # noqa: ANN001, ANN201
+        return fallback
+
+    def note_compression(self, tokens_before, tokens_after):  # noqa: ANN001, ANN201
+        return None
+
+    def recommended_ttl(self, **kwargs):  # noqa: ANN003, ANN201
+        return None
+
+    def latch_compress(self):  # noqa: ANN201
+        return None
+
+    @property
+    def compress_latched(self):  # noqa: ANN201
+        return False
+
+    def cached_token_count(self):  # noqa: ANN201
+        return 0
+
+    def turn_number(self):  # noqa: ANN201
+        return 0
+
+    def recent_compression_ratio(self, default=0.8):  # noqa: ANN001, ANN201
+        return default
+
+    def conservative_compression_ratio(self, *, default=0.8, k=1.0):  # noqa: ANN001, ANN201
+        return default
+
+    def compression_ratio_stddev(self):  # noqa: ANN201
+        return 0.0
+
+    # --- end telemetry stub ---
     def __init__(self, frozen_count: int):
         self._frozen_count = frozen_count
         self._cached_token_count = 0
@@ -25,6 +156,19 @@ class _FakePrefixTracker:
 
     def get_frozen_message_count(self) -> int:
         return self._frozen_count
+
+    @property
+    def hybrid_controller(self):  # noqa: ANN201
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                adaptive_ttl=False,
+                subagent_ttl_5m=False,
+                # These tests lock byte-stability of the un-admitted path, so
+                # gated masking (which may legitimately mutate a churn-dead
+                # frozen prefix) is pinned off.
+                observation_masking=False,
+            )
+        )
 
     def get_last_original_messages(self):  # noqa: ANN201
         return self._last_original_messages.copy()
@@ -342,7 +486,7 @@ def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -417,7 +561,7 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         proxy.config.ccr_proactive_expansion = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -483,7 +627,7 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
         proxy.config.ccr_inject_system_instructions = True
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -550,7 +694,7 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
         proxy.config.ccr_inject_system_instructions = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -616,7 +760,7 @@ def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -802,7 +946,7 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -886,7 +1030,7 @@ def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> Non
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -956,7 +1100,7 @@ def test_cache_mode_does_not_forward_latest_turn_rewrites() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -1039,7 +1183,7 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
         tracker.get_last_original_messages = lambda: tracker._last_original_messages.copy()
         tracker.get_last_forwarded_messages = lambda: tracker._last_forwarded_messages.copy()
 
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
@@ -1145,7 +1289,7 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
         tracker.get_last_original_messages = lambda: tracker._last_original_messages.copy()
         tracker.get_last_forwarded_messages = lambda: tracker._last_forwarded_messages.copy()
 
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
@@ -1293,7 +1437,7 @@ def _drive_request(
     proxy = client.app.state.proxy
 
     fake_tracker = _FakePrefixTracker(frozen_count=prefix_tracker_frozen)
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
         "issue-327-session"
     )
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -1486,10 +1630,14 @@ def test_issue_327_repeated_content_new_position_is_not_frozen() -> None:
     assert captured["frozen_message_count"] == 8
 
 
-def test_issue_327_pipeline_preserves_frozen_prefix_byte_for_byte() -> None:
+def test_issue_327_pipeline_preserves_frozen_prefix_byte_for_byte(monkeypatch) -> None:
     """Invariant: messages[:frozen_message_count] passed to the pipeline are
     byte-identical to the messages received from the client (modulo the
-    `apply_cached` swap, which is byte-stable). Lock the cache-floor."""
+    `apply_cached` swap, which is byte-stable). Lock the cache-floor.
+
+    Observation masking is pinned off via the fake tracker's config: a fresh
+    tracker reports the prefix as churn-dead, which legitimately admits gated
+    masking of the frozen range. This test locks the UN-admitted path only."""
     captured: dict = {}
     with _make_optimize_proxy_client(mode="token") as client:
         fake_cache = _IssueFakeCompCache(frozen_via_compute=10)
@@ -1582,7 +1730,7 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
 
         proxy = client.app.state.proxy
         fake_tracker = _FakePrefixTracker(frozen_count=12)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stream-parity-A"
         )
         proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
@@ -1639,7 +1787,7 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
 
         proxy = client.app.state.proxy
         fake_tracker = _FakePrefixTracker(frozen_count=12)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
             "stream-parity-B"
         )
         proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
