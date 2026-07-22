@@ -323,6 +323,19 @@ class _FakePrefixTracker:
     def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
         return None
 
+    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+        return 1.0
+
+    @property
+    def hybrid_controller(self):  # noqa: ANN201
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                adaptive_ttl=False,
+                subagent_ttl_5m=False,
+                observation_masking=False,
+            )
+        )
+
     def note_compression(self, tokens_before, tokens_after):  # noqa: ANN001, ANN201
         return None
 
@@ -401,8 +414,9 @@ def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransp
     # Pin a stable session tracker so the prefix walker doesn't re-read
     # turn 0 on every run.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: "s1"
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.resolve_tracker = lambda session_id, provider, messages=None, **kwargs: fake_tracker
 
     return TestClient(app), transport
 
@@ -1029,8 +1043,9 @@ def test_streaming_forwarder_byte_faithful() -> None:
 
     # Pin session tracker so the cache-stable delta path is a no-op.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s_stream"
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: "s_stream"
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.resolve_tracker = lambda session_id, provider, messages=None, **kwargs: fake_tracker
 
     transport = _StreamingCapturingTransport()
     proxy.http_client = httpx.AsyncClient(transport=transport)
@@ -1124,10 +1139,13 @@ def test_messages_custom_upstream_stream_preserves_client_beta_header() -> None:
         old_anthropic_url = type(proxy).ANTHROPIC_API_URL
         type(proxy).ANTHROPIC_API_URL = "https://custom.example"
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "custom-stream-beta-1"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.resolve_tracker = (
+            lambda session_id, provider, messages=None, **kwargs: fake_tracker
+        )
 
         transport = _StreamingCapturingTransport()
         proxy.http_client = httpx.AsyncClient(transport=transport)

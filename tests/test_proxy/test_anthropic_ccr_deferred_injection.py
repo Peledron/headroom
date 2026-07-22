@@ -22,6 +22,19 @@ class _FakePrefixTracker:
     def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
         return None
 
+    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+        return 1.0
+
+    @property
+    def hybrid_controller(self):  # noqa: ANN201
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                adaptive_ttl=False,
+                subagent_ttl_5m=False,
+                observation_masking=False,
+            )
+        )
+
     def note_compression(self, tokens_before, tokens_after):  # noqa: ANN001, ANN201
         return None
 
@@ -155,7 +168,7 @@ def test_frozen_prefix_skips_marker_emission_when_tool_injection_is_deferred(mon
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -238,7 +251,7 @@ def test_unfrozen_prefix_keeps_reversible_ccr_path(monkeypatch) -> None:
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -312,7 +325,7 @@ def test_token_mode_reclamp_keeps_reversible_ccr_path_when_effective_prefix_drop
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -389,7 +402,7 @@ def test_token_mode_compresses_frozen_prefix_turns_when_tool_is_not_already_pres
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -465,7 +478,7 @@ def test_existing_retrieve_tool_keeps_reversible_ccr_path_when_prefix_is_frozen(
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -553,7 +566,7 @@ def test_cache_mode_compresses_delta_but_replays_cached_prefix_when_markers_are_
         fake_tracker = _FakePrefixTracker(frozen_count=1)
         fake_tracker._last_original_messages = [original_messages[0]]
         fake_tracker._last_forwarded_messages = previous_forwarded_messages
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -645,7 +658,7 @@ def test_cache_mode_exact_prefix_replay_forwards_cached_compressed_prefix_when_t
         fake_tracker = _FakePrefixTracker(frozen_count=1)
         fake_tracker._last_original_messages = original_messages.copy()
         fake_tracker._last_forwarded_messages = previous_forwarded_messages
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -736,7 +749,7 @@ def test_token_mode_cached_messages_skip_cache_update_when_pipeline_result_is_un
         cache.update_from_result = lambda originals, compressed: cache_updates.append(  # type: ignore[method-assign]
             (originals, compressed)
         )
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -809,7 +822,7 @@ def test_non_token_non_cache_mode_keeps_compression_and_injects_tool_for_new_mar
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -902,7 +915,7 @@ def test_non_token_non_cache_mode_keeps_reversible_path_and_records_waste_signal
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -989,7 +1002,7 @@ def test_cache_mode_existing_retrieve_tool_keeps_exact_prefix_replay(monkeypatch
         fake_tracker = _FakePrefixTracker(frozen_count=1)
         fake_tracker._last_original_messages = original_messages.copy()
         fake_tracker._last_forwarded_messages = previous_forwarded_messages
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -1077,7 +1090,7 @@ def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
         fake_tracker = _FakePrefixTracker(frozen_count=1)
         fake_tracker._last_original_messages = [original_messages[0]]
         fake_tracker._last_forwarded_messages = previous_forwarded_messages
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -1187,7 +1200,7 @@ def test_non_token_non_cache_mode_preserves_original_messages_when_result_is_unc
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -1263,7 +1276,7 @@ def test_non_token_non_cache_mode_recovers_from_compression_errors(monkeypatch) 
         _disable_pipeline_extensions(proxy)
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -1334,7 +1347,7 @@ def test_cache_mode_without_stable_delta_keeps_original_messages(monkeypatch) ->
                 "content": "[100 items compressed to 10. Retrieve more: hash=unrelatedhashunrelatedhash]",
             }
         ]
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: (
             "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker

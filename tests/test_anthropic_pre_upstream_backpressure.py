@@ -162,37 +162,39 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.request_logger = self.logger
         self.usage_observer = None
         self.image_compressor = None
+        _fake_tracker = SimpleNamespace(
+            _cached_token_count=0,
+            get_frozen_message_count=lambda: 0,
+            get_last_original_messages=lambda: [],
+            get_last_forwarded_messages=lambda: [],
+            update_from_response=lambda *a, **k: None,
+            record_request=lambda *a, **k: None,
+            # Telemetry surface the handler drives on the real tracker.
+            peek_idle_seconds=lambda *a, **k: 0.0,
+            record_turn_gap=lambda *a, **k: None,
+            observe_client_churn=lambda *a, **k: 1.0,
+            hybrid_controller=SimpleNamespace(
+                config=SimpleNamespace(
+                    adaptive_ttl=False,
+                    subagent_ttl_5m=False,
+                    observation_masking=False,
+                )
+            ),
+            note_compression=lambda *a, **k: None,
+            recommended_ttl=lambda *a, **k: None,
+            cached_token_count=lambda: 0,
+            turn_number=lambda: 0,
+            compress_latched=False,
+            latch_compress=lambda: None,
+            recent_compression_ratio=lambda *a, **k: 0.8,
+            conservative_compression_ratio=lambda *a, **k: 0.8,
+            compression_ratio_stddev=lambda: 0.0,
+        )
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
             peek_idle_seconds=lambda *a, **k: 0.0,
-            get_or_create=lambda *a, **k: SimpleNamespace(
-                _cached_token_count=0,
-                get_frozen_message_count=lambda: 0,
-                get_last_original_messages=lambda: [],
-                get_last_forwarded_messages=lambda: [],
-                update_from_response=lambda *a, **k: None,
-                record_request=lambda *a, **k: None,
-                # Telemetry surface the handler drives on the real tracker.
-                peek_idle_seconds=lambda *a, **k: 0.0,
-                record_turn_gap=lambda *a, **k: None,
-                note_compression=lambda *a, **k: None,
-                recommended_ttl=lambda *a, **k: None,
-                cached_token_count=lambda: 0,
-                turn_number=lambda: 0,
-                compress_latched=False,
-                latch_compress=lambda: None,
-                recent_compression_ratio=lambda *a, **k: 0.8,
-                conservative_compression_ratio=lambda *a, **k: 0.8,
-                compression_ratio_stddev=lambda: 0.0,
-            ),
-            resolve_tracker=lambda *a, **k: SimpleNamespace(
-                _cached_token_count=0,
-                get_frozen_message_count=lambda: 0,
-                get_last_original_messages=lambda: [],
-                get_last_forwarded_messages=lambda: [],
-                update_from_response=lambda *a, **k: None,
-                record_request=lambda *a, **k: None,
-            ),
+            get_or_create=lambda *a, **k: _fake_tracker,
+            resolve_tracker=lambda *a, **k: _fake_tracker,
         )
         # Unit 4: the only field this test cares about.
         self.anthropic_pre_upstream_sem = anthropic_pre_upstream_sem

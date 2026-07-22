@@ -29,6 +29,19 @@ class _FakePrefixTracker:
     def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
         return None
 
+    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+        return 1.0
+
+    @property
+    def hybrid_controller(self):  # noqa: ANN201
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                adaptive_ttl=False,
+                subagent_ttl_5m=False,
+                observation_masking=False,
+            )
+        )
+
     def note_compression(self, tokens_before, tokens_after):  # noqa: ANN001, ANN201
         return None
 
@@ -112,7 +125,7 @@ def _install_memory_handler(proxy: object) -> None:
 def _install_session_tracker(proxy: object, frozen_count: int) -> None:
     fake_tracker = _FakePrefixTracker(frozen_count=frozen_count)
     proxy.session_tracker_store.compute_session_id = (  # type: ignore[attr-defined]
-        lambda request, model, messages: "stable-session"
+        lambda request, model, messages, **kwargs: "stable-session"
     )
     proxy.session_tracker_store.get_or_create = (  # type: ignore[attr-defined]
         lambda session_id, provider: fake_tracker

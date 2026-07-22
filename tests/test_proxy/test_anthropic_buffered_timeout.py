@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
@@ -17,6 +19,19 @@ class _FakePrefixTracker:
     # track the interface by hand as it grows.
     def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
         return None
+
+    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+        return 1.0
+
+    @property
+    def hybrid_controller(self):  # noqa: ANN201
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                adaptive_ttl=False,
+                subagent_ttl_5m=False,
+                observation_masking=False,
+            )
+        )
 
     def note_compression(self, tokens_before, tokens_after):  # noqa: ANN001, ANN201
         return None
@@ -115,7 +130,7 @@ def _make_config() -> ProxyConfig:
 
 def _install_prefix_tracker(proxy) -> None:
     tracker = _FakePrefixTracker()
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **kwargs: "s1"
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
 
 
