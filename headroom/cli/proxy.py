@@ -14,7 +14,7 @@ from headroom.providers.registry import (
     resolve_api_targets,
     resolve_extra_headers,
 )
-from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
+from headroom.proxy.modes import PROXY_MODE_HYBRID, normalize_proxy_mode
 
 from .main import main
 
@@ -1128,10 +1128,12 @@ def proxy(
     else:
         effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
 
-    # Resolve mode: CLI flag > env var > default. Default is CACHE (Headroom's
-    # coding posture): delta-only compression at ~0 prefix-cache busts.
+    # Resolve mode: CLI flag > env var > default. Default is HYBRID (Headroom's
+    # coding posture): delta-only compression on a frozen prefix, so it saves
+    # tokens at ~0 prefix-cache busts instead of mutating the prefix like token
+    # mode does.
     effective_mode: str = normalize_proxy_mode(
-        mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_CACHE
+        mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_HYBRID
     )
 
     # Stateless mode: CLI flag or env var

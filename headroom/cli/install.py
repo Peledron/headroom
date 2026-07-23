@@ -452,7 +452,7 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
 )
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
 @click.option(
-    "--mode", "proxy_mode", default="token", show_default=True, help="Proxy optimization mode."
+    "--mode", "proxy_mode", default="hybrid", show_default=True, help="Proxy optimization mode."
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
 @click.option(
@@ -612,7 +612,7 @@ def install_apply(
 )
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
 @click.option(
-    "--mode", "proxy_mode", default="token", show_default=True, help="Proxy optimization mode."
+    "--mode", "proxy_mode", default="hybrid", show_default=True, help="Proxy optimization mode."
 )
 @click.option(
     "--scope",
