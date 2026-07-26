@@ -82,8 +82,21 @@ not the scoring.
 
 ## Conclusions
 
-Keep the route enabled: the 78 cold-prefix switches, about 18 per week, are free
-by construction and cost nothing to collect.
+Operator decision, 2026-07-26: **leave the cheap-model route off.** It is off
+by default and off in this deployment, and it stays that way. The measured
+upside is 78 free cold-prefix switches, about 18 per week, against a residual
+tail where a turn admitted as easy still ran 147 follow-on assistant turns.
+That trade is not worth taking while the tail is unbounded, so the route is
+not enabled and the sections below describe what it would do if it were.
+
+Both locks are independent and both are currently open circuits:
+`HEADROOM_MODEL_ROUTER_ENABLED` is unset, so `ModelRouterConfig.enabled` stays
+False and no rule fires, and `HEADROOM_MODEL_ROUTE_PRICES` is unset, so
+`_price_model_route` returns None before reading anything. Enabling the router
+without prices self-disables with a warning.
+
+The 78 cold-prefix switches, about 18 per week, would be free by construction
+if the route were turned on.
 
 Do not tune the difficulty weights for savings, and do not A/B the warm-prefix
 route. The gap between a 3-turn horizon and a 13-turn break-even is too large
