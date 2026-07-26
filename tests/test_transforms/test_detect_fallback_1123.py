@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from headroom.transforms import content_router as cr
 
 # Patch the native detector via its string target ("headroom._core.detect_content_type")
@@ -13,6 +15,23 @@ from headroom.transforms import content_router as cr
 # headroom._core out of sys.modules (e.g. test_rust_core_smoke), which rebuilds the module
 # object. A captured alias would then go stale and the patch would miss the live module —
 # the control-flow tests would silently run the real detector and never see the exception.
+
+
+@pytest.fixture(autouse=True)
+def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the native-detector circuit breaker (#575) before each test.
+
+    The breaker is process-wide and one-way by design: the first native
+    ``detect_content_type`` in this environment parks in a futex and trips the
+    watchdog, after which every later call routes straight to regex. That is
+    correct in production and fatal here, because these tests need the native
+    branch reachable to observe what it raises. Without the reset they pass
+    alone and fail in-suite, which is how they were found.
+    """
+    monkeypatch.setattr(cr, "_detect_native_unhealthy", False)
+    monkeypatch.setattr(cr, "_detect_native_wedged", False)
+    monkeypatch.setattr(cr, "_detect_backend_warned", False)
+    monkeypatch.setattr(cr, "_detect_panic_warned", False)
 
 
 def test_falls_back_on_rust_exception(monkeypatch):
@@ -58,8 +77,6 @@ def test_control_flow_exceptions_propagate(monkeypatch):
     monkeypatch.setattr("headroom._core.detect_content_type", _interrupt)
     monkeypatch.setattr(cr, "_detect_panic_warned", False, raising=False)
 
-    import pytest
-
     with pytest.raises(KeyboardInterrupt):
         cr._detect_content("content")
 
@@ -73,8 +90,6 @@ def test_cancelled_error_propagates(monkeypatch):
     monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
     monkeypatch.setattr("headroom._core.detect_content_type", _cancel)
     monkeypatch.setattr(cr, "_detect_panic_warned", False, raising=False)
-
-    import pytest
 
     with pytest.raises(asyncio.CancelledError):
         cr._detect_content("content")

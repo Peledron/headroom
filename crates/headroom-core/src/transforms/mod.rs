@@ -51,7 +51,10 @@ pub use log_compressor::{
     LogLevel, LogLine,
 };
 #[cfg(feature = "ml")]
-pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
+pub use magika_detector::{
+    magika_detect, map_magika_label, wait_until_ready as wait_for_magika_session,
+    MagikaDetectorError,
+};
 pub use pipeline::{
     CompressionContext, CompressionPipeline, CompressionPipelineBuilder, DiffNoise, DiffOffload,
     JsonMinifier, JsonOffload, LogOffload, LogTemplate, OffloadOutput, OffloadTransform,

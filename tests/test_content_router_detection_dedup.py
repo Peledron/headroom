@@ -27,6 +27,7 @@ def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     # The native-detector circuit breaker (#575) is process-wide; keep it from
     # leaking across tests (mirrors tests/test_transforms_content_router.py).
     monkeypatch.setattr(content_router_module, "_detect_native_unhealthy", False)
+    monkeypatch.setattr(content_router_module, "_detect_native_wedged", False)
     monkeypatch.setattr(content_router_module, "_detect_backend_warned", False)
     monkeypatch.setattr(content_router_module, "_detect_panic_warned", False)
 

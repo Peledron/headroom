@@ -32,6 +32,7 @@ use headroom_core::transforms::tag_protector::{
 use headroom_core::transforms::{
     compress_openai_responses_live_zone as rust_compress_openai_responses_live_zone,
     detect as rust_detect_chain, is_json_array_of_dicts as rust_is_json_array_of_dicts,
+    wait_for_magika_session as rust_wait_for_magika_session,
     summarize_openai_responses_no_change_reason as rust_summarize_openai_responses_no_change_reason,
     AuthMode as RustLiveZoneAuthMode, ContentType as RustContentType,
     DetectionResult as RustDetectionResult, DiffCompressionResult, DiffCompressor,
@@ -1007,6 +1008,27 @@ fn detect_content_type(py: Python<'_>, content: &str) -> PyDetectionResult {
     }
 }
 
+/// Load the detector's model, waiting up to `timeout_secs` for it to settle.
+///
+/// `detect_content_type` never waits: if the model is still loading it drops
+/// to the non-ML tiers for that call. Without a warmup, a process that only
+/// ever calls it on the hot path would spend its first several detections on
+/// the weaker tiers, and a short-lived one might never reach the model at all.
+/// This is the call that pays the ~50 ms cold load somewhere it does not hurt.
+///
+/// Returns whether the outcome is known, not whether the model loaded. `False`
+/// means still loading, so calling again later is reasonable.
+#[pyfunction]
+#[pyo3(signature = (timeout_secs = 0.0))]
+fn warm_content_detector(py: Python<'_>, timeout_secs: f64) -> bool {
+    let timeout = std::time::Duration::from_secs_f64(if timeout_secs.is_finite() {
+        timeout_secs.max(0.0)
+    } else {
+        0.0
+    });
+    py.detach(move || rust_wait_for_magika_session(timeout))
+}
+
 /// Quick check: is `content` a JSON array of dictionaries (the format
 /// `SmartCrusher` natively handles)?
 #[pyfunction]
@@ -1838,6 +1860,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_html_tag, m)?)?;
     m.add_function(wrap_pyfunction!(known_html_tag_names, m)?)?;
     m.add_function(wrap_pyfunction!(detect_content_type, m)?)?;
+    m.add_function(wrap_pyfunction!(warm_content_detector, m)?)?;
     m.add_function(wrap_pyfunction!(is_json_array_of_dicts, m)?)?;
     m.add_function(wrap_pyfunction!(score_line, m)?)?;
     m.add_function(wrap_pyfunction!(content_has_error_indicators, m)?)?;

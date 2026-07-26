@@ -7,11 +7,20 @@
 //!
 //! # Design
 //!
-//! - **Singleton session.** Magika model loading is the expensive part
-//!   (one-time ONNX init, ~50 ms cold). We do it exactly once per
-//!   process via [`OnceLock`]. The `Session` requires `&mut self`
-//!   for inference, so the singleton wraps it in a `Mutex` — fine for
-//!   our throughput; if benchmarks show contention later we'll pool.
+//! - **Singleton session, loaded off the caller's thread.** Magika model
+//!   loading is the expensive part (one-time ONNX init, ~50 ms cold). We do it
+//!   exactly once per process, on a background thread. The `Session` requires
+//!   `&mut self` for inference, so the singleton wraps it in a `Mutex` — fine
+//!   for our throughput; if benchmarks show contention later we'll pool.
+//!
+//! - **No caller ever waits on another caller.** Detection takes the session
+//!   with `try_lock` and gives up on the load with a plain `get`, so both
+//!   contended paths return [`MagikaDetectorError::Busy`] rather than parking.
+//!   This matters because the Python binding releases the GIL and its caller
+//!   runs under a watchdog that abandons the thread on timeout. An abandoned
+//!   thread inside the model keeps whatever it holds forever, so any blocking
+//!   wait here turns one slow inference into a dead detector for the life of
+//!   the process. Use [`wait_until_ready`] to warm the model instead.
 //!
 //! - **Loud failures.** If the model fails to load or inference fails,
 //!   `magika_detect` returns `Err`. The ContentRouter (PR5) decides
@@ -35,9 +44,11 @@
 //!   error early instead of crashing with SIGILL; the detection chain then
 //!   falls through to Tier 2 and Tier 3 normally.
 
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
 use magika::Session;
@@ -147,7 +158,106 @@ fn initialize_dynamic_ort() -> Result<PathBuf, String> {
     }
 }
 
+/// Layout of ONNX Runtime's `OrtApiBase`, the one struct in its C ABI
+/// that is reachable without going through `ort`.
+///
+/// Only the two members we need are declared. Both have been at the
+/// front of the struct since ONNX Runtime 1.0 and the C API treats the
+/// layout as frozen, so a shorter definition reads the same fields any
+/// version would hand back.
+#[repr(C)]
+struct OrtApiBaseProbe {
+    get_api: unsafe extern "C" fn(u32) -> *const core::ffi::c_void,
+    get_version_string: unsafe extern "C" fn() -> *const core::ffi::c_char,
+}
+
+/// Read the version string out of an ONNX Runtime shared library.
+///
+/// Loads the library, calls `OrtGetApiBase()->GetVersionString()`, and
+/// leaves the mapping in place. We never unload: ONNX Runtime installs
+/// static initializers and exit handlers, and `dlclose`-ing it is the
+/// same teardown hazard that wedges process exit (ort #1715). Keeping
+/// the mapping also means the `dlopen` `ort` does next is a refcount
+/// bump on an object we already proved loadable.
+fn onnxruntime_version_string(path: &Path) -> Result<String, String> {
+    // SAFETY: `OrtGetApiBase` is ONNX Runtime's documented entry point.
+    // It takes no arguments, cannot fail, and returns a pointer to a
+    // static struct owned by the library. `GetVersionString` likewise
+    // returns a static NUL-terminated string. The library outlives the
+    // borrow because we forget the handle instead of dropping it.
+    unsafe {
+        let library = libloading::Library::new(path)
+            .map_err(|error| format!("failed to load `{}`: {error}", path.display()))?;
+
+        let result = (|| {
+            let base_getter: libloading::Symbol<
+                unsafe extern "C" fn() -> *const OrtApiBaseProbe,
+            > = library.get(b"OrtGetApiBase").map_err(|error| {
+                format!(
+                    "`{}` does not export OrtGetApiBase: {error}",
+                    path.display()
+                )
+            })?;
+
+            let base = base_getter();
+            if base.is_null() {
+                return Err(format!("`{}` returned a null OrtApiBase", path.display()));
+            }
+
+            let version = ((*base).get_version_string)();
+            if version.is_null() {
+                return Err(format!("`{}` reported a null version", path.display()));
+            }
+
+            Ok(CStr::from_ptr(version).to_string_lossy().into_owned())
+        })();
+
+        core::mem::forget(library);
+        result
+    }
+}
+
+/// Reject an ONNX Runtime library that this build of `ort` cannot use.
+///
+/// `ort` compares the library's minor version against the API level it
+/// was built for and errors out on anything older. That error is not
+/// survivable: `load_dylib_from_path` marks its global library
+/// `OnceLock` completed *without writing a value*, then `setup_api`
+/// panics on the `Err` it got back, and every later `ort` call reads
+/// the slot that was never written. The process is left with a
+/// permanently wedged detector, which is exactly the hang we saw with
+/// onnxruntime 1.23.2 against an `ort` compiled for 1.24.
+///
+/// So the version check happens here, before `ort` sees the path. A
+/// library that fails it is skipped with a plain `Err`, which lets the
+/// discovery loop keep trying other candidates.
+fn ort_can_use_library(path: &Path) -> Result<(), String> {
+    let version = onnxruntime_version_string(path)?;
+
+    // Parse exactly the way `ort` does, so our verdict and its verdict
+    // can never disagree: second dot-separated field, anything
+    // unparseable counts as 0 and therefore too old.
+    let minor = version
+        .split('.')
+        .nth(1)
+        .map_or(0, |field| field.parse::<u32>().unwrap_or(0));
+
+    if minor < ort::MINOR_VERSION {
+        return Err(format!(
+            "ONNX Runtime at `{}` is version `{version}`, but this build of ort needs \
+             1.{}.x or newer; install `onnxruntime>=1.{}`",
+            path.display(),
+            ort::MINOR_VERSION,
+            ort::MINOR_VERSION
+        ));
+    }
+
+    Ok(())
+}
+
 fn init_ort_from_path(path: &Path) -> Result<(), String> {
+    ort_can_use_library(path)?;
+
     let builder = ort::init_from(path).map_err(|error| {
         format!(
             "failed to load ONNX Runtime from `{}`: {error}",
@@ -323,16 +433,129 @@ pub enum MagikaDetectorError {
     /// something is corrupt and continuing would mask it.
     #[error("magika session lock poisoned")]
     Poisoned,
+
+    /// The session is not loaded yet, or another caller holds it. Not a
+    /// failure: the chain drops to the unidiff/regex tiers for this one call
+    /// and the next call may well succeed.
+    ///
+    /// This variant is what makes the detector safe to call from a thread the
+    /// embedder is willing to abandon. Both waits it replaces were unbounded,
+    /// so a caller that hung inside the model took the whole process's
+    /// detector with it. See [`wait_until_ready`].
+    #[error("magika session not ready")]
+    Busy,
 }
 
-/// One-process singleton holding the magika session. Lazily
-/// initialized on first call to [`magika_detect`].
+/// One-process singleton holding the magika session. Populated only by the
+/// background initializer in [`ensure_init_started`], never by a detection
+/// caller.
 ///
 /// `Mutex<Result<Session, ...>>` rather than `Result<Mutex<Session>>`
 /// so init failure is recorded once and replayed cheaply on every
 /// subsequent call (no re-attempting the load — if the model file is
 /// missing or ort can't init, retrying just wastes cycles).
 static MAGIKA_SESSION: OnceLock<Mutex<Result<Session, String>>> = OnceLock::new();
+
+/// Latch saying the background initializer has been kicked off. Deliberately
+/// an atomic rather than a `OnceLock` init closure: `get_or_init` parks every
+/// other caller for as long as the closure runs, which is the wait this module
+/// exists to remove.
+static INIT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Set once `MAGIKA_SESSION` is populated, so [`wait_until_ready`] can block
+/// without polling. Detection never touches these.
+static INIT_DONE: Mutex<bool> = Mutex::new(false);
+static INIT_DONE_CV: Condvar = Condvar::new();
+
+/// Record the init outcome and release anyone waiting in [`wait_until_ready`].
+fn publish_session(result: Result<Session, String>) {
+    // Only the single initializer thread reaches here, so `set` cannot lose a
+    // race. Ignoring the error keeps the first outcome authoritative anyway.
+    let _ = MAGIKA_SESSION.set(Mutex::new(result));
+    let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+    *done = true;
+    INIT_DONE_CV.notify_all();
+}
+
+/// Start loading the session in the background, at most once per process.
+///
+/// Returns immediately. Everything that can hang — the dynamic ORT loader
+/// probe and `Session::new()` alike — runs on threads no caller waits on.
+fn ensure_init_started() {
+    if INIT_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new()
+        .name("magika-init".into())
+        .spawn(run_session_init)
+    {
+        tracing::warn!("magika init thread spawn failed: {e}");
+        publish_session(Err(format!("magika init thread spawn failed: {e}")));
+    }
+}
+
+/// Supervise the load: bound it, then publish an `Ok` or an `Err` either way.
+///
+/// The probe runs inside the supervised worker, not before it. On dynamic-ORT
+/// platforms `dynamic_ort_loader_ready` can itself park inside ort's recursive
+/// `OnceLock` error path (#1715), so leaving it outside the timeout would let
+/// the one thing this timeout is for escape it.
+fn run_session_init() {
+    let timeout = magika_init_timeout();
+    let (tx, rx) = mpsc::channel();
+    // The orphaned worker on timeout is left to finish on its own; its
+    // eventual `send` lands on a dropped receiver (harmless) and the `Session`
+    // is then dropped.
+    let spawned = std::thread::Builder::new()
+        .name("magika-session-new".into())
+        .spawn(move || {
+            let outcome = match magika_runtime_available_for_session_init() {
+                Err(error) => Err(error),
+                Ok(()) => Session::new().map_err(|e| e.to_string()),
+            };
+            let _ = tx.send(outcome);
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("magika session thread spawn failed: {e}");
+        publish_session(Err(format!("magika session thread spawn failed: {e}")));
+        return;
+    }
+
+    match rx.recv_timeout(timeout) {
+        Ok(res) => publish_session(res),
+        Err(_) => {
+            let ort_dylib = std::env::var("ORT_DYLIB_PATH").ok();
+            tracing::warn!(
+                timeout_secs = timeout.as_secs(),
+                ort_dylib_path = ort_dylib.as_deref(),
+                "magika ONNX session init timed out; detection falls back to \
+                 non-ML tiers for this process. On Windows an unset \
+                 ORT_DYLIB_PATH usually means the WinML System32 \
+                 onnxruntime.dll was picked up (deadlocks ort init)."
+            );
+            publish_session(Err(format!(
+                "magika session init exceeded {}s timeout; \
+                 using non-ML detection tiers",
+                timeout.as_secs()
+            )));
+        }
+    }
+}
+
+/// Block until the session has loaded (or failed to), up to `timeout`.
+///
+/// Detection itself never calls this. It exists for two callers who can afford
+/// to wait and would otherwise silently lose the ML tier: a process that warms
+/// the detector at startup, and tests. Returns whether the outcome is known,
+/// not whether it was a success.
+pub fn wait_until_ready(timeout: Duration) -> bool {
+    ensure_init_started();
+    let done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+    let (done, _) = INIT_DONE_CV
+        .wait_timeout_while(done, timeout, |ready| !*ready)
+        .unwrap_or_else(|e| e.into_inner());
+    *done
+}
 
 /// Default cap on magika ONNX session init.
 ///
@@ -361,66 +584,33 @@ fn magika_init_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-fn session() -> &'static Mutex<Result<Session, String>> {
-    MAGIKA_SESSION.get_or_init(|| {
-        // Early-out if ORT is known to be unsafe or unavailable in this
-        // process. This avoids both SIGILL on unsupported CPUs and Windows
-        // deadlocks from unpinned dynamic ONNX Runtime loading.
-        if let Err(error) = magika_runtime_available_for_session_init() {
-            return Mutex::new(Err(error));
-        }
-
-        let timeout = magika_init_timeout();
-        let (tx, rx) = mpsc::channel();
-        // Run the (potentially hanging) ONNX init on a side thread so we
-        // can bound it. `Session: Send` (the static itself requires it),
-        // so moving the result across the channel is sound. On timeout we
-        // record an `Err` — `detection::detect` already falls through to
-        // the unidiff/regex tiers on `Err` — and the orphaned init thread
-        // is left to finish on its own; its eventual `send` lands on a
-        // dropped receiver (harmless) and the `Session` is then dropped.
-        let spawned = std::thread::Builder::new()
-            .name("magika-init".into())
-            .spawn(move || {
-                let _ = tx.send(Session::new().map_err(|e| e.to_string()));
-            });
-        if let Err(e) = spawned {
-            tracing::warn!("magika init thread spawn failed: {e}");
-            return Mutex::new(Err(format!("magika init thread spawn failed: {e}")));
-        }
-        match rx.recv_timeout(timeout) {
-            Ok(res) => Mutex::new(res),
-            Err(_) => {
-                let ort_dylib = std::env::var("ORT_DYLIB_PATH").ok();
-                tracing::warn!(
-                    timeout_secs = timeout.as_secs(),
-                    ort_dylib_path = ort_dylib.as_deref(),
-                    "magika ONNX session init timed out; detection falls back to \
-                     non-ML tiers for this process. On Windows an unset \
-                     ORT_DYLIB_PATH usually means the WinML System32 \
-                     onnxruntime.dll was picked up (deadlocks ort init)."
-                );
-                Mutex::new(Err(format!(
-                    "magika session init exceeded {}s timeout; \
-                     using non-ML detection tiers",
-                    timeout.as_secs()
-                )))
-            }
-        }
-    })
-}
-
 /// Classify `content` and return the mapped Headroom [`ContentType`].
 ///
 /// Empty input shortcuts to [`ContentType::PlainText`] without touching
 /// the model — saves the round trip on every empty tool result.
+///
+/// **Never blocks on another caller.** If the session is still loading, or a
+/// different thread is inside the model, this returns
+/// [`MagikaDetectorError::Busy`] and the chain drops a tier for this one call.
+/// The earlier version waited in both places, which is how a single stuck
+/// inference took the detector out for the rest of the process: the stuck
+/// thread kept the session mutex, and every later call parked behind it with
+/// no timeout and no escape. Callers that need the ML tier warm should call
+/// [`wait_until_ready`] once at startup instead of paying for it here.
 pub fn magika_detect(content: &str) -> Result<ContentType, MagikaDetectorError> {
     if content.is_empty() {
         return Ok(ContentType::PlainText);
     }
 
-    let mutex = session();
-    let mut guard = mutex.lock().map_err(|_| MagikaDetectorError::Poisoned)?;
+    ensure_init_started();
+    let Some(mutex) = MAGIKA_SESSION.get() else {
+        return Err(MagikaDetectorError::Busy);
+    };
+    let mut guard = match mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => return Err(MagikaDetectorError::Busy),
+        Err(TryLockError::Poisoned(_)) => return Err(MagikaDetectorError::Poisoned),
+    };
     let session = guard
         .as_mut()
         .map_err(|e| MagikaDetectorError::Init(e.clone()))?;
@@ -501,11 +691,30 @@ pub fn map_magika_label(label: &str) -> ContentType {
 mod tests {
     use super::*;
 
+    /// Wait out the two things production callers refuse to wait for.
+    ///
+    /// `magika_detect` now declines rather than queues, so a test that asserts
+    /// a label has to warm the model itself and retry past a peer holding the
+    /// session. Cargo runs these in parallel, so the peer case is real.
+    fn detect_for_test(content: &str) -> Result<ContentType, MagikaDetectorError> {
+        assert!(
+            wait_until_ready(Duration::from_secs(60)),
+            "magika session init never settled"
+        );
+        for _ in 0..200 {
+            match magika_detect(content) {
+                Err(MagikaDetectorError::Busy) => std::thread::sleep(Duration::from_millis(10)),
+                other => return other,
+            }
+        }
+        panic!("magika session stayed busy for 2s; a caller is holding it")
+    }
+
     fn assert_detect(content: &str, expected: ContentType, hint: &str) {
         if let Err(init_reason) = magika_runtime_available_for_session_init() {
             // On hosts where Magika cannot safely initialize, assert graceful
             // degradation rather than panicking or hanging.
-            match magika_detect(content) {
+            match detect_for_test(content) {
                 Err(MagikaDetectorError::Init(msg)) => {
                     assert!(
                         msg == init_reason,
@@ -515,7 +724,7 @@ mod tests {
                 other => panic!("{hint}: expected Magika init error, got {other:?}"),
             }
         } else {
-            match magika_detect(content) {
+            match detect_for_test(content) {
                 Ok(got) => {
                     assert_eq!(got, expected, "{hint}: expected {expected:?}, got {got:?}")
                 }
@@ -657,9 +866,9 @@ index abc123..def456 100644
         // session is Ok and repeated calls succeed; otherwise the session is
         // Err and repeated calls return the same Err.
         if let Err(init_reason) = magika_runtime_available_for_session_init() {
-            let r1 = magika_detect("hello world");
-            let r2 = magika_detect("def f(): pass");
-            let r3 = magika_detect(r#"{"a":1}"#);
+            let r1 = detect_for_test("hello world");
+            let r2 = detect_for_test("def f(): pass");
+            let r3 = detect_for_test(r#"{"a":1}"#);
             for r in [&r1, &r2, &r3] {
                 match r {
                     Err(MagikaDetectorError::Init(msg)) => {
@@ -672,10 +881,55 @@ index abc123..def456 100644
             // On available hosts the session loads once and all calls
             // succeed. Wall-clock asymmetry (cold ~50 ms, warm
             // <1 ms) confirms reuse.
-            magika_detect("hello world").unwrap();
-            magika_detect("def f(): pass").unwrap();
-            magika_detect(r#"{"a":1}"#).unwrap();
+            detect_for_test("hello world").unwrap();
+            detect_for_test("def f(): pass").unwrap();
+            detect_for_test(r#"{"a":1}"#).unwrap();
         }
+    }
+
+    /// The regression that motivated the non-blocking rewrite.
+    ///
+    /// A caller stuck inside the model holds the session mutex. Before, every
+    /// later call parked on that mutex with no timeout, so one stuck inference
+    /// cost the process its detector permanently. The contract now is that a
+    /// held session is reported, not waited on, and that the detector recovers
+    /// the moment the holder lets go.
+    #[test]
+    fn a_held_session_is_declined_not_waited_on() {
+        assert!(
+            wait_until_ready(Duration::from_secs(60)),
+            "magika session init never settled"
+        );
+        let mutex = MAGIKA_SESSION.get().expect("session published");
+
+        let held = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let started = std::time::Instant::now();
+        let during = magika_detect("hello world");
+        let waited = started.elapsed();
+        drop(held);
+
+        assert!(
+            matches!(during, Err(MagikaDetectorError::Busy)),
+            "expected Busy while the session was held, got {during:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "declining took {waited:?}; it should not have waited at all"
+        );
+
+        // Recovery: the holder is gone, so the next call goes through.
+        assert!(
+            !matches!(detect_for_test("hello world"), Err(MagikaDetectorError::Busy)),
+            "detector stayed unusable after the holder released it"
+        );
+    }
+
+    #[test]
+    fn waiting_for_readiness_settles_within_the_init_budget() {
+        // Bounded either way: the initializer publishes an Ok or an Err, so a
+        // host without a usable ONNX runtime settles just as fast as one with.
+        assert!(wait_until_ready(Duration::from_secs(60)));
+        assert!(MAGIKA_SESSION.get().is_some());
     }
 
     #[test]

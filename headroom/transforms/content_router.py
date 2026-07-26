@@ -92,7 +92,14 @@ split_into_sections = _mixed_content.split_into_sections
 _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
-_detect_native_verified = False  # native detect has returned once -> skip the watchdog
+_detect_native_verified = False  # native detect has returned once (diagnostic only)
+# A watchdog timeout leaves a thread parked inside the native call, and that
+# thread still holds the detector's session mutex, so every later native call
+# blocks on it forever. Unlike the circuit breaker above, this is not a policy
+# flag a caller or a test may clear: the process is out of a usable detector for
+# good. Tests reset ``_detect_native_unhealthy`` between cases, which is why the
+# two are separate flags rather than one.
+_detect_native_wedged = False
 
 
 # Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
@@ -822,6 +829,46 @@ def _rust_detect_watchdogged(rust_detect: Any, content: str, timeout: float) -> 
     return box["result"]
 
 
+_detect_warmup_started = False
+_detect_warmup_lock = threading.Lock()
+
+
+def _start_detect_warmup() -> None:
+    """Load the native detector's model once, off the request path.
+
+    The native detector no longer waits for its own model: a call that arrives
+    before the ONNX session is loaded gets declined and falls to the regex
+    tier. That is what makes a hung load survivable, but left alone it would
+    also mean a short-lived process never reaches the ML tier at all, and a
+    long-lived one spends its first detections on the weaker one.
+
+    So the wait moved here, onto a daemon thread nobody joins. Failure is not
+    reported because there is nothing to report: warmup failing means detection
+    keeps using the tier it was already using.
+    """
+    global _detect_warmup_started
+    with _detect_warmup_lock:
+        if _detect_warmup_started:
+            return
+        _detect_warmup_started = True
+
+    def _warm() -> None:
+        try:
+            from headroom._core import warm_content_detector
+
+            warm_content_detector(_DETECT_WARMUP_TIMEOUT_SECS)
+        except BaseException:  # noqa: BLE001 — a cold detector is not an error
+            pass
+
+    threading.Thread(target=_warm, name="headroom-detect-warmup", daemon=True).start()
+
+
+# Generous because nothing waits on it. The native side bounds its own load at
+# HEADROOM_MAGIKA_INIT_TIMEOUT_SECS (5s default) and publishes an error on
+# timeout, so this only has to outlast that.
+_DETECT_WARMUP_TIMEOUT_SECS = 60.0
+
+
 # Coding agents commonly wrap each tool result in an envelope such as
 # ``<returncode>0</returncode>\n<output>...</output>`` (or <stdout>/<stderr>/
 # <tool_result>). Those wrapper tags make the native detector read the whole
@@ -872,7 +919,7 @@ def _detect_content(content: str) -> DetectionResult:
     `_strategy_from_detection` keys off that field alone.
     """
     global _detect_backend_warned, _detect_panic_warned, _detect_native_unhealthy
-    global _detect_native_verified
+    global _detect_native_verified, _detect_native_wedged
 
     # Detect on the unwrapped payload so a tool-output envelope's tags don't get
     # the whole result misclassified as HTML/XML (#route-converter corruption).
@@ -889,7 +936,7 @@ def _detect_content(content: str) -> DetectionResult:
             )
         return _regex_detect_content_type(content)
 
-    if _detect_native_unhealthy:
+    if _detect_native_unhealthy or _detect_native_wedged:
         # Circuit breaker (#575): the native detector hung once under the
         # watchdog; every later call would wait the full budget and strand
         # another stuck daemon thread, so route straight to pure-Python.
@@ -897,20 +944,28 @@ def _detect_content(content: str) -> DetectionResult:
 
     from headroom._core import detect_content_type as _rust_detect
 
+    # Idempotent and cheap after the first call. Kept here rather than at proxy
+    # startup so every embedder gets it, including the CLI and the tests.
+    _start_detect_warmup()
+
     try:
         # The native detector can deadlock on FIRST use (#575 — seen on Windows
         # and macOS/arm64). Bound it with a watchdog so a hang degrades to the
         # pure-Python detector; the previous win32-only guard left other
         # platforms unprotected, so a hung Linux sidecar silently stopped
-        # compressing (every request failed open to passthrough). Watchdog until
-        # the native detector has returned once, then use the direct fast path —
-        # the hang is first-use only, so steady state pays no per-call thread
-        # overhead. win32 keeps watchdogging every call (unchanged).
-        if sys.platform == "win32" or not _detect_native_verified:
-            rust_result = _rust_detect_watchdogged(_rust_detect, content, _detect_timeout_secs())
-        else:
-            rust_result = _rust_detect(content)
-        _detect_native_verified = True  # returned without hanging -> trusted hot path
+        # compressing (every request failed open to passthrough).
+        #
+        # Every call is watchdogged, including after the detector has returned
+        # once. An earlier version took a direct unbounded call once
+        # ``_detect_native_verified`` was set, on the theory that the hang is
+        # first-use only. Measured 2026-07-25: that is false. A stranded
+        # watchdog thread keeps holding the detector's session mutex, so a
+        # later direct call parks in a futex with no timeout and no escape,
+        # which is what wedged the full test suite. A thread per call is a few
+        # tens of microseconds against a millisecond-scale ONNX inference, so
+        # the fast path was never worth the unbounded wait.
+        rust_result = _rust_detect_watchdogged(_rust_detect, content, _detect_timeout_secs())
+        _detect_native_verified = True
         # Rust's `content_type` is the lowercase string tag (e.g.
         # "json_array"); translate to the Python `ContentType` enum so
         # downstream mapping keys match.
@@ -930,7 +985,11 @@ def _detect_content(content: str) -> DetectionResult:
         if isinstance(exc, TimeoutError):
             # Watchdog tripped: the native detector hung (#575). Disable it
             # process-wide so later calls don't each wait the full budget and
-            # strand another daemon thread in the wedged native call.
+            # strand another daemon thread in the wedged native call. The
+            # wedged flag is the one that has to hold: the stranded thread
+            # still owns the detector's session mutex, so the native path stays
+            # unusable even if the breaker below is cleared.
+            _detect_native_wedged = True
             _detect_native_unhealthy = True
             logger.warning(
                 "Native content detector hung (%s); disabling it for this process "

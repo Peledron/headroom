@@ -73,6 +73,13 @@ pub fn detect(content: &str) -> ContentType {
             // diffs and prose-prefixed diffs as text.
         }
         Ok(content_type) => return content_type,
+        Err(crate::transforms::magika_detector::MagikaDetectorError::Busy) => {
+            // Model still loading, or another thread is inside it. Expected
+            // during the first few calls of a process and under concurrency,
+            // so this is debug, not warn: at warn level a cold start would
+            // print one line per tool result and bury the real failures.
+            tracing::debug!("magika session busy; falling through to unidiff tier");
+        }
         Err(e) => {
             // Init or inference failure. Log it (so an ops-side
             // health check can spot magika trouble in the proxy

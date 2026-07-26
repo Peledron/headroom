@@ -31,8 +31,13 @@ def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     The circuit breaker (#575) is process-wide, so a test that trips it would
     otherwise force later tests onto the pure-Python path. ``monkeypatch.setattr``
     zeroes each flag for the test and auto-restores it afterward.
+
+    ``_detect_native_wedged`` is reset here too, which production code must never
+    do: a hang simulated by a patched fake strands nothing, while a real one
+    leaves a thread holding the detector's session mutex forever.
     """
     monkeypatch.setattr(content_router_module, "_detect_native_unhealthy", False)
+    monkeypatch.setattr(content_router_module, "_detect_native_wedged", False)
     monkeypatch.setattr(content_router_module, "_detect_backend_warned", False)
     monkeypatch.setattr(content_router_module, "_detect_panic_warned", False)
 
@@ -1666,6 +1671,74 @@ def test_detect_content_circuit_breaker_skips_native_after_hang(
         assert calls == 1  # breaker tripped: native entered once, 2nd call skipped it
     finally:
         release.set()  # let the lone daemon worker finish
+
+
+def test_detect_content_bounds_native_call_after_a_successful_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hang is bounded even after the detector has already returned once.
+
+    Regression for the wedge measured 2026-07-25: once ``_detect_native_verified``
+    was set, non-Windows callers went straight into the native call with no
+    timeout, and a stranded thread holding the detector's session mutex parked
+    them forever. Both calls here must come back.
+    """
+    import threading as _threading
+
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module.sys, "platform", "linux")
+    monkeypatch.setenv("HEADROOM_DETECT_TIMEOUT_SECS", "0.1")
+
+    release = _threading.Event()
+    calls = 0
+
+    def _fast_then_hang(_content: str):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            release.wait()  # park with the GIL released, like the real futex hang
+        return SimpleNamespace(content_type="source_code", confidence=1.0, metadata={})
+
+    monkeypatch.setattr(_core, "detect_content_type", _fast_then_hang)
+    try:
+        first = _detect_content("def main(): pass")
+        assert first.content_type is ContentType.SOURCE_CODE
+        assert content_router_module._detect_native_verified is True
+        # JSON content: coming back as JSON_ARRAY proves the pure-Python
+        # fallback answered, so the second call was watchdogged rather than
+        # taking the old unbounded fast path.
+        second = _detect_content('[{"id": 2}]')
+        assert second.content_type is ContentType.JSON_ARRAY
+        assert content_router_module._detect_native_wedged is True
+    finally:
+        release.set()
+
+
+def test_detect_content_wedged_flag_survives_a_breaker_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing the circuit breaker does not re-arm a detector known to be wedged.
+
+    The suite's autouse fixture resets ``_detect_native_unhealthy`` between
+    tests, which is how a stranded native thread from one test used to poison
+    the next. The wedged flag is checked separately so that reset cannot send a
+    caller back into a mutex nobody will ever release.
+    """
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module.sys, "platform", "linux")
+    monkeypatch.setattr(content_router_module, "_detect_native_wedged", True)
+    monkeypatch.setattr(content_router_module, "_detect_native_unhealthy", False)
+
+    def _must_not_run(_content: str):
+        raise AssertionError("native detector called while wedged")
+
+    monkeypatch.setattr(_core, "detect_content_type", _must_not_run)
+
+    assert _detect_content('[{"id": 1}]').content_type is ContentType.JSON_ARRAY
 
 
 def test_strip_detection_envelope_isolates_tool_output_payload() -> None:

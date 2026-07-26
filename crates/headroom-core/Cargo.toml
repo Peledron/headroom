@@ -154,6 +154,12 @@ fastembed = { version = "5", default-features = false, optional = true, features
     "image-models",
 ] }
 ort = { version = "2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
+# Used only to read the ONNX Runtime version string out of a candidate
+# shared library before `ort` ever touches it. `ort` rejects a library
+# older than the API level it was compiled against, and its rejection
+# path corrupts its own global state, so we have to screen candidates
+# ourselves. Same version `ort` already pulls in, so this adds no build.
+libloading = { version = "0.8", optional = true }
 
 [features]
 # `ml` is ON by default, so a stock build is byte-for-byte what it was before:
@@ -166,7 +172,7 @@ ort = { version = "2.0.0-rc.12", default-features = false, optional = true, feat
 # "ml")]` gates (TODO: the module + dispatch gating is the collaborative half
 # of this change — flagged in the PR).
 default = ["ml"]
-ml = ["dep:ort", "dep:fastembed", "dep:magika"]
+ml = ["dep:ort", "dep:fastembed", "dep:magika", "dep:libloading"]
 # Compile in the Redis CCR backend. Enable for multi-worker deployments
 # that want a shared CCR store with no sticky-session at the LB. The
 # SQLite backend (always compiled) is the production default for
