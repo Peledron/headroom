@@ -228,7 +228,7 @@ class TestCompressionEntry:
             created_at=time.time(),
         )
         assert entry.hash == "abc123"
-        assert entry.ttl == 1800  # Default TTL (session-scale)
+        assert entry.ttl == 86400  # Default TTL: whole-session scale
         assert entry.retrieval_count == 0
         assert entry.search_queries == []
         assert entry.last_accessed is None
@@ -399,8 +399,8 @@ class TestCompressionStoreInit:
         """CompressionStore initializes with default values."""
         store = CompressionStore()
 
-        assert store._max_entries == 1000
-        assert store._default_ttl == 1800
+        assert store._max_entries == 50000
+        assert store._default_ttl == 86400
         assert store._enable_feedback is True
         assert store._backend is not None
 
@@ -513,7 +513,7 @@ class TestCompressionStoreOperations:
         entry = store.retrieve(hash_key)
 
         assert entry is not None
-        assert entry.ttl == 1800  # Default TTL (session-scale)
+        assert entry.ttl == 86400  # Default TTL: whole-session scale
 
     def test_store_accepts_custom_ttl(self, store: CompressionStore):
         """store() accepts custom TTL override."""
@@ -789,7 +789,7 @@ class TestCompressionStoreStats:
     def test_get_stats_max_entries(self, store: CompressionStore):
         """get_stats includes max_entries configuration."""
         stats = store.get_stats()
-        assert stats["max_entries"] == 1000
+        assert stats["max_entries"] == 50000
 
     def test_get_stats_token_totals(self, store: CompressionStore):
         """get_stats calculates token totals correctly."""

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import anyio
 from fastapi import Request
 
+from headroom.cache.prefix_tracker import PrefixCacheTracker, PrefixFreezeConfig
 from headroom.config import TransformResult
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.models import ProxyConfig
@@ -89,6 +90,17 @@ def _fake_pipeline_apply(messages, model, **kwargs):
     )
 
 
+def _tracker_double() -> PrefixCacheTracker:
+    """A real tracker with freezing off, not a hand-rolled stand-in.
+
+    These tests are about cold-start deferral, but the handler drives about
+    thirty methods on whatever the store returns. Listing them by hand in a
+    SimpleNamespace went stale every time the handler learned a new one, so the
+    real class is cheaper to keep honest.
+    """
+    return PrefixCacheTracker("anthropic", PrefixFreezeConfig(enabled=False))
+
+
 class _DummyAnthropicHandler(AnthropicHandlerMixin):
     ANTHROPIC_API_URL = "https://api.anthropic.com"
 
@@ -133,18 +145,9 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.image_compressor = None
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
-            get_or_create=lambda *a, **k: SimpleNamespace(
-                get_frozen_message_count=lambda: 0,
-                get_last_original_messages=lambda: [],
-                get_last_forwarded_messages=lambda: [],
-                record_request=lambda *a, **k: None,
-            ),
-            resolve_tracker=lambda *a, **k: SimpleNamespace(
-                get_frozen_message_count=lambda: 0,
-                get_last_original_messages=lambda: [],
-                get_last_forwarded_messages=lambda: [],
-                record_request=lambda *a, **k: None,
-            ),
+            peek_idle_seconds=lambda *a, **k: 0.0,
+            get_or_create=lambda *a, **k: _tracker_double(),
+            resolve_tracker=lambda *a, **k: _tracker_double(),
         )
         # Cold-start deferral wiring under test.
         self._background_compression_enabled = True

@@ -103,6 +103,11 @@ class _RealFunnelHandler(OpenAIHandlerMixin):
             retry_max_delay_ms=1,
             connect_timeout_seconds=10,
             log_full_messages=False,
+            # Read when the WS forwarder builds its upstream header set. Absent
+            # here the handler dies before any turn completes, and the PERF
+            # assertions below fail for a reason that has nothing to do with
+            # PERF emission.
+            openai_extra_headers={},
         )
         self.usage_reporter = None
         self.openai_provider = SimpleNamespace(

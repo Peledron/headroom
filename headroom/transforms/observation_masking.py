@@ -26,6 +26,22 @@ _EXCERPT_CHARS = 120
 # RESULTS are environment-authored and stay safe to mask.
 _MASKABLE_INPUT_KEYS = ("content", "file_text", "new_string", "old_string")
 
+# How many assistant turns an assistant TEXT block must age before
+# sweep_assistant_text may replace it with a CCR marker.
+#
+# This guards model-authored content, not tool results, so it is deliberately
+# conservative and stays at 3. The 2026-07-17 mimicry incident came from
+# marker text planted in a position the model can imitate on its next turn
+# (see the module docstring and tests/test_breaker3_sweep_chaos.py). Pulling
+# the floor closer to the tail moves that text further into the model's
+# imitation window, and assistant prose is only 8.4 percent of appended
+# content (docs/rewrite-mechanisms-2026-07-25.md), so there is little to buy.
+#
+# Tool-result masking has no turn-age gate of its own. It is priced by
+# masking_gate_gain instead, which is the correct shape: it compares the
+# rewrite cost against the read saving rather than guessing from position.
+ASSISTANT_TEXT_SWEEP_AGE = 3
+
 
 @dataclass(frozen=True, slots=True)
 class MaskCandidate:
@@ -48,6 +64,10 @@ class MaskCandidate:
     """True when the tool_result content is the Claude Code block-list form
     [{"type": "text", "text": ...}] rather than a plain string. The marker
     replaces the inner text, preserving sibling keys like cache_control."""
+    closed_episode: bool = False
+    """True when the closed-episode relaxation admitted this block rather than
+    the turn-age gate. Recorded on the CCR entry so retrieval rate can be
+    compared per gate (see CompressionStore._mask_gate_stats)."""
 
     @property
     def tokens_saved(self) -> int:
@@ -194,7 +214,7 @@ def sweep_history(
                 sweep_assistant_text
                 and role == "assistant"
                 and isinstance(content, str)
-                and assistant_turns - assistant_turn - 1 >= 3
+                and assistant_turns - assistant_turn - 1 >= ASSISTANT_TEXT_SWEEP_AGE
             ):
                 prepare(
                     message_index=message_index,
@@ -250,7 +270,7 @@ def sweep_history(
                 and role == "assistant"
                 and block_type == "text"
                 and isinstance(block.get("text"), str)
-                and assistant_turns - assistant_turn - 1 >= 3
+                and assistant_turns - assistant_turn - 1 >= ASSISTANT_TEXT_SWEEP_AGE
             ):
                 prepare(
                     message_index=message_index,
@@ -345,6 +365,40 @@ def _tool_metadata(messages: list[dict[str, Any]]) -> tuple[dict[str, tuple[str,
     return metadata, assistant_turn
 
 
+def closed_episode_turn(messages: list[dict[str, Any]]) -> int | None:
+    """Assistant-turn index at which the most recent finished task ended.
+
+    A new user ask closes the task before it. Everything that task produced is
+    finished work: the model has been told what to do next and will not be
+    reasoning from those tool results again, whatever their age in turns.
+
+    Returns None when the conversation has no closed task yet, either because
+    the last message is not a user ask or because the ask is the first thing in
+    the conversation. A user message that only carries tool results is the
+    client returning work the model asked for, not a new ask, so it does not
+    close anything.
+    """
+    boundary_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            kinds = {b.get("type") for b in content if isinstance(b, dict)}
+            if "tool_result" in kinds:
+                # Tool results coming back mid-task, not a new instruction.
+                return None
+        boundary_index = index
+        break
+
+    if boundary_index is None or boundary_index == 0:
+        return None
+
+    _, closed_turns = _tool_metadata(messages[:boundary_index])
+    return closed_turns or None
+
+
 def discover_candidates(
     messages: list[dict[str, Any]],
     *,
@@ -352,8 +406,16 @@ def discover_candidates(
     mask_after_turns: int = 3,
     mask_min_tokens: int = 400,
     mask_input_keys: tuple[str, ...] = (),
+    episode_closed_turn: int | None = None,
 ) -> list[MaskCandidate]:
-    """Prepare eligible markers without mutating messages or writing CCR."""
+    """Prepare eligible markers without mutating messages or writing CCR.
+
+    ``episode_closed_turn`` names the assistant turn where the last finished
+    task ended (see ``closed_episode_turn``). Results produced before it skip
+    the turn-age gate: that gate is a proxy for "the model has moved on", and a
+    closed task is the direct evidence the proxy stands in for. It only relaxes
+    the age test, never the size or already-compact tests.
+    """
     metadata, assistant_turns = _tool_metadata(messages)
     candidates: list[MaskCandidate] = []
 
@@ -369,7 +431,16 @@ def discover_candidates(
     ) -> MaskCandidate | None:
         if _already_compact(original):
             return None
-        if assistant_turns - source_turn - 1 < max(0, mask_after_turns):
+        # Results only. A tool input sits where the model generates, and the
+        # 2026-07-17 mimicry incident came from marker text landing there; the
+        # age gate is part of what keeps that text away from the tail, so it
+        # does not get relaxed for inputs however cold the task is.
+        in_closed_episode = (
+            input_key is None
+            and episode_closed_turn is not None
+            and source_turn < episode_closed_turn
+        )
+        if not in_closed_episode and assistant_turns - source_turn - 1 < max(0, mask_after_turns):
             return None
         original_tokens = max(0, int(count_tokens(original)))
         if original_tokens < max(0, mask_min_tokens):
@@ -411,6 +482,7 @@ def discover_candidates(
             original_bytes=original_bytes,
             input_key=input_key,
             text_block=text_block,
+            closed_episode=in_closed_episode,
         )
 
     for message_index, message in enumerate(messages):
@@ -504,6 +576,7 @@ def apply_candidates(
                 tool_call_id=candidate.tool_use_id,
                 compression_strategy="observation_masking",
                 explicit_hash=candidate.content_hash,
+                mask_gate="episode" if candidate.closed_episode else "age",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("observation_masking: CCR store failed for %s: %s", candidate.tool_use_id, exc)

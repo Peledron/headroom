@@ -120,7 +120,7 @@ def test_ledger_render_wired_only_into_the_structural_bust_branch():
     calls = source.count("structural_ledger.build_structural_ledger(")
     assert calls == 1, "expected exactly one call site for the ledger render"
 
-    bust_log_index = source.index('"[%s] STRUCTURAL-BUST: alive_fraction=%.2f forcing fresh 5m write"')
+    bust_log_index = source.index('"[%s] STRUCTURAL-BUST: alive_fraction=%.2f forcing fresh %s write"')
     call_index = source.index("structural_ledger.build_structural_ledger(")
 
     # The render call sits shortly after the bust log line (same

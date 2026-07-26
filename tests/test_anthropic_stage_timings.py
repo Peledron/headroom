@@ -11,6 +11,7 @@ import anyio
 import pytest
 from fastapi import Request
 
+from headroom.cache.prefix_tracker import PrefixCacheTracker, PrefixFreezeConfig
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.models import ProxyConfig
 
@@ -50,6 +51,17 @@ class _ResponseStub:
             "content": [],
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }
+
+
+def _tracker_double() -> PrefixCacheTracker:
+    """A real tracker with freezing off, not a hand-rolled stand-in.
+
+    These tests are about stage timings and header handling, not about the
+    tracker, but the handler drives about thirty methods on whatever the store
+    returns. A SimpleNamespace listing them by hand went stale every time the
+    handler learned a new one, so the real class is cheaper to keep honest.
+    """
+    return PrefixCacheTracker("anthropic", PrefixFreezeConfig(enabled=False))
 
 
 class _DummyAnthropicHandler(AnthropicHandlerMixin):
@@ -94,33 +106,16 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.request_logger = self.logger
         self.usage_observer = None
         self.image_compressor = None
+        # ``resolve_tracker`` and ``get_or_create`` hand back the same object in
+        # the real store, so they get the same surface here. Splitting them was
+        # how this double drifted: the handler resolves its tracker through
+        # ``resolve_tracker`` and then drives telemetry only the other branch
+        # had been given.
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
             peek_idle_seconds=lambda *a, **k: 0.0,
-            get_or_create=lambda *a, **k: SimpleNamespace(
-                get_frozen_message_count=lambda: 0,
-                get_last_original_messages=lambda: [],
-                get_last_forwarded_messages=lambda: [],
-                record_request=lambda *a, **k: None,
-                # Telemetry surface the handler drives on the real tracker.
-                peek_idle_seconds=lambda *a, **k: 0.0,
-                record_turn_gap=lambda *a, **k: None,
-                note_compression=lambda *a, **k: None,
-                recommended_ttl=lambda *a, **k: None,
-                cached_token_count=lambda: 0,
-                turn_number=lambda: 0,
-                compress_latched=False,
-                latch_compress=lambda: None,
-                recent_compression_ratio=lambda *a, **k: 0.8,
-                conservative_compression_ratio=lambda *a, **k: 0.8,
-                compression_ratio_stddev=lambda: 0.0,
-            ),
-            resolve_tracker=lambda *a, **k: SimpleNamespace(
-                get_frozen_message_count=lambda: 0,
-                get_last_original_messages=lambda: [],
-                get_last_forwarded_messages=lambda: [],
-                record_request=lambda *a, **k: None,
-            ),
+            get_or_create=lambda *a, **k: _tracker_double(),
+            resolve_tracker=lambda *a, **k: _tracker_double(),
         )
 
     async def _next_request_id(self) -> str:

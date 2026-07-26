@@ -1,5 +1,6 @@
 """Tests for PrefixCacheTracker — cache-aware compression."""
 
+import copy
 import time
 
 import pytest
@@ -13,6 +14,7 @@ from headroom.cache.prefix_tracker import (
     PrefixCacheTracker,
     PrefixFreezeConfig,
     SessionTrackerStore,
+    overlay_cached_prefix,
 )
 
 
@@ -675,6 +677,106 @@ class TestConversationLineageResolution:
         assert fresh is not tracker
         assert store.active_sessions == 2
 
+    @staticmethod
+    def _edit_late(history: list[dict], index: int) -> list[dict]:
+        """History with one old message rewritten, as a client stripping an
+        ephemeral <system-reminder> block out of its own transcript does."""
+        edited = [dict(m) for m in history]
+        edited[index] = {**edited[index], "content": "trimmed by the client"}
+        return edited
+
+    def test_late_edit_keeps_the_lineage(self, store):
+        """One rewritten message near the tail must not discard the agreeing
+        head. Strict prefix matching threw away the whole lineage, so prev_fwd
+        went to 0 and overlay_cached_prefix had nothing to replay. Measured on
+        the replay corpus: histories of 20+ messages broke lineage on 18.1
+        percent of turns at mean mismatch depth 167."""
+        sid = "shared"
+        history = self._history("A", 40)
+        tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+        late = self._edit_late(history, len(history) - 4)
+        assert store.resolve_tracker(sid, "anthropic", messages=late) is tracker
+        assert store.active_sessions == 1
+
+    def test_early_divergence_still_gets_a_fresh_tracker(self, store):
+        """The #2085 guarantee. Two conversations under one session id share a
+        short head and then diverge for good: they must stay apart."""
+        sid = "shared"
+        history = self._history("A", 40)
+        tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+        branched = self._edit_late(history, 4)
+        assert store.resolve_tracker(sid, "anthropic", messages=branched) is not tracker
+        assert store.active_sessions == 2
+
+    def test_short_overlap_is_rejected_even_at_a_high_fraction(self):
+        """The absolute floor is the primary defence against merging siblings,
+        because a fraction alone cannot see scale. Two short conversations that
+        share their opening score a high fraction on a tiny chain, which is
+        exactly the #2085 shape: same system prompt, same first exchange, then
+        independent work. Nine shared messages out of ten is 0.9, well over the
+        fraction guard, so only the message floor keeps them apart."""
+        store = SessionTrackerStore(
+            default_config=PrefixFreezeConfig(
+                lineage_rematch_min_messages=16,
+                lineage_rematch_fraction=0.5,
+            )
+        )
+        sid = "shared"
+        history = self._history("A", 5)
+        tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+        sibling = self._edit_late(history, len(history) - 1)
+        assert store.resolve_tracker(sid, "anthropic", messages=sibling) is not tracker
+        assert store.active_sessions == 2
+
+    def test_strict_prefix_is_preferred_over_a_partial_match(self, store):
+        """A chain that genuinely prefixes the history wins outright, so the
+        fallback can never pull a conversation onto a worse-matching lineage."""
+        sid = "shared"
+        exact = store.resolve_tracker(sid, "anthropic", messages=self._history("A", 40))
+        store.resolve_tracker(sid, "anthropic", messages=self._edit_late(self._history("A", 40), 4))
+        grown = self._history("A", 41)
+        assert store.resolve_tracker(sid, "anthropic", messages=grown) is exact
+
+    def test_retained_lineage_replays_the_forwarded_head_byte_identical(self, store):
+        """The payoff, end to end. Retaining the tracker is only worth anything
+        because overlay_cached_prefix can then replay what was forwarded last
+        turn. This asserts the bytes, not just the tracker identity: every
+        message before the client's edit must come back exactly as forwarded,
+        and the edited message onward must be this turn's fresh output."""
+        sid = "shared"
+        history = self._history("A", 40)
+        store.resolve_tracker(sid, "anthropic", messages=history)
+
+        # What the proxy forwarded last turn: the head was compressed, so it is
+        # deliberately NOT equal to the client's original.
+        forwarded = [{**m, "content": f"compressed-{i}"} for i, m in enumerate(history)]
+
+        edit_at = len(history) - 4
+        late = self._edit_late(history, edit_at)
+        assert store.resolve_tracker(sid, "anthropic", messages=late) is not None
+
+        # This turn's pipeline output, recompressed from scratch and drifted.
+        fresh = [{**m, "content": f"recompressed-{i}"} for i, m in enumerate(late)]
+
+        result = overlay_cached_prefix(
+            fresh,
+            late,
+            previous_original_messages=history,
+            previous_forwarded_messages=forwarded,
+        )
+
+        assert result[:edit_at] == forwarded[:edit_at]
+        assert result[edit_at:] == fresh[edit_at:]
+
+    def test_fraction_above_one_restores_strict_matching(self):
+        """Opt-out: the fallback is off when no agreement can satisfy it."""
+        store = SessionTrackerStore(PrefixFreezeConfig(lineage_rematch_fraction=1.5))
+        sid = "shared"
+        history = self._history("A", 40)
+        tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+        late = self._edit_late(history, len(history) - 4)
+        assert store.resolve_tracker(sid, "anthropic", messages=late) is not tracker
+
     @pytest.mark.parametrize("messages", [None, []], ids=["none", "empty"])
     def test_resolve_without_messages_matches_legacy_get_or_create(self, store, messages):
         tracker = store.resolve_tracker("sid", "anthropic", messages=messages)
@@ -997,3 +1099,189 @@ class TestClassifyCacheMiss:
             ).resolved_cache_ttl_seconds()
             == 3600
         )
+
+
+class TestForwardedPrefixWillChange:
+    """The gates ask this before spending a rewrite, so it has to be exact.
+
+    A false positive hands the effort router and the compaction advisor a free
+    pass they have not earned. A false negative charges them for a write that
+    was already being paid. The region that matters is the one the provider
+    billed us a read for, not the whole list we sent last turn.
+    """
+
+    @staticmethod
+    def _msgs(*texts: str) -> list[dict]:
+        return [{"role": "user", "content": t} for t in texts]
+
+    @staticmethod
+    def _warm(cached_messages: list[dict], read_tokens: int = 4000) -> PrefixCacheTracker:
+        """A tracker that has billed a read covering exactly these messages."""
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=read_tokens,
+            cache_write_tokens=0,
+            messages=cached_messages,
+            message_token_counts=[read_tokens // len(cached_messages)] * len(cached_messages),
+        )
+        return tracker
+
+    def test_a_cold_lineage_is_not_busting(self):
+        """Nothing cached yet, so there is no prefix to invalidate."""
+        tracker = PrefixCacheTracker("anthropic")
+        assert tracker.forwarded_prefix_will_change(self._msgs("a", "b")) is False
+
+    def test_an_appended_turn_keeps_the_prefix(self):
+        cached = self._msgs("a", "b")
+        tracker = self._warm(cached)
+        assert tracker.forwarded_prefix_will_change(cached + self._msgs("c")) is False
+
+    def test_rewriting_the_uncached_tail_is_not_a_bust(self):
+        """The regression this method exists to avoid.
+
+        Last turn's uncached tail is this turn's mid-prefix. Recompressing it
+        changes the list without touching what the provider cached, and a
+        whole-list compare called that a bust on every turn of a healthy
+        lineage.
+        """
+        tracker = self._warm(self._msgs("a", "b"))
+        # Two messages were cached. Send those verbatim, everything after
+        # rewritten.
+        current = self._msgs("a", "b", "tail-recompressed", "d")
+        assert tracker.forwarded_prefix_will_change(current) is False
+
+    def test_rewriting_the_head_of_the_cached_prefix_is_a_bust(self):
+        cached = self._msgs(*[f"m{i}" for i in range(8)])
+        tracker = self._warm(cached)
+        current = self._msgs("CHANGED", *[f"m{i}" for i in range(1, 8)])
+        assert tracker.forwarded_prefix_will_change(current) is True
+
+    def test_rewriting_the_last_cached_message_is_not_already_paid(self):
+        """Providers match a longest common prefix, so depth is the question.
+
+        Recompressing the final cached message leaves everything ahead of it
+        readable. Handing a caller a free-rewrite discount for that spends the
+        rest of the prefix on a mutation it never covered.
+        """
+        cached = self._msgs(*[f"m{i}" for i in range(8)])
+        tracker = self._warm(cached)
+        current = self._msgs(*[f"m{i}" for i in range(7)], "CHANGED")
+        assert tracker.forwarded_prefix_will_change(current) is False
+
+    def test_a_shorter_list_than_the_cached_prefix_is_a_bust(self):
+        tracker = self._warm(self._msgs("a", "b"))
+        assert tracker.forwarded_prefix_will_change(self._msgs("a")) is True
+
+    def test_a_non_list_body_is_not_treated_as_a_bust(self):
+        """Best-effort: an unreadable body is no evidence of anything."""
+        tracker = self._warm(self._msgs("a", "b"))
+        assert tracker.forwarded_prefix_will_change(None) is False
+
+    def test_a_moved_cache_breakpoint_is_not_a_bust(self):
+        """Claude Code slides the breakpoint forward on every call.
+
+        The same cached message carries cache_control on one turn and not the
+        next. That is a directive about marker placement, not content, and
+        treating it as a change reported a bust on every turn of a lineage
+        billing 97 to 100% cache hits.
+        """
+        base = [
+            {"role": "user", "content": [{"type": "text", "text": f"m{i}"}]} for i in range(4)
+        ]
+        turn1 = copy.deepcopy(base)
+        turn1[2]["content"][0]["cache_control"] = {"type": "ephemeral"}
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=400,
+            cache_write_tokens=0,
+            messages=turn1,
+            message_token_counts=[100] * 4,
+        )
+
+        turn2 = copy.deepcopy(base)
+        turn2[3]["content"][0]["cache_control"] = {"type": "ephemeral"}
+        assert tracker.forwarded_prefix_will_change(turn2) is False
+
+        # Content still counts, marker or no marker.
+        turn3 = copy.deepcopy(turn2)
+        turn3[1]["content"][0]["text"] = "rewritten"
+        assert tracker.forwarded_prefix_will_change(turn3) is True
+
+    def test_the_projected_assistant_tail_is_excluded(self):
+        """Callers record what they sent plus the assistant reply they parsed.
+
+        That reconstruction never byte-matches the client's own echo of the same
+        reply, so including it in the compare reports a bust on every single
+        turn. Only the region actually sent upstream is evidence of anything.
+        """
+        sent = self._msgs("a", "b")
+        reconstructed = {"role": "assistant", "content": [{"type": "text", "text": "reply"}]}
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=300,
+            cache_write_tokens=0,
+            messages=sent + [reconstructed],
+            message_token_counts=[100] * 3,
+            sent_message_count=len(sent),
+        )
+        # The provider's read covered all three, but only two were ever sent.
+        assert tracker._cached_message_count == 3
+
+        # Next turn the client echoes its own, differently-shaped, version.
+        client_echo = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "reply"}],
+            "id": "msg_abc",
+        }
+        assert (
+            tracker.forwarded_prefix_will_change(sent + [client_echo] + self._msgs("c"))
+            is False
+        )
+
+    def test_rewriting_a_sent_message_is_still_a_bust(self):
+        """Excluding the projected tail must not blind it to real changes."""
+        sent = self._msgs(*[f"m{i}" for i in range(8)])
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=900,
+            cache_write_tokens=0,
+            messages=sent + [{"role": "assistant", "content": "reply"}],
+            message_token_counts=[100] * 9,
+            sent_message_count=len(sent),
+        )
+        current = self._msgs("CHANGED", *[f"m{i}" for i in range(1, 8)])
+        assert tracker.forwarded_prefix_will_change(current) is True
+
+    def test_the_sent_count_survives_a_snapshot_round_trip(self):
+        """A restored lineage keeps reading its live prefix.
+
+        The exported message list carries a projected assistant tail. Without
+        the sent count travelling alongside it, the restored tracker compares
+        against that tail and calls the first turn after a restart a bust.
+        """
+        sent = self._msgs("a", "b")
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=300,
+            cache_write_tokens=0,
+            messages=sent + [{"role": "assistant", "content": "reply"}],
+            message_token_counts=[100] * 3,
+            sent_message_count=len(sent),
+        )
+
+        restored = PrefixCacheTracker("anthropic")
+        restored.restore_state(tracker.export_state())
+        assert restored._last_sent_message_count == len(sent)
+
+        client_echo = {"role": "assistant", "content": [{"type": "text", "text": "reply"}]}
+        assert (
+            restored.forwarded_prefix_will_change(sent + [client_echo] + self._msgs("c"))
+            is False
+        )
+
+    def test_an_older_snapshot_without_the_sent_count_still_loads(self):
+        blob = PrefixCacheTracker("anthropic").export_state()
+        blob.pop("last_sent_message_count")
+        restored = PrefixCacheTracker("anthropic")
+        restored.restore_state(blob)
+        assert restored._last_sent_message_count == 0

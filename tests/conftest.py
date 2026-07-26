@@ -3,11 +3,23 @@
 # CRITICAL: Must be set before ANY imports that could trigger sentence_transformers
 # The Rust tokenizers use parallelism that deadlocks with pytest-asyncio
 import os
+import tempfile
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Lineage persistence defaults to on and its default state path is the real
+# ~/.headroom/lineages. Any test that builds a proxy would otherwise write live
+# conversation content into the developer's own state file and could load it
+# back on a later run. This has to be a plain import-time assignment, not a
+# fixture: session and module scoped fixtures build proxies before any
+# function-scoped autouse fixture runs, so a fixture cannot cover them.
+os.environ["HEADROOM_LINEAGE_PERSIST"] = "0"
+os.environ.setdefault(
+    "HEADROOM_LINEAGE_DIR", os.path.join(tempfile.gettempdir(), "headroom-test-lineages")
+)
+
 import json
-import tempfile
+import warnings
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -15,6 +27,14 @@ from unittest.mock import Mock
 import pytest
 
 from tests._skip_helpers import external_model_skip_reason
+
+# Captured before any test module is imported, so it is the real stdlib
+# function. Collection imports every test module, and an import-time
+# monkeypatch of warnings.warn made there outlives the module that caused it.
+# CrewAI does exactly this: importing it installs a wrapper that drops the
+# Python 3.13 skip_file_prefixes keyword, which makes every later
+# datetime.strptime call raise TypeError. See pytest_collection_finish.
+_PRISTINE_WARNINGS_WARN = warnings.warn
 
 
 # A live `headroom` dev session exports HEADROOM_* into the shell (and the
@@ -28,6 +48,19 @@ def _scrub_developer_headroom_env(monkeypatch):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+
+
+# Lineage persistence defaults to on, and its default state path is the real
+# ~/.headroom/lineages. Any test that builds a proxy would otherwise write live
+# conversation content into the developer's own state file, and could load it
+# back on the next run. Scrubbing HEADROOM_* above is what exposes the default,
+# so this has to run after that fixture. Redirect the whole directory rather
+# than only disabling the flush: a test that enables persistence explicitly
+# still lands in its own tmp tree.
+@pytest.fixture(autouse=True)
+def _isolate_lineage_persistence(_scrub_developer_headroom_env, monkeypatch, tmp_path):
+    monkeypatch.setenv("HEADROOM_LINEAGE_PERSIST", "0")
+    monkeypatch.setenv("HEADROOM_LINEAGE_DIR", str(tmp_path / "lineages"))
 
 
 # The Copilot "routed to Copilot" flag is a module-global ContextVar that
@@ -55,6 +88,18 @@ def _reset_copilot_routing_flag():
 # =============================================================================
 # Global test hooks
 # =============================================================================
+
+
+def pytest_collection_finish(session):
+    """Undo any import-time replacement of ``warnings.warn``.
+
+    Runs after every test module has been imported and before the first test
+    runs, which is the only window that covers a polluter installed at import
+    time. Without this the failure lands on whichever unrelated test happens to
+    call datetime.strptime next, and looks like a bug in that test.
+    """
+    if warnings.warn is not _PRISTINE_WARNINGS_WARN:
+        warnings.warn = _PRISTINE_WARNINGS_WARN
 
 
 @pytest.hookimpl(hookwrapper=True)

@@ -65,7 +65,7 @@ class _RecordingTracker:
     def record_turn_gap(self, gap_seconds) -> None:  # noqa: ANN001
         return None
 
-    def observe_client_churn(self, messages) -> float:  # noqa: ANN001
+    def observe_client_churn(self, messages, head_fingerprint=None) -> float:  # noqa: ANN001
         return 1.0
 
     def get_last_original_messages(self) -> list[dict]:

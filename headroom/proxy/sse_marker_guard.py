@@ -73,13 +73,24 @@ class SseToolUseMarkerGuard:
     traffic stays byte-identical.
     """
 
-    def __init__(self, retrieve: Callable[[str], str | None], request_id: str) -> None:
+    def __init__(
+        self,
+        retrieve: Callable[[str], str | None],
+        request_id: str,
+        stored_hashes: Callable[[], list[str]] | None = None,
+    ) -> None:
         self._retrieve = retrieve
         self._request_id = request_id
+        self._stored_hashes = stored_hashes
         self._buffer = bytearray()
         # index -> {"raw": [bytes], "start": dict, "json": [str]}
         self._held: dict[int, dict[str, Any]] = {}
         self._blocked = False
+        # Set once any tool_use block reaches the client intact. A blocked
+        # stream cannot be retried the way a buffered response can, since its
+        # earlier events are already gone, so a surviving call is the only way
+        # the client's loop keeps turning without a human.
+        self._released_tool_use = False
 
     def feed(self, chunk: bytes) -> bytes:
         self._buffer.extend(chunk)
@@ -144,7 +155,7 @@ class SseToolUseMarkerGuard:
             held["raw"].append(raw)
             return self._resolve_block(index, held)
 
-        if kind == "message_delta" and self._blocked:
+        if kind == "message_delta" and self._blocked and not self._released_tool_use:
             delta = data.get("delta")
             if isinstance(delta, dict) and delta.get("stop_reason") == "tool_use":
                 data["delta"] = {**delta, "stop_reason": "end_turn"}
@@ -156,6 +167,7 @@ class SseToolUseMarkerGuard:
     def _resolve_block(self, index: int, held: dict[str, Any]) -> bytes:
         joined = "".join(held["json"])
         if not any(p in joined for p in _MARKER_PREFIXES):
+            self._released_tool_use = True
             return b"".join(held["raw"])
 
         try:
@@ -171,8 +183,10 @@ class SseToolUseMarkerGuard:
         if missing is not None:
             return self._blocked_block(index, missing)
         if not changed:
+            self._released_tool_use = True
             return b"".join(held["raw"])
 
+        self._released_tool_use = True
         logger.warning("[%s] SSE_MARKER_GUARD: expanded tool_use input", self._request_id)
         start = held["start"]
         block = dict(start.get("content_block") or {})
@@ -205,15 +219,21 @@ class SseToolUseMarkerGuard:
         return bytes(out)
 
     def _blocked_block(self, index: int, missing_hash: str) -> bytes:
+        from headroom.proxy.marker_recovery import blocked_message, nearest_stored_hashes
+
         self._blocked = True
+        try:
+            keys = self._stored_hashes() if self._stored_hashes is not None else []
+            suggestions = nearest_stored_hashes(missing_hash, keys)
+        except Exception:  # pragma: no cover - suggestions are never load bearing
+            suggestions = []
         logger.warning(
-            "[%s] SSE_MARKER_GUARD: blocked hash=%s", self._request_id, missing_hash
+            "[%s] SSE_MARKER_GUARD: blocked hash=%s near=%s",
+            self._request_id,
+            missing_hash,
+            ",".join(suggestions) or "-",
         )
-        message = (
-            "Headroom blocked this tool call: its input contained a recovery "
-            f"marker with unknown hash {missing_hash}. Re-emit the tool call "
-            "with the real content written out in full."
-        )
+        message = blocked_message(missing_hash, suggestions=suggestions)
         out = bytearray()
         out.extend(
             _sse_event(

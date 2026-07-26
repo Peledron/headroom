@@ -97,26 +97,25 @@ def test_str_vs_list_system_both_recognize_marker():
     )
 
 
-# --- Real gap: the marker can be present yet MISSED by the plain substring
-# check, because _flatten_system_text joins list blocks with "\n". If the
-# literal 4-character marker straddles a block boundary, the joined text
-# never contains an unbroken "[1m]" substring, even though the original
-# system head DOES render "<id>[1m]" (Claude Code just happened to chunk the
-# text at that offset, e.g. an env-info block boundary). This is a real
-# finding: it freezes a genuine main-agent request. Confirmed cost-only, not
-# a correctness bug (see claim 2 analysis: the frozen path skips compression,
-# it does not corrupt the forwarded body).
+# --- Closed gap: the marker used to be present yet MISSED by the substring
+# check, because _flatten_system_text joined list blocks with "\n". If the
+# literal 4-character marker straddled a block boundary, the joined text never
+# contained an unbroken "[1m]" substring, even though the original system head
+# DOES render "<id>[1m]" (Claude Code just happened to chunk the text at that
+# offset, e.g. an env-info block boundary), which froze a genuine main-agent
+# request. The join is now separator-free, so the marker survives the boundary.
+# This test pins that behavior so the readable-text join cannot come back.
 
 
-def test_marker_split_across_adjacent_blocks_is_missed_BUG():
+def test_marker_split_across_adjacent_blocks_is_still_seen():
     system = [
         {"type": "text", "text": f"Header text. Exact model ID is {MODEL}[1"},
         {"type": "text", "text": "m]. Rest of the system head follows."},
     ]
     flattened = _flatten_system_text(system)
-    assert "[1m]" not in flattened  # the join's "\n" breaks the marker in two
-    # A real main-agent head, misclassified as lacking the marker:
-    assert _system_lacks_1m_marker(system) is True  # BUG: should be False
+    assert "[1m]" in flattened  # the separator-free join keeps the marker whole
+    # A real main-agent head, correctly classified as carrying the marker:
+    assert _system_lacks_1m_marker(system) is False
 
 
 def test_marker_defeated_by_fullwidth_bracket_lookalike():

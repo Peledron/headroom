@@ -100,8 +100,10 @@ def test_empty_and_missing():
 
 
 def test_flatten_joins_blocks():
+    # Separator-free, so a marker straddling a block boundary stays intact for
+    # the substring detectors that are this function's only callers.
     system = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
-    assert _flatten_system_text(system) == "a\nb"
+    assert _flatten_system_text(system) == "ab"
     assert _flatten_system_text("raw") == "raw"
     assert _flatten_system_text(None) == ""
 

@@ -113,7 +113,7 @@ class _FakePrefixTracker:
             config=SimpleNamespace(adaptive_ttl=False, subagent_ttl_5m=False)
         )
 
-    def observe_client_churn(self, _messages):
+    def observe_client_churn(self, _messages, head_fingerprint=None):
         return self._alive_fraction
 
     def get_last_original_messages(self):
@@ -139,6 +139,11 @@ class _FakePrefixTracker:
 
     def recommended_ttl(self):
         return None
+
+    def prefers_long_ttl(self):
+        # The real tracker answers False below the TTL size floor, and this
+        # double's prefix is 5000 tokens, well under it.
+        return False
 
     def cached_token_count(self):
         return self._cached_token_count
@@ -221,10 +226,14 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         tracker = _FakePrefixTracker(
             frozen_message_count=frozen_message_count, alive_fraction=alive_fraction
         )
+        # The handler resolves its tracker through ``resolve_tracker`` and only
+        # falls back to ``get_or_create``. Both hand back the same object in the
+        # real store, so the double gives them the same one.
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: session_id,
             peek_idle_seconds=lambda *a, **k: 0.0,
             get_or_create=lambda *a, **k: tracker,
+            resolve_tracker=lambda *a, **k: tracker,
         )
         self.anthropic_pre_upstream_sem = None
         self.anthropic_pre_upstream_concurrency = 0

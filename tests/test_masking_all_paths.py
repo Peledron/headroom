@@ -27,7 +27,7 @@ class _HybridMaskingTracker(_FakePrefixTracker):
         super().__init__(frozen_count=0)
         self._client_prefix_alive = client_prefix_alive
 
-    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+    def observe_client_churn(self, messages, head_fingerprint=None):  # noqa: ANN001, ANN201
         return self._client_prefix_alive
 
     @property

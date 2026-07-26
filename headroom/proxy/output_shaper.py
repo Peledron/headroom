@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.proxy import runtime_env
+from headroom.proxy.effort_pricing import EffortPricingContext
 from headroom.proxy.output_effort_policy import (
     EFFORT_RANK as _EFFORT_RANK,
 )
@@ -246,6 +247,7 @@ def route_effort(
     body: dict[str, Any],
     kind: TurnKind,
     settings: OutputShaperSettings,
+    pricing: EffortPricingContext | None = None,
 ) -> tuple[list[str], str | None]:
     """Lower effort spend on mechanical continuations.
 
@@ -253,9 +255,6 @@ def route_effort(
     was edited (empty list = untouched). decision is "lowered", "pinned", or
     None.
     """
-    if kind is not TurnKind.MECHANICAL_CONTINUATION:
-        return [], None
-
     # Modern lever: output_config.effort. Only lower a value the client
     # explicitly sent — presence proves the target model accepts the param.
     output_config = body.get("output_config")
@@ -263,17 +262,48 @@ def route_effort(
         return [], None
 
     effort = output_config.get("effort")
+
+    # Stickiness comes before the turn-kind gate, and that order is the whole
+    # point. What costs tokens is not the effort level, it is changing it:
+    # output_config leads every message, so a flip rewrites the full prefix.
+    # Gating on turn kind alone makes the value follow the conversation between
+    # tool runs and user asks, and pays a rewrite on every alternation. Once a
+    # lineage has committed to a value, hold it on every turn.
+    if pricing is not None and pricing.committed_effort:
+        held = pricing.committed_effort
+        if effort == held:
+            return [], "sticky:held"
+        output_config["effort"] = held
+        return [f"output_shaper:effort:{effort}->{held}"], "sticky:reapplied"
+
+    if kind is not TurnKind.MECHANICAL_CONTINUATION:
+        return [], None
+
     lowered = lower_effort_value(effort, settings.mechanical_effort)
     if lowered is None:
         return [], None
 
     # Flipping output_config.effort busts the Anthropic prompt cache (measured
-    # 2026-07-19, two full-prefix rewrites per flip), so a cached request
-    # keeps its current effort instead.
+    # 2026-07-19, two full-prefix rewrites per flip). Without a price for that
+    # rewrite the only safe answer is to keep the current effort.
     if request_uses_prompt_caching(body):
-        return [], "pinned"
+        if pricing is None:
+            return [], "pinned"
+
+        decision = pricing.decide(from_effort=str(effort), to_effort=lowered)
+        if not decision.switch:
+            return [], f"pinned:{decision.reason}"
+
+        output_config["effort"] = lowered
+        pricing.record(lowered)
+        return (
+            [f"output_shaper:effort:{effort}->{lowered}"],
+            f"lowered:{decision.reason}",
+        )
 
     output_config["effort"] = lowered
+    if pricing is not None:
+        pricing.record(lowered)
     return [f"output_shaper:effort:{effort}->{lowered}"], "lowered"
 
 
@@ -362,6 +392,7 @@ def shape_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
     level_override: int | None = None,
+    pricing: EffortPricingContext | None = None,
 ) -> ShapeResult:
     """Apply all output-shaping levers to an Anthropic request body in place.
 
@@ -384,7 +415,7 @@ def shape_request(
 
     if settings.effort_router_enabled:
         kind = classify_turn(body.get("messages", []))
-        labels, effort_decision = route_effort(body, kind, settings)
+        labels, effort_decision = route_effort(body, kind, settings, pricing)
         if labels:
             result.changed = True
             result.labels.extend(labels)

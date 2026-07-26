@@ -25,6 +25,7 @@ import anyio
 import pytest
 from fastapi import Request
 
+from headroom.cache.prefix_tracker import PrefixCacheTracker, PrefixFreezeConfig
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.helpers import referenced_tool_names
 from headroom.proxy.models import ProxyConfig
@@ -68,6 +69,17 @@ class _ResponseStub:
             "content": [],
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }
+
+
+def _tracker_double() -> PrefixCacheTracker:
+    """A real tracker with freezing off, not a hand-rolled stand-in.
+
+    These tests are about the tool-reference stub guard, but the handler drives
+    about thirty methods on whatever the store returns. Listing them by hand in
+    a SimpleNamespace went stale every time the handler learned a new one, so
+    the real class is cheaper to keep honest.
+    """
+    return PrefixCacheTracker("anthropic", PrefixFreezeConfig(enabled=False))
 
 
 class _DummyAnthropicHandler(AnthropicHandlerMixin):
@@ -116,24 +128,8 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
             peek_idle_seconds=lambda *a, **k: 0.0,
-            get_or_create=lambda *a, **k: SimpleNamespace(
-                get_frozen_message_count=lambda: 0,
-                get_last_original_messages=lambda: [],
-                get_last_forwarded_messages=lambda: [],
-                record_request=lambda *a, **k: None,
-                peek_idle_seconds=lambda *a, **k: 0.0,
-                record_turn_gap=lambda *a, **k: None,
-                note_compression=lambda *a, **k: None,
-                recommended_ttl=lambda *a, **k: None,
-                cached_token_count=lambda: 0,
-                turn_number=lambda: 0,
-                compress_latched=False,
-                latch_compress=lambda: None,
-                recent_compression_ratio=lambda *a, **k: 0.8,
-                conservative_compression_ratio=lambda *a, **k: 0.8,
-                observe_client_churn=lambda *a, **k: 1.0,
-                hybrid_controller=SimpleNamespace(config=SimpleNamespace(adaptive_ttl=False)),
-            ),
+            get_or_create=lambda *a, **k: _tracker_double(),
+            resolve_tracker=lambda *a, **k: _tracker_double(),
         )
 
     async def _next_request_id(self) -> str:

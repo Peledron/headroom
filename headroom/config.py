@@ -328,6 +328,22 @@ class ReadLifecycleConfig:
     compress_superseded: bool = False  # Disabled: busts Anthropic prompt cache prefix
     min_size_bytes: int = 512  # Skip tiny Read outputs (not worth the overhead)
 
+    # Send a re-read of an already-read file as a unified diff against the
+    # earlier read instead of full content. Measured 2026-07-25: unmasked tool
+    # results at or above 500 tokens are 36.2 percent of all genuinely appended
+    # content, and re-reads are a large share of those. A diff is a pure tail
+    # append of d bytes where the full text would append L.
+    #
+    # Off by default. This rewrites content the model reasons against, and on
+    # 2026-07-17 a masked rebase in this area put a fabricated marker on disk
+    # as a file's contents with an unrecoverable hash. Enable per deployment
+    # after a pilot, not as a default.
+    diff_rereads: bool = False
+    # A diff only pays if it is materially smaller than the text it replaces.
+    # A rewritten file diffs to roughly its own size, so fall through to full
+    # content above this fraction.
+    diff_max_ratio: float = 0.5
+
 
 @dataclass
 class ReadMaturationConfig:
@@ -552,14 +568,19 @@ class CCRConfig:
     """
 
     enabled: bool = True  # Enable CCR (cache + retrieval markers)
-    store_max_entries: int = 1000  # Max entries in compression store
+    # One marker per compressed tool result, and every one stays referenceable
+    # for the life of the session. At 1000 a long agentic session evicted the
+    # oldest markers while the client still quoted them, which made the marker
+    # guard block legitimate tool calls. Markers are small, so the bound is
+    # generous and the TTL sweep does the real reclaiming.
+    store_max_entries: int = 50000  # Max entries in compression store
     # Session-scale TTL. The original 5-minute default predates agentic
     # sessions that routinely run 30+ minutes; an expired entry silently
     # converts "lossless with retrieval" into "lossy", so the TTL is the
     # weakest link in the no-accuracy-loss guarantee. Kept in lockstep
     # with Rust DEFAULT_TTL (crates/headroom-core/src/ccr/mod.rs) and
     # DEFAULT_CCR_TTL_SECONDS (cache/compression_store.py).
-    store_ttl_seconds: int = 1800  # Cache TTL (30 minutes)
+    store_ttl_seconds: int = 86400  # Cache TTL (24 hours, whole-session scale)
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
     feedback_enabled: bool = True  # Track retrieval events for learning
     min_items_to_cache: int = 20  # Only cache if original had >= N items

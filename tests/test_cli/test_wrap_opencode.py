@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,17 @@ def runner() -> CliRunner:
 
 def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = str(tmp_path)
+    # Model caches must not follow HOME into tmp_path. The --memory path pulls a
+    # ~90MB embedding model, and a per-test cache re-downloaded it into every
+    # throwaway home: 5.3G per pytest run, retained for three runs, which filled
+    # a 16G /tmp and took the whole suite down with ENOSPC. Pinning the caches to
+    # a real directory downloads the model once for the machine instead.
+    shared_cache = Path(
+        os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    ) / "headroom-tests"
+    shared_cache.mkdir(parents=True, exist_ok=True)
+    for var in ("HF_HOME", "HUGGINGFACE_HUB_CACHE", "FASTEMBED_CACHE_PATH", "XDG_CACHE_HOME"):
+        monkeypatch.setenv(var, str(shared_cache))
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("USERPROFILE", home)
     monkeypatch.delenv("OPENCODE_HOME", raising=False)

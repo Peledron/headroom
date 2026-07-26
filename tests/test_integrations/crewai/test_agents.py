@@ -211,7 +211,11 @@ class TestHeadroomToolWrapper:
 
         wrapper = HeadroomToolWrapper(my_fn)
         assert wrapper.name == "my_fn"
-        assert wrapper.description == "Do something useful."
+        # CrewAI builds the description itself, prepending a name and argument
+        # preamble to the docstring. The wrapper's job is to carry that string
+        # through unchanged, whatever shape the installed CrewAI gives it.
+        assert wrapper.description == getattr(my_fn, "description")
+        assert "Do something useful." in wrapper.description
 
 
 class TestWrapToolsWithHeadroom:

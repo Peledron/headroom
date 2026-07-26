@@ -21,6 +21,19 @@ def _no_persistent_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda _port: None)
 
 
+@pytest.fixture(autouse=True)
+def _clean_routing_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unwrap reports routing residue from the live environment.
+
+    A developer running this suite from a shell that is itself wrapped by
+    Headroom exports ANTHROPIC_BASE_URL, which makes every unwrap test read
+    that residue and report it. Start from a clean environment, the tests that
+    exercise residue detection set the variables they need explicitly.
+    """
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_remove_claude_rtk_hooks_preserves_unrelated_hooks(tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     settings.write_text(

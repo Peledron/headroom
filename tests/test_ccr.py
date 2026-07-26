@@ -213,8 +213,10 @@ class TestCCRConfig:
         """Default CCR config values."""
         config = CCRConfig()
         assert config.enabled is True
-        assert config.store_max_entries == 1000
-        assert config.store_ttl_seconds == 1800  # session-scale (was 300)
+        # Long sessions blew through 1000 and evicted markers the transcript
+        # still quoted, which made the marker guard block live tool calls.
+        assert config.store_max_entries == 50000
+        assert config.store_ttl_seconds == 86400  # whole-session scale (was 1800)
         assert config.inject_retrieval_marker is True
         assert config.feedback_enabled is True
         assert config.min_items_to_cache == 20

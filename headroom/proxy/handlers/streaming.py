@@ -1467,7 +1467,15 @@ class StreamingMixin:
                     return None
                 return getattr(entry, "original_content", None) if entry else None
 
-            _sse_guard = SseToolUseMarkerGuard(_sse_guard_retrieve, request_id)
+            def _sse_guard_stored_hashes() -> list[str]:
+                """Keys the guard compares a rejected hash against."""
+                from headroom.cache.compression_store import get_compression_store
+
+                return get_compression_store().stored_hashes()
+
+            _sse_guard = SseToolUseMarkerGuard(
+                _sse_guard_retrieve, request_id, _sse_guard_stored_hashes
+            )
 
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests

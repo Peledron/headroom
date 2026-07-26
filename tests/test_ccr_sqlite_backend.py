@@ -17,7 +17,7 @@ from headroom.cache.backends.sqlite import SQLiteBackend
 from headroom.cache.compression_store import CompressionEntry, CompressionStore
 
 
-def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 1800) -> CompressionEntry:
+def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 86400) -> CompressionEntry:
     return CompressionEntry(
         hash=hash_key,
         original_content=content,
@@ -49,7 +49,7 @@ class TestSQLiteBackend:
         assert got is not None
         assert got.original_content == entry.original_content
         assert got.tool_name == "Read"
-        assert got.ttl == 1800
+        assert got.ttl == 86400
 
         assert b.exists("h1")
         assert b.count() == 1
@@ -199,9 +199,9 @@ class TestDefaults:
         """CCRConfig, CompressionEntry, and CompressionStore must agree."""
         from headroom.config import CCRConfig
 
-        assert CCRConfig().store_ttl_seconds == 1800
-        assert CompressionEntry.__dataclass_fields__["ttl"].default == 1800
-        assert CompressionStore()._default_ttl == 1800
+        assert CCRConfig().store_ttl_seconds == 86400
+        assert CompressionEntry.__dataclass_fields__["ttl"].default == 86400
+        assert CompressionStore()._default_ttl == 86400
 
     def test_default_backend_is_sqlite(self, monkeypatch, tmp_path):
         from headroom.cache.compression_store import _create_default_ccr_backend

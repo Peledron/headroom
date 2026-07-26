@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +32,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.proxy import structural_ledger
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
@@ -40,7 +43,6 @@ from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.outcome import RequestOutcome
-from headroom.proxy import structural_ledger
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -52,17 +54,37 @@ _RECOVERY_MARKER_PREFIXES = (
 _RECOVERY_HASH_RE = re.compile(r"hash=([0-9a-fA-F]{24})")
 
 
-def _guard_anthropic_tool_use_markers(response_json: dict[str, Any], *, request_id: str) -> bool:
+@dataclass(frozen=True)
+class MarkerGuardResult:
+    """What the guard did, and whether the turn can still move on its own.
+
+    ``stalled`` is the case that needs help: the blocked call was the only
+    thing the turn asked for, so the response now ends the turn and the client
+    stops until a human types. The message is carried out with the result so
+    the caller can hand it back to the model instead.
+    """
+
+    changed: bool
+    stalled: bool = False
+    message: str = ""
+
+    def __bool__(self) -> bool:
+        return self.changed
+
+
+def _guard_anthropic_tool_use_markers(
+    response_json: dict[str, Any], *, request_id: str
+) -> MarkerGuardResult:
     """Expand genuine recovery markers and block fabricated tool calls.
 
-    Returns True when the response was changed. This guard runs only on complete
-    Anthropic responses. Direct upstream SSE cannot be repaired safely after a
-    tool input delta has reached the client, so request-side tool-input masking
-    is disabled for that path below.
+    The result is truthy when the response was changed. This guard runs only on
+    complete Anthropic responses. Direct upstream SSE cannot be repaired safely
+    after a tool input delta has reached the client, so request-side tool-input
+    masking is disabled for that path below.
     """
     content = response_json.get("content")
     if not isinstance(content, list):
-        return False
+        return MarkerGuardResult(changed=False)
 
     from headroom.cache.compression_store import get_compression_store
 
@@ -102,7 +124,7 @@ def _guard_anthropic_tool_use_markers(response_json: dict[str, Any], *, request_
         logger.warning("[%s] MARKER_GUARD: expanded hash=%s", request_id, hash_key)
         return entry.original_content, None
 
-    blocked = False
+    blocked_messages: list[str] = []
     for block in content:
         if not isinstance(block, dict) or block.get("type") != "tool_use":
             guarded_content.append(block)
@@ -116,32 +138,76 @@ def _guard_anthropic_tool_use_markers(response_json: dict[str, Any], *, request_
             )
             continue
         changed = True
-        blocked = True
-        logger.warning("[%s] MARKER_GUARD: blocked hash=%s", request_id, missing_hash)
-        guarded_content.append(
-            {
-                "type": "text",
-                "text": (
-                    "Headroom blocked this tool call: its input contained a recovery "
-                    f"marker with unknown hash {missing_hash}. Re-emit the tool call "
-                    "with the real content written out in full."
-                ),
-            }
+        from headroom.proxy.marker_recovery import blocked_message, nearest_stored_hashes
+
+        try:
+            suggestions = nearest_stored_hashes(missing_hash, store.stored_hashes())
+        except Exception:  # pragma: no cover - suggestions are never load bearing
+            suggestions = []
+        logger.warning(
+            "[%s] MARKER_GUARD: blocked hash=%s near=%s",
+            request_id,
+            missing_hash,
+            ",".join(suggestions) or "-",
         )
+        message = blocked_message(missing_hash, suggestions=suggestions)
+        blocked_messages.append(message)
+        guarded_content.append({"type": "text", "text": message})
 
     if changed:
         response_json["content"] = guarded_content
-    if blocked:
-        # ``end_turn`` with any surviving tool_use block is an invalid
-        # Anthropic response shape. Defer every tool call in this turn so the
-        # model can re-emit a clean set after reading the guard message.
-        response_json["content"] = [
-            block
-            for block in guarded_content
-            if not isinstance(block, dict) or block.get("type") != "tool_use"
-        ]
-        response_json["stop_reason"] = "end_turn"
-    return changed
+    if not blocked_messages:
+        return MarkerGuardResult(changed=changed)
+
+    joined = "\n\n".join(blocked_messages)
+    survivors = any(
+        isinstance(block, dict) and block.get("type") == "tool_use" for block in guarded_content
+    )
+    if survivors:
+        # Only the marker-bearing call is gone. The rest of the turn still
+        # runs, the client's loop keeps turning on their results, and the model
+        # reads the guard text alongside them. A refusal costs one tool call
+        # here rather than the whole turn.
+        return MarkerGuardResult(changed=True, message=joined)
+
+    # Nothing executable survived, and ``end_turn`` is the only valid shape for
+    # a response with no tool_use block. That shape also parks the client until
+    # a human types, which no mistyped hash deserves, so the caller is told the
+    # turn stalled and given the message to hand back to the model.
+    response_json["stop_reason"] = "end_turn"
+    return MarkerGuardResult(changed=True, stalled=True, message=joined)
+
+
+def _prefix_certainly_lapsed(
+    prefix_tracker: Any, ttl_seconds: float | None, head_bust: bool = False
+) -> bool:
+    """True when the cached prefix has provably outlived its TTL tier.
+
+    This is the one moment compression is free. The suffix gets re-billed on
+    this turn no matter what is sent, so a rebase that would otherwise have to
+    earn back a full rewrite costs nothing. Measured on the live corpus, turns
+    past the 5m tier were 3.4% of traffic and 40% of all cache-write tokens,
+    and every one of them re-sent uncompressed history it was paying to write
+    anyway. Only a provable lapse counts, so an unknown idle time stays false
+    and the ordinary economics keep deciding.
+    """
+    # A head bust is the other provable death. The client changed the
+    # bytes ahead of every message (its tools array grows as deferred
+    # schemas load), so the provider matches nothing and the whole
+    # transcript is re-billed regardless of what we send. Idle time
+    # says nothing about it, so without this the free-rebase path
+    # never fired on exactly the turns where rewriting costs nothing.
+    if head_bust:
+        return True
+    if not ttl_seconds or ttl_seconds <= 0:
+        return False
+    try:
+        idle_seconds = prefix_tracker.peek_idle_seconds()
+    except Exception:
+        return False
+    if not isinstance(idle_seconds, (int, float)) or isinstance(idle_seconds, bool):
+        return False
+    return idle_seconds > ttl_seconds
 
 
 def _strip_streaming_only_content_fields(messages: Any) -> None:
@@ -639,6 +705,49 @@ class AnthropicHandlerMixin:
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
 
+    @staticmethod
+    def _observe_effort_cost(model: str, effort: str, output_tokens: int) -> None:
+        """Feed one turn's output cost into the effort pricing model.
+
+        The router needs to know what a level actually costs on this model
+        before it will spend a prefix rewrite to change it, and no provider
+        publishes that number. Bookkeeping only, so a failure here must never
+        touch the response.
+        """
+        if not model or not effort or output_tokens <= 0:
+            return
+        try:
+            from headroom.proxy.effort_pricing import shared_cost_model
+
+            shared_cost_model().observe(model, effort, int(output_tokens))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _observe_output_tokens(messages: Any, output_tokens: int, request_id: str) -> None:
+        """Log one turn's output cost, bucketed by turn shape.
+
+        The whole compression stack prices the request. This is the only
+        reading of what the response side costs, and the split by shape is
+        what says whether the lever is narration during tool loops or answer
+        length on direct questions. Bookkeeping only, so a failure here must
+        never touch the response.
+        """
+        if output_tokens <= 0:
+            return
+        try:
+            from headroom.proxy.output_accounting import (
+                classify_turn_shape,
+                shared_output_ledger,
+            )
+
+            shape = classify_turn_shape(messages)
+            observation = shared_output_ledger().observe(shape, int(output_tokens))
+            if observation is not None:
+                logger.info("[%s] OUTPUT_DIAG: %s", request_id, observation.as_log_fields())
+        except Exception:
+            pass
+
     def _anthropic_buffered_request_timeout(self) -> httpx.Timeout:
         """Timeout for buffered Anthropic reads."""
         return httpx.Timeout(
@@ -647,6 +756,68 @@ class AnthropicHandlerMixin:
             write=self.config.request_timeout_seconds,
             pool=self.config.connect_timeout_seconds,
         )
+
+    async def _retry_marker_blocked_turn(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        messages: list[dict[str, Any]],
+        guard_message: str,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        """Hand a marker refusal back to the model instead of back to the user.
+
+        A blocked turn with nothing left to run has to be shaped as
+        ``end_turn``, and ``end_turn`` parks the client's agent loop until a
+        human types. The mistake that got here is one the model can fix by
+        itself, so the refusal is replayed as the assistant turn, the standard
+        retry prompt goes in as the user turn, and one more upstream call
+        decides what the client actually receives. The client sees a normal
+        turn and keeps going.
+
+        Cost is one extra request on a path that is already an error, and it
+        appends to the same prefix, so the cache reads through. Returns the
+        continuation response body, or None when it could not be had, in which
+        case the caller delivers the refusal as it stands.
+        """
+        from headroom.proxy.marker_recovery import RETRY_PROMPT
+
+        continuation_body = {
+            **body,
+            "messages": [
+                *messages,
+                {"role": "assistant", "content": [{"type": "text", "text": guard_message}]},
+                {"role": "user", "content": [{"type": "text", "text": RETRY_PROMPT}]},
+            ],
+            # The caller works on a complete response object, including on the
+            # buffered-SSE path where the stream is resynthesized from it.
+            "stream": False,
+        }
+        try:
+            response = await self._retry_request(
+                "POST",
+                url,
+                headers,
+                continuation_body,
+                timeout=self._anthropic_buffered_request_timeout(),
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    "[%s] MARKER_GUARD: self-heal continuation returned %s",
+                    request_id,
+                    response.status_code,
+                )
+                return None
+            healed = response.json()
+        except Exception as exc:
+            logger.warning("[%s] MARKER_GUARD: self-heal continuation failed: %s", request_id, exc)
+            return None
+        if not isinstance(healed, dict) or not isinstance(healed.get("content"), list):
+            return None
+        logger.warning("[%s] MARKER_GUARD: self-heal continuation delivered", request_id)
+        return healed
 
     @classmethod
     def _sort_tools_deterministically(
@@ -943,6 +1114,7 @@ class AnthropicHandlerMixin:
         body: dict[str, Any],
         body_mutation_tracker: Any,
         bypass: bool,
+        request: Any = None,
     ) -> str:
         """Apply cost-aware model routing (#1706), returning the model to forward.
 
@@ -955,6 +1127,13 @@ class AnthropicHandlerMixin:
         router = getattr(self, "model_router", None)
         if router is None or not router.enabled or bypass:
             return model
+        if not self._can_notice_model_route(body):
+            # A model swap the user is not told about is the failure mode to
+            # avoid, ahead of any saving. The notice rides on the response
+            # object, so a response this proxy never assembles cannot carry
+            # one, and the request stays on the model it arrived on.
+            logger.info("MODEL_PRICE: refused switch=False reason=no_notice_channel")
+            return model
         decision = router.select(
             model=model,
             input_tokens=estimate_input_tokens(messages, body.get("tools"), body.get("system")),
@@ -963,9 +1142,146 @@ class AnthropicHandlerMixin:
         logger.info("model routing decision: %s", decision.reason)
         if not decision.changed:
             return model
+        priced = self._price_model_route(
+            model, decision.routed_model, body, messages, request
+        )
+        if priced is not None and not priced.switch:
+            logger.info("MODEL_PRICE: refused %s", priced.as_log_fields())
+            return model
+        if priced is not None:
+            logger.info("MODEL_PRICE: took %s", priced.as_log_fields())
         body["model"] = decision.routed_model
         body_mutation_tracker.mark_mutated("model_router")
         return decision.routed_model
+
+    def _can_notice_model_route(self, body: dict[str, Any]) -> bool:
+        """True when a routed response can carry a visible notice to the user.
+
+        Non-stream requests come back as one object this proxy rewrites, and a
+        stream:true request does too when CCR retrieval buffers it. Direct SSE
+        is the case that cannot: its first events have left before the routing
+        would be worth announcing, and prepending a block mid-stream means
+        renumbering every index behind it.
+        """
+        if not body.get("stream"):
+            return True
+        handler = getattr(self, "ccr_response_handler", None)
+        if handler is None or not getattr(getattr(handler, "config", None), "enabled", True):
+            return False
+        has_retrieve = getattr(self, "_has_headroom_retrieve_tool", None)
+        if not callable(has_retrieve):
+            return False
+        try:
+            return bool(has_retrieve(body.get("tools")))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _model_route_notice(routed_model: str, original_model: str) -> dict[str, Any]:
+        """The block that tells the user which model answered, and why."""
+        return {
+            "type": "text",
+            "text": (
+                f"[headroom] This turn was answered by {routed_model} instead of "
+                f"{original_model}. Headroom routes a turn to a cheaper model only "
+                "when it reads as a short standalone question and the switch pays "
+                "for the cache rewrite it costs. Unset HEADROOM_MODEL_ROUTE_PRICES "
+                "to stop this."
+            ),
+        }
+
+    def _price_model_route(
+        self,
+        model: str,
+        routed_model: str,
+        body: dict[str, Any],
+        messages: object,
+        request: Any = None,
+    ) -> Any:
+        """Price the rule engine's choice against the prefix it would abandon.
+
+        Returns None when the price cannot be read, which leaves the rule
+        engine's decision alone. That is the conservative direction only
+        because routing is opt-in: an operator who turned it on asked for the
+        rule, and a missing tracker means a cold prefix, where the switch is
+        free anyway.
+
+        This runs before ``resolve_tracker`` because the model chooses the
+        tokenizer that compression runs under, so the numbers come from a
+        peek rather than the resolved tracker for this turn.
+        """
+        from headroom.proxy.model_pricing import (
+            ModelPricingContext,
+            estimate_difficulty,
+        )
+
+        store = getattr(self, "session_tracker_store", None)
+        prices = getattr(self, "model_route_prices", None)
+        if store is None or prices is None:
+            return None
+        price_ratio = prices.get(routed_model)
+        if not price_ratio:
+            return None
+
+        tracker = None
+        session_id = ""
+        try:
+            # The pre-route model on purpose: the session id hashes the model,
+            # so the tracker holding the warm prefix is the one belonging to
+            # the model this request arrived on.
+            session_id = store.compute_session_id(
+                request,
+                model,
+                [message for message in (body.get("messages") or []) if isinstance(message, dict)],
+                system=body.get("system"),
+            )
+            tracker = store.peek_tracker(session_id)
+        except Exception:
+            tracker = None
+
+        messages_list = body.get("messages") or []
+        latest = messages_list[-1] if messages_list else {}
+        content = latest.get("content") if isinstance(latest, dict) else None
+        is_continuation = isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        )
+        difficulty = estimate_difficulty(
+            latest_user_text=content if isinstance(content, str) else "",
+            tool_count=len(body.get("tools") or []),
+            is_tool_continuation=is_continuation,
+            input_tokens=estimate_input_tokens(
+                messages, body.get("tools"), body.get("system")
+            ),
+        )
+
+        # The commitment lives on the handler rather than on the tracker: a
+        # model switch starts a new lineage, so the tracker that recorded the
+        # decision is not the one the next turn resolves. Keying by the
+        # pre-route session id is what survives that.
+        commitments = getattr(self, "_model_route_commitments", None)
+        if commitments is None:
+            commitments = {}
+            self._model_route_commitments = commitments
+
+        horizon = float(getattr(self, "model_route_horizon", 0.0))
+        if tracker is not None:
+            try:
+                horizon = tracker.expected_session_reads(300.0, horizon)
+            except Exception:
+                pass
+
+        context = ModelPricingContext(
+            prefix_tokens=tracker.cached_token_count() if tracker is not None else 0,
+            price_ratio=price_ratio,
+            expected_remaining_turns=horizon,
+            committed_model=commitments.get(session_id),
+            commit=lambda chosen: commitments.__setitem__(session_id, chosen),
+        )
+        result = context.decide(difficulty)
+        if result.switch:
+            context.record(routed_model)
+        return result
 
     async def handle_anthropic_messages(
         self,
@@ -1284,9 +1600,12 @@ class AnthropicHandlerMixin:
             # fail-closed and bypass handling live in the helper. A model override
             # comes from a provider URL (for example Vertex rawPredict), where
             # rewriting body["model"] would not change the upstream model.
+            # Kept so the response can say which model the client asked for
+            # when the router sends the turn somewhere else.
+            client_model = model
             if model_override is None:
                 model = self._maybe_route_model(
-                    model, messages, body, body_mutation_tracker, _bypass
+                    model, messages, body, body_mutation_tracker, _bypass, request
                 )
 
             # NOTE: Upstream temporarily disabled broad image compression due to
@@ -1637,8 +1956,23 @@ class AnthropicHandlerMixin:
             # compression of the dead region becomes free (bust piggybacking).
             # Runs before update_from_response overwrites the comparison state.
             # Also feeds the churn-depth ring that anchor placement reads.
+            # The head covers every byte the provider matches ahead of the
+            # first message. Deferred tool loading grows `tools` mid-session,
+            # which kills the whole cached prefix while the messages stay
+            # byte-identical, so message-only churn reads 1.0 on exactly the
+            # turns that are total busts. Fingerprinting the head makes those
+            # turns visible, which is what lets free_rebase_at_bust flush the
+            # queued compression while the rewrite is already being paid for.
+            _head_fingerprint = hashlib.md5(
+                json.dumps(
+                    [body.get("system"), body.get("tools")],
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8", "replace"),
+                usedforsecurity=False,
+            ).hexdigest()
             client_prefix_alive_fraction = prefix_tracker.observe_client_churn(
-                original_client_messages
+                original_client_messages, head_fingerprint=_head_fingerprint
             )
             if client_prefix_alive_fraction < 1.0:
                 logger.info(
@@ -1719,6 +2053,11 @@ class AnthropicHandlerMixin:
                     p_alive=_hybrid_alive,
                     context_pressure=(original_tokens / _hybrid_limit if _hybrid_limit else 0.0),
                     write_multiplier=2.0 if _hybrid_ttl == "1h" else 1.25,
+                    prefix_known_dead=_prefix_certainly_lapsed(
+                        prefix_tracker,
+                        _hybrid_ttl_seconds,
+                        head_bust=client_prefix_alive_fraction <= 0.0,
+                    ),
                 )
                 frozen_message_count = _hybrid_decision.frozen_message_count
                 _hybrid_should_rebase = _hybrid_decision.should_rebase
@@ -2019,9 +2358,11 @@ class AnthropicHandlerMixin:
                     _masking_admitted = False
                     _masking_config = prefix_tracker.hybrid_controller.config
                     if getattr(_masking_config, "observation_masking", True):
+                        from headroom.proxy.compaction_advisor import deferral_credit
                         from headroom.transforms.observation_masking import (
                             _MASKABLE_INPUT_KEYS,
                             apply_candidates,
+                            closed_episode_turn,
                             discover_candidates,
                             masking_gate_gain,
                         )
@@ -2054,12 +2395,20 @@ class AnthropicHandlerMixin:
                                 or os.environ.get("HR_SSE_MARKER_GUARD", "1") != "0"
                             )
                         )
+                        # A new user ask closes the task before it. Results that
+                        # task produced are finished work no matter how recent,
+                        # so they stop waiting out the turn-age gate. This is
+                        # the cheap half of compaction: one thread at a time,
+                        # at the moment it goes cold, instead of the whole
+                        # history at once when the window fills.
+                        _closed_turn = closed_episode_turn(messages)
                         _mask_candidates = discover_candidates(
                             messages,
                             count_tokens=tokenizer.count_text,
                             mask_after_turns=getattr(_masking_config, "mask_after_turns", 2),
                             mask_min_tokens=getattr(_masking_config, "mask_min_tokens", 150),
                             mask_input_keys=_MASKABLE_INPUT_KEYS if _mask_tool_inputs else (),
+                            episode_closed_turn=_closed_turn,
                         )
                         if not _mask_candidates:
                             _tr_shapes: dict[str, int] = {}
@@ -2108,7 +2457,9 @@ class AnthropicHandlerMixin:
 
                             _mask_ttl = prefix_tracker.recommended_ttl() or "5m"
                             _mask_ttl_s = 3600.0 if _mask_ttl == "1h" else 300.0
-                            _mask_reads = prefix_tracker.expected_reads_within_ttl(
+                            # A mask outlives the cache run that pays for it, so
+                            # price it over the session rather than the TTL run.
+                            _mask_reads = prefix_tracker.expected_session_reads(
                                 _mask_ttl_s, fallback=10.0
                             )
                             _mask_alive = prefix_tracker.survival_p_alive(
@@ -2127,16 +2478,43 @@ class AnthropicHandlerMixin:
                                 p_alive=_mask_alive,
                                 write_multiplier=write_multiplier_for_ttl(_mask_ttl),
                             )
-                            _masking_admitted = _mask_gain > 0.0
-                            if not _masking_admitted:
-                                _mask_dt = sum(
-                                    candidate.tokens_saved for candidate in _mask_candidates
+                            _mask_dt = sum(
+                                candidate.tokens_saved for candidate in _mask_candidates
+                            )
+                            # The read arithmetic above prices this prefix as if
+                            # it will be read for the rest of the session. Near
+                            # the context limit it will not: it is about to be
+                            # replaced by a summary, at the price of a full
+                            # retained-prefix write plus the summary's output
+                            # tokens. Reclaiming tokens now pushes that moment
+                            # out, and the session may well end before it
+                            # arrives. Credit the mutation for what it defers.
+                            _defer = deferral_credit(
+                                live_tokens=original_tokens,
+                                reclaimed_tokens=_mask_dt,
+                                # Average growth to date. A per-turn delta would
+                                # be sharper, but this needs no new state and
+                                # only sets the scale of "how many turns".
+                                tokens_per_turn=(
+                                    original_tokens / max(1, prefix_tracker.turn_number())
+                                ),
+                                expected_remaining_turns=_mask_reads,
+                                context_limit=context_limit,
+                            )
+                            _masking_admitted = (_mask_gain + _defer.credit) > 0.0
+                            if _masking_admitted and _mask_gain <= 0.0:
+                                logger.info(
+                                    f"[{request_id}] DEFER_COMPACT: admitted on "
+                                    f"deferral credit (gain={_mask_gain:.0f} "
+                                    f"dT={_mask_dt} {_defer.as_log_fields()})"
                                 )
+                            elif not _masking_admitted:
                                 logger.info(
                                     f"[{request_id}] MASKING_GATE: declined "
                                     f"(gain={_mask_gain:.0f} dT={_mask_dt} "
                                     f"n={len(_mask_candidates)} R={_mask_reads:.1f} "
-                                    f"p_alive={_mask_alive:.3f} ttl={_mask_ttl})"
+                                    f"p_alive={_mask_alive:.3f} ttl={_mask_ttl} "
+                                    f"defer={_defer.reason}/{_defer.credit:.0f})"
                                 )
 
                         if _masking_structural_admission:
@@ -2148,6 +2526,7 @@ class AnthropicHandlerMixin:
                                     _masking_config, "mask_min_tokens_at_bust", 60
                                 ),
                                 mask_input_keys=_MASKABLE_INPUT_KEYS if _mask_tool_inputs else (),
+                                episode_closed_turn=_closed_turn,
                             )
                             _mask_candidates = _bust_candidates
 
@@ -2431,7 +2810,9 @@ class AnthropicHandlerMixin:
 
                             _mask_ttl = prefix_tracker.recommended_ttl() or "5m"
                             _mask_ttl_s = 3600.0 if _mask_ttl == "1h" else 300.0
-                            _mask_reads = prefix_tracker.expected_reads_within_ttl(
+                            # A mask outlives the cache run that pays for it, so
+                            # price it over the session rather than the TTL run.
+                            _mask_reads = prefix_tracker.expected_session_reads(
                                 _mask_ttl_s, fallback=10.0
                             )
                             _mask_alive = prefix_tracker.survival_p_alive(
@@ -2902,9 +3283,25 @@ class AnthropicHandlerMixin:
 
             _prev_orig_diag = prefix_tracker.get_last_original_messages()
             _prev_fwd_diag = prefix_tracker.get_last_forwarded_messages()
+            # Replaying the prior forwarded prefix is not free. Those bytes are
+            # the pre-compression form of messages the compressor would shrink
+            # now, so the replay routinely forwards MORE tokens than the
+            # optimized build (measured: 17 turns today where tok_after >
+            # tok_before). That premium buys a byte-identical prefix, which is
+            # worth paying while the prefix is alive and worth nothing once it
+            # is dead. Paying it on a turn that busts anyway costs twice: the
+            # inflated payload is billed at the write rate AND the cache line is
+            # gone (2026-07-25 16:28:36, 34k client -> 51.5k forwarded -> 68k
+            # write against a 24.5k head-only hit). When the prefix is provably
+            # dead, send the compressed build instead and re-seed the cache with
+            # it. Same reasoning as free_rebase_at_bust: the rewrite is already
+            # paid, so the mutation is free.
+            _prefix_provably_dead = (
+                client_prefix_alive_fraction == 0.0 or _hybrid_alive <= 0.05
+            )
             _ov = (
                 optimized_messages
-                if _hybrid_should_rebase
+                if _hybrid_should_rebase or _prefix_provably_dead
                 else overlay_cached_prefix(
                     optimized_messages,
                     original_client_messages,
@@ -2912,19 +3309,38 @@ class AnthropicHandlerMixin:
                     _prev_fwd_diag,
                 )
             )
-            # TOKEN_DIAG (2026-07-12, temporary): trace token-mode partial busts.
-            # overlay replays the prior forwarded prefix byte-stable ONLY when it
-            # append-only-extends the prior turn AND there is one forwarded msg per
-            # original (len(prev_fwd)==len(prev_orig)). If token compression changed
-            # the message count, prev_fwd!=prev_orig, overlay bails, and the tail
-            # busts. This logs exactly that so the cause is measured, not guessed.
-            if is_token_mode(self.config.mode):
+            # TOKEN_DIAG (2026-07-12, temporary): trace partial busts on any mode
+            # that keeps a warm prefix. overlay replays the prior forwarded prefix
+            # byte-stable ONLY when it append-only-extends the prior turn AND there
+            # is one forwarded msg per original (len(prev_fwd)==len(prev_orig)). If
+            # compression changed the message count, prev_fwd!=prev_orig, overlay
+            # bails, and the tail busts. This logs exactly that so the cause is
+            # measured, not guessed. Hybrid is the default mode since 81f231bc, so
+            # gating this on token mode alone left the default path unobservable.
+            if is_token_mode(self.config.mode) or is_hybrid_mode(self.config.mode):
+                # A miss with prev_fwd=0 means resolve_tracker handed back a fresh
+                # lineage, which happens when the session id moved rather than when
+                # the messages diverged. The id keys on model plus system prompt, so
+                # log both heads separately, plus the tools head, to say which one
+                # moved instead of inferring it from the message counts.
+                def _h(obj: object) -> str:
+                    return hashlib.md5(
+                        json.dumps(obj, sort_keys=True, default=str).encode()
+                    ).hexdigest()[:8]
+
+                _tools_diag = body.get("tools") or []
+                _sid_diag = str(locals().get("session_id", "unset"))[:8]
                 logger.info(
-                    f"[{request_id}] TOKEN_DIAG: client_msgs={len(original_client_messages)} "
+                    f"[{request_id}] TOKEN_DIAG: sid={_sid_diag} "
+                    f"sys_h={_h(body.get('system'))} "
+                    f"tools_n={len(_tools_diag)} "
+                    f"tools_h={_h([t.get('name') for t in _tools_diag if isinstance(t, dict)])} "
+                    f"client_msgs={len(original_client_messages)} "
                     f"opt_msgs={len(optimized_messages)} "
                     f"prev_orig={len(_prev_orig_diag or [])} prev_fwd={len(_prev_fwd_diag or [])} "
                     f"count_ok={len(_prev_orig_diag or []) == len(_prev_fwd_diag or [])} "
-                    f"overlay_applied={_ov != optimized_messages} frozen={frozen_message_count}"
+                    f"overlay_applied={_ov != optimized_messages} frozen={frozen_message_count} "
+                    f"rebase={_hybrid_should_rebase} dead={_prefix_provably_dead}"
                 )
             _overlay_replayed = _ov != optimized_messages
             if _overlay_replayed:
@@ -2980,12 +3396,17 @@ class AnthropicHandlerMixin:
                     threshold=max(0.0, min(1.0, _structural_bust_threshold)),
                 )
             ):
-                _force_ttl = "5m"
+                # A bust re-writes the prefix whichever tier it lands on, so the
+                # only question left is how long that write survives. When the
+                # prefix is big enough that the session already prefers 1h,
+                # spending the bust on a 5m entry just books the next re-write.
+                _force_ttl = "1h" if prefix_tracker.prefers_long_ttl() else "5m"
                 structural_bust_forced_write = True
                 logger.info(
-                    "[%s] STRUCTURAL-BUST: alive_fraction=%.2f forcing fresh 5m write",
+                    "[%s] STRUCTURAL-BUST: alive_fraction=%.2f forcing fresh %s write",
                     request_id,
                     client_prefix_alive_fraction,
+                    _force_ttl,
                 )
                 # The prefix is being re-billed regardless, so render what the
                 # conversation had accumulated for the log. Log-only: never
@@ -3946,12 +4367,92 @@ class AnthropicHandlerMixin:
                     tools = _req_ctx.tools
                     body["tools"] = tools
 
+            # Adaptive horizon, shared by every gate that spends a rewrite to
+            # buy future turns. All of them price the same question: how many
+            # more turns will read what I am about to rewrite. Lindy answers the
+            # same for a one-line typo fix and a thirty-file refactor, so
+            # estimate from what this turn actually looks like, and let the next
+            # task boundary label the turns sitting behind it.
+            # Every read of the tracker sits inside the try: the estimate is
+            # bookkeeping, and no gate is worth failing a request over. A
+            # failure here just leaves the default horizon in place.
+            _horizon = 10.0
+            _horizon_src = "default"
+            _at_task_boundary = False
+            # Whether this turn's write is already being paid, which is what
+            # makes a structural mutation free. Deliberately not
+            # body_mutation_tracker.mutated: that flag says a transform touched
+            # the body, which only turns off byte-faithful forwarding. A
+            # re-serialized body whose leading messages are unchanged still hits
+            # the provider's cache, so treating mutation as a bust would mark
+            # nearly every turn free and hand the gates a discount they have not
+            # earned.
+            _prefix_already_busting = client_prefix_alive_fraction == 0.0
+            try:
+                from headroom.proxy.output_shaper import TurnKind, classify_turn
+                from headroom.proxy.turn_horizon import (
+                    expected_remaining_turns,
+                    features_from_request,
+                    shared_horizon_model,
+                )
+
+                _ttl_hint = prefix_tracker.recommended_ttl() or "5m"
+                _ttl_seconds = 3600.0 if _ttl_hint == "1h" else 300.0
+                _horizon = prefix_tracker.expected_session_reads(_ttl_seconds, fallback=10.0)
+                _horizon_src = "lindy"
+                _messages_now = body.get("messages", [])
+                _at_task_boundary = classify_turn(_messages_now) is TurnKind.NEW_USER_ASK
+                _prefix_already_busting = (
+                    _prefix_already_busting
+                    or prefix_tracker.forwarded_prefix_will_change(_messages_now)
+                )
+                _horizon_features = features_from_request(
+                    _messages_now,
+                    prefix_tracker.turn_number(),
+                    prefix_tracker.cached_token_count(),
+                )
+                _horizon_model = shared_horizon_model()
+                # The boundary is its own label: every turn taken since the
+                # previous user ask now knows exactly how many turns it had
+                # left. Label before recording this turn, so a boundary turn
+                # never becomes an episode of the task it just ended.
+                if _at_task_boundary:
+                    _labelled = _horizon_model.observe_task_boundary(
+                        prefix_tracker.turn_number()
+                    )
+                    if _labelled:
+                        logger.info(
+                            f"[{request_id}] HORIZON_LABEL labelled={_labelled} "
+                            f"episodes={_horizon_model.episode_count()}"
+                        )
+                _horizon_model.observe_turn(_horizon_features)
+                _horizon, _horizon_src = expected_remaining_turns(
+                    _horizon_features,
+                    fallback=_horizon,
+                    model=_horizon_model,
+                )
+                # These three feed every gate below, and two of them are cheap
+                # to get wrong in a way nothing else reports. A busting flag
+                # stuck on True hands out a free-rewrite discount on turns
+                # that are in fact billing full cache reads.
+                logger.info(
+                    f"[{request_id}] HORIZON turns={_horizon:.1f} "
+                    f"src={_horizon_src} boundary={_at_task_boundary} "
+                    f"busting={_prefix_already_busting}"
+                )
+            except Exception as _horizon_exc:
+                logger.debug(f"[{request_id}] horizon estimate skipped: {_horizon_exc}")
+
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
             # steering appended to the system-prompt tail + effort routing on
             # mechanical tool_result continuations. Runs after every other
             # body mutation so the turn classifier sees the final messages,
             # and respects the same bypass header as compression.
             if not _bypass:
+                from headroom.proxy.effort_pricing import (
+                    EffortPricingContext,
+                    shared_cost_model,
+                )
                 from headroom.proxy.output_savings import (
                     assign_arm,
                     conversation_key_from_body,
@@ -3964,6 +4465,7 @@ class AnthropicHandlerMixin:
                     resolve_verbosity_level,
                     shape_request,
                 )
+                from headroom.proxy.turn_horizon import expected_remaining_turns
 
                 _shaper_settings = OutputShaperSettings.from_env()
                 if _shaper_settings.enabled:
@@ -3995,11 +4497,55 @@ class AnthropicHandlerMixin:
 
                     if _arm == "treatment":
                         _level, _src = resolve_verbosity_level(_shaper_settings)
-                        shape_result = shape_request(body, _shaper_settings, level_override=_level)
+                        # Price the effort switch instead of blanket-pinning it
+                        # on cached requests. Flipping output_config.effort
+                        # rewrites the whole prefix, so the router needs the
+                        # live cache state: how much prefix is at stake, how
+                        # many more turns this session is expected to read it,
+                        # and whether the rewrite is already being paid by an
+                        # earlier transform or by the client rewriting history
+                        # itself. On those last two the switch is free.
+                        #
+                        # The committed value rides the tracker, which is the
+                        # only object that lives as long as the lineage whose
+                        # prefix is at stake. Once a switch is bought it must be
+                        # held on every later turn: paying for it again on the
+                        # next turn kind is how the router turns one priced
+                        # rewrite into one per turn.
+                        def _commit_effort(value: str) -> None:
+                            prefix_tracker._hr_committed_effort = value  # noqa: SLF001
+
+                        _pricing = EffortPricingContext(
+                            model=model,
+                            prefix_tokens=prefix_tracker.cached_token_count(),
+                            cost_model=shared_cost_model(),
+                            prefix_already_busting=_prefix_already_busting,
+                            expected_remaining_turns=_horizon,
+                            committed_effort=getattr(
+                                prefix_tracker, "_hr_committed_effort", None
+                            ),
+                            commit=_commit_effort,
+                        )
+                        shape_result = shape_request(
+                            body, _shaper_settings, level_override=_level, pricing=_pricing
+                        )
                         if shape_result.effort_decision is not None:
                             _audit = getattr(self, "operational_audit", None)
                             if _audit is not None:
                                 _audit.record_effort_routing(shape_result.effort_decision)
+                            # Only the priced decisions carry a reason suffix.
+                            # Log their arithmetic: a population of near-miss
+                            # refusals means the horizon estimate, not the
+                            # policy, is what needs recalibrating.
+                            if ":" in shape_result.effort_decision:
+                                logger.info(
+                                    f"[{request_id}] EFFORT_PRICE "
+                                    f"{shape_result.effort_decision} "
+                                    f"S={_pricing.prefix_tokens} "
+                                    f"turns={_pricing.expected_remaining_turns:.1f} "
+                                    f"horizon={_horizon_src} "
+                                    f"busting={_pricing.prefix_already_busting}"
+                                )
                         if shape_result.changed:
                             body_mutation_tracker.mark_mutated("output_shaper")
                             transforms_applied.extend(shape_result.labels or [])
@@ -4007,6 +4553,46 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] OutputShaper(L{_level}/{_src}): "
                                 f"{shape_result.labels}"
                             )
+
+            # What effort this request actually carries upstream, captured after
+            # every body transform so it reflects what the provider will bill.
+            # Read unconditionally, not just on shaped turns: the pricing model
+            # can only compute a delta once it has seen both levels, and the
+            # unshaped turns are where the higher level gets measured.
+            _effort_in_force = ""
+            _output_config = body.get("output_config")
+            if isinstance(_output_config, dict):
+                _effort_in_force = str(_output_config.get("effort") or "")
+
+            # Compaction advisory. The proxy cannot compact for the client, but
+            # it is the only party holding the numbers the decision needs: the
+            # live prefix size, how many more turns this session is likely to
+            # read it, and whether the turn is already paying a rewrite. Price
+            # it here, publish it on /stats, and let the client act on a figure
+            # instead of on a context-window threshold.
+            try:
+                from headroom.proxy.compaction_advisor import advise_compaction
+
+                _compact_limit = 0
+                if self.anthropic_provider is not None:
+                    _compact_limit = self.anthropic_provider.get_context_limit(model) or 0
+                _compact_advice = advise_compaction(
+                    live_tokens=original_tokens,
+                    expected_remaining_turns=_horizon,
+                    # A new user ask after a tool run is the natural handover
+                    # point: the working context the summary would drop is the
+                    # context the finished task needed, not the next one.
+                    at_task_boundary=_at_task_boundary,
+                    prefix_already_busting=_prefix_already_busting,
+                    context_limit=_compact_limit,
+                )
+                self._latest_compaction_advice = _compact_advice
+                if _compact_advice.recommend:
+                    logger.info(
+                        f"[{request_id}] COMPACT_ADVISE {_compact_advice.as_log_fields()}"
+                    )
+            except Exception as _compact_exc:
+                logger.debug(f"[{request_id}] compaction advisory skipped: {_compact_exc}")
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.
@@ -4129,6 +4715,10 @@ class AnthropicHandlerMixin:
                         total_latency = (time.time() - start_time) * 1000
                         usage = backend_response.body.get("usage", {})
                         output_tokens = usage.get("output_tokens", 0)
+                        self._observe_effort_cost(model, _effort_in_force, output_tokens)
+                        self._observe_output_tokens(
+                            body.get("messages"), output_tokens, request_id
+                        )
 
                         _backend_name = (
                             self.anthropic_backend.name if self.anthropic_backend else "anthropic"
@@ -4194,6 +4784,7 @@ class AnthropicHandlerMixin:
                             cache_write_tokens=cw_tokens,
                             messages=next_forwarded_messages,
                             original_messages=next_original_messages,
+                            sent_message_count=len(optimized_messages),
                         )
 
                         await self._record_request_outcome(
@@ -4362,13 +4953,32 @@ class AnthropicHandlerMixin:
                         # remaining breakpoint budget at DP-optimal depths from
                         # this session's observed churn-depth profile, instead of
                         # the single fixed mid-depth anchor. Hybrid policy,
-                        # default on, HR_DP_ANCHORS=0 overrides. Same
-                        # quantization, so anchors stay byte-stable between
-                        # growth jumps either way.
+                        # default on, HR_DP_ANCHORS=0 overrides.
+                        #
+                        # The DP output alone is not stable across turns: its
+                        # samples are fractions rescaled by the current message
+                        # count, and they sit in a ring that turns over, so the
+                        # argmin walks even when nothing about the conversation
+                        # changed. Measured on the 2026-07 replay corpus, that
+                        # moved the 1h anchor on 75 of 824 steady-state turns,
+                        # 38 of them backwards, re-billing 1.59M tokens at the
+                        # 2.0x long-TTL premium for no change in what was
+                        # cached. stabilize_anchor_depths pins live anchors in
+                        # absolute terms and lets the DP's proposal evict one
+                        # only when the priced gain beats the rewrite.
                         if prefix_tracker.hybrid_controller.config.dp_anchors:
-                            from headroom.cache.anchor_dp import optimal_anchor_depths
+                            from headroom.cache.anchor_dp import (
+                                optimal_anchor_depths,
+                                stabilize_anchor_depths,
+                            )
 
-                            _targets = optimal_anchor_depths(
+                            _targets = stabilize_anchor_depths(
+                                prefix_tracker.placed_anchor_depths,
+                                optimal_anchor_depths(
+                                    len(_msgs),
+                                    prefix_tracker.churn_depth_samples,
+                                    _budget,
+                                ),
                                 len(_msgs),
                                 prefix_tracker.churn_depth_samples,
                                 _budget,
@@ -4455,6 +5065,13 @@ class AnthropicHandlerMixin:
                                         f"msg {_i}/{len(_msgs)}"
                                     )
                                     break
+                        # Record where the anchors landed, not where they were
+                        # aimed. The backward scan above can settle up to 24
+                        # messages short of the target, and next turn has to pin
+                        # the position that actually carries the cache entry,
+                        # otherwise the retarget re-introduces the drift this
+                        # stickiness exists to remove.
+                        prefix_tracker.record_placed_anchors(_taken)
                 except Exception:
                     logger.warning("HR_MID_ANCHOR failed", exc_info=True)
 
@@ -4991,7 +5608,57 @@ class AnthropicHandlerMixin:
                     # CCR continuations, memory continuations, and buffered SSE
                     # resynthesis from the same complete response object.
                     if resp_json and response.status_code == 200:
-                        if _guard_anthropic_tool_use_markers(resp_json, request_id=request_id):
+                        routed_notice = False
+                        if model != client_model and isinstance(resp_json.get("content"), list):
+                            # Announced on every routed turn, not only the first.
+                            # Stickiness means a lineage can sit on the cheap
+                            # model for a long stretch, and a notice the user
+                            # has to scroll back to find is not a notice.
+                            resp_json["content"] = [
+                                self._model_route_notice(model, client_model),
+                                *resp_json["content"],
+                            ]
+                            routed_notice = True
+                            logger.warning(
+                                "[%s] MODEL_ROUTE: answered by %s instead of %s",
+                                request_id,
+                                model,
+                                client_model,
+                            )
+                        guard_result = _guard_anthropic_tool_use_markers(
+                            resp_json, request_id=request_id
+                        )
+                        if routed_notice:
+                            guard_result = MarkerGuardResult(
+                                changed=True,
+                                stalled=guard_result.stalled,
+                                message=guard_result.message,
+                            )
+                        if guard_result.stalled:
+                            healed = await self._retry_marker_blocked_turn(
+                                url=url,
+                                headers=headers,
+                                body=body,
+                                messages=optimized_messages,
+                                guard_message=guard_result.message,
+                                request_id=request_id,
+                            )
+                            if healed is not None:
+                                healed_json = healed
+                                # The retry gets one pass of the same guard. If
+                                # it comes back carrying a marker too, the turn
+                                # ends for real: a second copy of the message is
+                                # not going to land where the first did not.
+                                second = _guard_anthropic_tool_use_markers(
+                                    healed_json, request_id=request_id
+                                )
+                                resp_json = healed_json
+                                guard_result = MarkerGuardResult(
+                                    changed=True,
+                                    stalled=second.stalled,
+                                    message=second.message,
+                                )
+                        if guard_result:
                             guarded_headers = {
                                 k: v
                                 for k, v in response.headers.items()
@@ -5021,6 +5688,10 @@ class AnthropicHandlerMixin:
                             usage
                         )
                         uncached_input_tokens = usage.get("input_tokens", 0)
+                        self._observe_effort_cost(model, _effort_in_force, output_tokens)
+                        self._observe_output_tokens(
+                            body.get("messages"), output_tokens, request_id
+                        )
 
                     # Track cache bust: tokens that lost their cache discount due to compression.
                     # If we had X tokens cached last turn and only Y hit cache this turn,
@@ -5077,6 +5748,7 @@ class AnthropicHandlerMixin:
                         cache_write_tokens=cw_tokens,
                         messages=next_forwarded_messages,
                         original_messages=next_original_messages,
+                        sent_message_count=len(optimized_messages),
                     )
 
                     # Cache response under the SAME key it was looked up by:

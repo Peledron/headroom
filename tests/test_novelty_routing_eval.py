@@ -9,6 +9,7 @@ makes a network call.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -443,7 +444,18 @@ def test_bootstrap_ci_shape_and_session_granularity(tmp_path):
 
 
 def test_module_does_not_import_embedding_backend_at_top_level():
-    assert "headroom.relevance.embedding" not in sys.modules
+    # Asked in a fresh interpreter. In-process the check reads whatever any
+    # earlier test imported, so it passed alone and failed in-suite: sys.modules
+    # is shared, and the claim under test is about this one module's imports.
+    probe = (
+        "import sys; import headroom.evals.novelty_routing_eval; "
+        "sys.exit(1 if 'headroom.relevance.embedding' in sys.modules else 0)"
+    )
+    completed = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert completed.returncode == 0, (
+        "importing headroom.evals.novelty_routing_eval pulled in the embedding "
+        f"backend eagerly; stderr: {completed.stderr}"
+    )
 
 
 def test_run_eval_works_without_embeddings_module_available(tmp_path, monkeypatch):

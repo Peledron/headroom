@@ -744,6 +744,37 @@ def _external_compressor_selection(compressors: set[str] | None) -> list[str] | 
     return external or None
 
 
+def _parse_model_route_prices(raw: str) -> dict[str, float]:
+    """Read ``model=fraction`` pairs into the routing gate's price table.
+
+    The gate has to compare what a cheaper model saves against what the switch
+    costs, and no provider ships that ratio in a form the proxy can read at
+    runtime. So it comes from the operator, as a fraction of the price of the
+    model the request arrived on: ``claude-sonnet-5=0.2`` says the target bills
+    a fifth of the current model.
+
+    Parsing is deliberately forgiving in one direction only. A malformed pair
+    is dropped rather than raised, because a bad environment variable must not
+    stop the proxy from starting, and a missing entry only means the gate
+    stands aside for that model. Values outside ``(0, 1]`` are dropped too: a
+    target priced at or above the current model has nothing to offer, and zero
+    or negative would make every switch look free.
+    """
+    prices: dict[str, float] = {}
+    for pair in raw.split(","):
+        name, sep, value = pair.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            continue
+        try:
+            fraction = float(value.strip())
+        except ValueError:
+            continue
+        if 0 < fraction <= 1:
+            prices[name] = fraction
+    return prices
+
+
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
@@ -814,6 +845,19 @@ class HeadroomProxy(
         # Cost-aware model routing (issue #1706). Disabled unless configured, so
         # the default request path is unchanged.
         self.model_router = ModelRouter(config.model_router)
+        # Prices for the routing gate, as a fraction of the model the request
+        # arrived on: HEADROOM_MODEL_ROUTE_PRICES="claude-sonnet-5=0.2".
+        # Without a table the gate cannot price a switch and stands aside, so
+        # the rule engine keeps whatever behaviour it had.
+        self.model_route_prices = _parse_model_route_prices(
+            os.getenv("HEADROOM_MODEL_ROUTE_PRICES", "")
+        )
+        # Fallback horizon for a lineage too young for its own Lindy estimate.
+        # Zero refuses every priced switch, which is the safe default for a
+        # gate whose quality cost has not been measured.
+        self.model_route_horizon = float(
+            os.getenv("HEADROOM_MODEL_ROUTE_HORIZON", "0") or 0
+        )
 
         # Initialize transforms based on routing mode.
         #
@@ -990,6 +1034,12 @@ class HeadroomProxy(
 
         # Prefix cache tracking: freeze already-cached messages to avoid
         # invalidating the provider's prefix cache with our transforms
+        from headroom.cache.lineage_persistence import (
+            LineagePersistence,
+        )
+        from headroom.cache.lineage_persistence import (
+            persistence_enabled as lineage_persistence_enabled,
+        )
         from headroom.cache.prefix_tracker import PrefixFreezeConfig, SessionTrackerStore
 
         self.session_tracker_store = SessionTrackerStore(
@@ -998,6 +1048,71 @@ class HeadroomProxy(
                 session_ttl_seconds=config.prefix_freeze_session_ttl,
             )
         )
+
+        # Rehydrate lineages from the previous run before serving anything.
+        # Without this every restart drops prev_orig/prev_fwd for all live
+        # sessions, overlay_cached_prefix has nothing to replay, and each
+        # session rewrites its whole history (~195k write tokens per restart).
+        self.lineage_persistence = None
+        if lineage_persistence_enabled():
+            from headroom.proxy.compaction_advisor import (
+                shared_shape_model as shared_compaction_shape,
+            )
+            from headroom.proxy.effort_pricing import shared_cost_model
+            from headroom.proxy.turn_horizon import shared_horizon_model
+
+            store = self.session_tracker_store
+            persistence = LineagePersistence()
+            snapshot = persistence.load()
+            if snapshot:
+                restored = store.restore_state(snapshot)
+                if restored:
+                    logging.getLogger("headroom.cache").info(
+                        "LINEAGE_RESTORE: rehydrated %d tracker(s) from %s",
+                        restored,
+                        persistence.path,
+                    )
+                # The pricing models ride the same snapshot. Both need several
+                # turns of traffic before they say anything useful, so a
+                # restart that dropped them would leave the effort router and
+                # the compaction advisor guessing at the start of every
+                # session, which is exactly when their answer matters most.
+                _priced = shared_cost_model().restore_state(snapshot.get("effort_pricing"))
+                _shapes = shared_compaction_shape().restore_state(
+                    snapshot.get("compaction_shape")
+                )
+                # A horizon bucket needs a dozen labelled episodes before it
+                # beats the Lindy fallback, which is more than most single
+                # sessions produce. Without carrying the table across restarts
+                # the estimator would never leave its fallback.
+                _episodes = shared_horizon_model().restore_state(snapshot.get("turn_horizon"))
+                if _priced or _shapes or _episodes:
+                    logging.getLogger("headroom.cache").info(
+                        "PRICING_RESTORE: %d effort observation set(s), "
+                        "%d compaction observation(s), %d horizon episode(s)",
+                        _priced,
+                        _shapes,
+                        _episodes,
+                    )
+
+            def _export_with_pricing() -> dict[str, Any]:
+                state = store.export_state()
+                state["effort_pricing"] = shared_cost_model().export_state()
+                state["compaction_shape"] = shared_compaction_shape().export_state()
+                state["turn_horizon"] = shared_horizon_model().export_state()
+                return state
+
+            persistence.start(
+                export=_export_with_pricing,
+                # Cheap change detector: turn numbers only ever advance, so
+                # their sum moves whenever any session took a turn. Reading it
+                # costs a walk of the tracker dict, not of the histories.
+                fingerprint=lambda: (
+                    len(store._trackers),
+                    sum(t._turn_number for t in store._trackers.values()),
+                ),
+            )
+            self.lineage_persistence = persistence
 
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
@@ -1962,6 +2077,13 @@ class HeadroomProxy(
         # a graceful shutdown doesn't drop the last few requests' totals.
         with contextlib.suppress(Exception):
             self.metrics.savings_tracker.flush()
+
+        # Snapshot lineages last, so a restart picks up the final state of every
+        # live session rather than whatever the periodic flush last caught. This
+        # is what makes a deploy cheap instead of a full rewrite per session.
+        if self.lineage_persistence is not None:
+            with contextlib.suppress(Exception):
+                self.lineage_persistence.stop()
 
         # Print final stats
         self._print_summary()
@@ -3675,7 +3797,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         - Compression (CCR) statistics
         - Telemetry/TOIN (data flywheel) statistics
         - Cache and rate limiter stats
+        - Output token distribution, split by turn shape
         """
+        from headroom.proxy.output_accounting import shared_output_ledger
+
         m = proxy.metrics
 
         import time
@@ -3925,9 +4050,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:  # pragma: no cover - defensive
             pass
 
+        # Latest priced compaction advice. The proxy cannot compact for the
+        # client, so this is the channel: the client polls /stats (the MCP
+        # headroom_stats tool already does) and gets a figure instead of a
+        # context-window threshold to guess against.
+        compaction_advice: dict[str, Any] | None = None
+        _advice = getattr(proxy, "_latest_compaction_advice", None)
+        if _advice is not None:
+            compaction_advice = {
+                "recommend": _advice.recommend,
+                "reason": _advice.reason,
+                "urgency": _advice.urgency,
+                "tokens_reclaimed": _advice.tokens_reclaimed,
+                "cost": round(_advice.cost),
+                "expected_gain": round(_advice.expected_gain),
+                "net_gain": round(_advice.net_gain),
+                "break_even_turns": (
+                    round(_advice.break_even_turns, 1)
+                    if _advice.break_even_turns is not None
+                    else None
+                ),
+            }
+
         return {
             "summary": summary,
             "agent_usage": agent_usage,
+            "compaction_advice": compaction_advice,
             "operational_audit": proxy.operational_audit.snapshot(),
             "subagent_cap_rewrites": subagent_cap_rewrites,
             "cache_reconciliation": cache_reconciliation,
@@ -4214,7 +4362,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "original_tokens_cached": compression_stats.get("total_original_tokens", 0),
                 "compressed_tokens_cached": compression_stats.get("total_compressed_tokens", 0),
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
+                # Per-gate masking accuracy. A block that is masked and never
+                # asked for again is the gate working, so a low retrieval rate
+                # here is the good outcome, and the age gate is the floor the
+                # episode gate has to be judged against.
+                "mask_gates": compression_stats.get("mask_gates", {}),
             },
+            # Output tokens bill at roughly five times an uncached input token
+            # and no transform in this proxy touches them. Split by turn shape
+            # so the reading says whether the cost is narration inside tool
+            # loops or answer length on direct questions.
+            "output": shared_output_ledger().snapshot(),
             "compression_cache": compression_cache_stats,
             # Always False: the anonymous telemetry beacon was removed, so no
             # telemetry is ever shipped externally (local collection only).

@@ -12,6 +12,7 @@ import math
 import os
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 class HybridPhase(str, Enum):
@@ -116,6 +117,35 @@ class HybridModeController:
         self._warm_turns = 0
         self._cooldown_remaining = 0
 
+    def export_state(self) -> dict[str, Any]:
+        """Plain-data snapshot for cross-restart persistence.
+
+        Config is deliberately excluded: it is rebuilt from the environment on
+        load, so a restart that changes an env knob takes the new value rather
+        than resurrecting the old one.
+        """
+        return {
+            "phase": self.phase.value,
+            "generation": self.generation,
+            "warm_turns": self._warm_turns,
+            "cooldown_remaining": self._cooldown_remaining,
+        }
+
+    def restore_state(self, blob: dict[str, Any]) -> None:
+        """Reinstate a snapshot from :meth:`export_state`.
+
+        Unknown or malformed phases fall back to COLD_PREFIX, which is the safe
+        direction: it re-establishes a prefix rather than assuming a warm one
+        that the provider may no longer hold.
+        """
+        try:
+            self.phase = HybridPhase(blob.get("phase"))
+        except ValueError:
+            self.phase = HybridPhase.COLD_PREFIX
+        self.generation = int(blob.get("generation", 0) or 0)
+        self._warm_turns = int(blob.get("warm_turns", 0) or 0)
+        self._cooldown_remaining = int(blob.get("cooldown_remaining", 0) or 0)
+
     @staticmethod
     def _finite_nonnegative(value: float) -> float:
         try:
@@ -160,6 +190,7 @@ class HybridModeController:
         p_alive: float,
         context_pressure: float,
         write_multiplier: float | None = None,
+        prefix_known_dead: bool = False,
     ) -> HybridModeDecision:
         frozen = min(max(0, frozen_message_count), max(0, message_count))
         if frozen == 0 or cached_suffix_tokens <= 0:
@@ -186,13 +217,32 @@ class HybridModeController:
         savings_fraction = (
             max(0, estimated_savings_tokens) / total_tokens if total_tokens > 0 else 0.0
         )
+        # A prefix that is already gone cannot be spent twice. The suffix gets
+        # re-billed this turn whatever we forward, so the rewrite penalty is
+        # zero and compressing now is free. This is the cheapest moment in the
+        # session to flush queued savings, and waiting for min_warm_turns or a
+        # cooldown would only push the same work onto a later warm turn where
+        # it does cost a full rewrite.
         gain = self.net_rebase_gain(
             estimated_savings_tokens=estimated_savings_tokens,
             cached_suffix_tokens=cached_suffix_tokens,
             expected_reads=expected_reads,
-            p_alive=p_alive,
+            p_alive=0.0 if prefix_known_dead else p_alive,
             write_multiplier=write_multiplier,
         )
+        if prefix_known_dead and estimated_savings_tokens > 0:
+            self.phase = HybridPhase.REBASE_PENDING
+            self.generation += 1
+            self._warm_turns = 0
+            self._cooldown_remaining = self.config.rebase_cooldown_turns
+            return HybridModeDecision(
+                phase=self.phase,
+                frozen_message_count=0,
+                should_rebase=True,
+                net_gain_tokens=gain,
+                reason="free_rebase_at_bust",
+                generation=self.generation,
+            )
         pressure = context_pressure if math.isfinite(context_pressure) else 0.0
         aged = self._warm_turns >= self.config.min_warm_turns
         # No pressure clause here. The old 0.50 floor made this branch

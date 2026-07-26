@@ -22,7 +22,7 @@ class _FakePrefixTracker:
     def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
         return None
 
-    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+    def observe_client_churn(self, messages, head_fingerprint=None):  # noqa: ANN001, ANN201
         return 1.0
 
     @property

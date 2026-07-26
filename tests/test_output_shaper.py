@@ -9,6 +9,11 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from headroom.proxy.effort_pricing import (
+    MIN_OBSERVATIONS,
+    EffortCostModel,
+    EffortPricingContext,
+)
 from headroom.proxy.output_shaper import (
     OutputShaperSettings,
     TurnKind,
@@ -244,6 +249,196 @@ class TestRouteEffort:
         labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
         assert labels == ["output_shaper:effort:xhigh->low"]
         assert decision == "lowered"
+
+
+class TestRouteEffortPricing:
+    """With a price attached, the blanket cache pin becomes a decision.
+
+    Without pricing the router refuses every cached request, which is safe but
+    leaves the saving on the table whenever the rewrite would repay. These pin
+    the two directions and the label format the audit trail reads.
+    """
+
+    @staticmethod
+    def _cached_body() -> dict[str, Any]:
+        return {
+            "output_config": {"effort": "xhigh"},
+            "system": [
+                {"type": "text", "text": "Sys.", "cache_control": {"type": "ephemeral"}}
+            ],
+        }
+
+    @staticmethod
+    def _measured_model() -> EffortCostModel:
+        cost_model = EffortCostModel()
+        for _ in range(MIN_OBSERVATIONS):
+            cost_model.observe("claude-opus-5", "xhigh", 6000)
+            cost_model.observe("claude-opus-5", "low", 1000)
+        return cost_model
+
+    def test_short_horizon_keeps_the_effort_pinned(self):
+        body = self._cached_body()
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=2,
+        )
+        labels, decision = route_effort(
+            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
+        )
+        assert labels == []
+        assert decision == "pinned:horizon_too_short"
+        assert body["output_config"]["effort"] == "xhigh"
+
+    def test_long_horizon_lowers_the_effort(self):
+        body = self._cached_body()
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=30,
+        )
+        labels, decision = route_effort(
+            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
+        )
+        assert labels == ["output_shaper:effort:xhigh->low"]
+        assert decision == "lowered:pays_back_within_horizon"
+        assert body["output_config"]["effort"] == "low"
+
+    def test_an_already_busting_turn_lowers_for_free(self):
+        """No measurement needed: the rewrite is being paid either way."""
+        body = self._cached_body()
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=EffortCostModel(),
+            prefix_already_busting=True,
+            expected_remaining_turns=1,
+        )
+        labels, decision = route_effort(
+            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
+        )
+        assert labels == ["output_shaper:effort:xhigh->low"]
+        assert decision == "lowered:free_prefix_already_busting"
+
+    def test_a_bought_switch_is_recorded_for_later_turns(self):
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=30,
+        )
+        route_effort(self._cached_body(), TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing)
+        assert pricing.committed_effort == "low"
+
+    def test_a_committed_effort_survives_a_non_mechanical_turn(self):
+        """The regression that made writes spike: effort following the turn kind.
+
+        output_config leads every message, so letting the value drop back to the
+        client's on the next user ask rewrites the whole prefix. Measured live
+        2026-07-25: 10,335 write tokens on the first non-mechanical turn after a
+        lowered run, against 677 to 3,144 on the stable ones.
+        """
+        body = self._cached_body()
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=30,
+            committed_effort="low",
+        )
+        labels, decision = route_effort(body, TurnKind.NEW_USER_ASK, ENABLED, pricing)
+        assert labels == ["output_shaper:effort:xhigh->low"]
+        assert decision == "sticky:reapplied"
+        assert body["output_config"]["effort"] == "low"
+
+    def test_a_held_value_is_not_a_body_mutation(self):
+        """Already at the committed value, so there is nothing to rewrite."""
+        body = self._cached_body()
+        body["output_config"]["effort"] = "low"
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=30,
+            committed_effort="low",
+        )
+        labels, decision = route_effort(body, TurnKind.NEW_USER_ASK, ENABLED, pricing)
+        assert labels == []
+        assert decision == "sticky:held"
+
+    def test_the_commit_callback_reaches_the_lineage(self):
+        seen: list[str] = []
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=30,
+            commit=seen.append,
+        )
+        route_effort(self._cached_body(), TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing)
+        assert seen == ["low"]
+
+    def test_a_failing_commit_does_not_break_the_turn(self):
+        def _explode(_value: str) -> None:
+            raise RuntimeError("tracker gone")
+
+        body = self._cached_body()
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=30,
+            commit=_explode,
+        )
+        labels, _ = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing)
+        assert labels == ["output_shaper:effort:xhigh->low"]
+        assert body["output_config"]["effort"] == "low"
+
+    def test_an_unmeasured_model_stays_pinned(self):
+        body = self._cached_body()
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=EffortCostModel(),
+            expected_remaining_turns=100,
+        )
+        labels, decision = route_effort(
+            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
+        )
+        assert labels == []
+        assert decision == "pinned:unmeasured_delta"
+
+    def test_pricing_does_not_touch_the_uncached_path(self):
+        """An uncached request has no prefix to protect, so it lowers as before."""
+        body = {"output_config": {"effort": "xhigh"}}
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=EffortCostModel(),
+            expected_remaining_turns=1,
+        )
+        labels, decision = route_effort(
+            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
+        )
+        assert labels == ["output_shaper:effort:xhigh->low"]
+        assert decision == "lowered"
+
+    def test_shape_request_threads_the_price_through(self):
+        body = self._cached_body()
+        body["messages"] = [
+            {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}
+        ]
+        pricing = EffortPricingContext(
+            model="claude-opus-5",
+            prefix_tokens=180_000,
+            cost_model=self._measured_model(),
+            expected_remaining_turns=2,
+        )
+        result = shape_request(body, ENABLED, pricing=pricing)
+        assert result.effort_decision == "pinned:horizon_too_short"
+        assert body["output_config"]["effort"] == "xhigh"
 
 
 # ---------------------------------------------------------------------------

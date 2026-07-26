@@ -106,7 +106,7 @@ class _FakePrefixTracker:
     def record_turn_gap(self, gap_seconds):  # noqa: ANN001, ANN201
         return None
 
-    def observe_client_churn(self, messages):  # noqa: ANN001, ANN201
+    def observe_client_churn(self, messages, head_fingerprint=None):  # noqa: ANN001, ANN201
         return 1.0
 
     @property
@@ -117,6 +117,9 @@ class _FakePrefixTracker:
         return fallback
 
     def expected_reads_within_ttl(self, ttl_seconds, fallback):  # noqa: ANN001, ANN201
+        return fallback
+
+    def expected_session_reads(self, ttl_seconds, fallback):  # noqa: ANN001, ANN201
         return fallback
 
     def note_compression(self, tokens_before, tokens_after):  # noqa: ANN001, ANN201

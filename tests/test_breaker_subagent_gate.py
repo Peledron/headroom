@@ -171,7 +171,8 @@ class TestFlattenSystemTextTypeHardening:
             ([{"text": None}], ""),
             ([{"text": 5}], ""),
             ([{"text": ["nested", "list"]}], ""),
-            ([{"text": "a"}, None, {"text": "b"}], "a\nb"),
+            # Separator-free join: a marker split across blocks stays intact.
+            ([{"text": "a"}, None, {"text": "b"}], "ab"),
             (42, ""),
             (3.14, ""),
             ({"not": "a list or str"}, ""),

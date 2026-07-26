@@ -157,3 +157,69 @@ def test_frozen_count_leaves_openai_tool_delta_mutable():
     # must freeze ~the cached prefix (<=4), NOT the whole 6 (which would freeze
     # the newest observation delta and block all compression).
     assert frozen <= 4, f"frozen={frozen} swallowed the delta (len={len(msgs)})"
+
+
+# ---------------------------------------------------------------------------
+# Anchor realignment: a forwarded/original count mismatch used to disable the
+# replay for the whole session, so every later turn re-sent freshly-optimized
+# bytes and re-billed the suffix. Tool ids pin each message to the forwarded
+# copy the provider actually cached, so the replay survives the mismatch.
+# ---------------------------------------------------------------------------
+
+
+def TU(tool_id, text):
+    """Assistant message carrying a tool_use block."""
+    return {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": tool_id, "name": "Read", "input": {"p": text}}],
+    }
+
+
+def TR(tool_id, text):
+    """User message carrying the matching tool_result block."""
+    return {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": text}],
+    }
+
+
+ANCHORED_PREV_ORIG = [M("user", "start"), TU("toolu_1", "foo.py"), TR("toolu_1", "<2000 lines>")]
+# Last turn headroom injected a note inside the run, so forwarded is LONGER.
+ANCHORED_PREV_FWD = [
+    M("user", "start"),
+    {"role": "user", "content": "<injected proxy note>"},
+    TU("toolu_1", "foo.py"),
+    TR("toolu_1", "<compressed>"),
+]
+
+
+def test_realigns_across_injected_message_and_replays_cached_bytes():
+    current = ANCHORED_PREV_ORIG + [M("user", "next question")]
+    # Freshly-optimized output re-derives the prefix and drops the injection.
+    optimized = list(ANCHORED_PREV_ORIG) + [M("user", "next question")]
+    out = overlay_cached_prefix(
+        optimized_messages=optimized,
+        current_original_messages=current,
+        previous_original_messages=ANCHORED_PREV_ORIG,
+        previous_forwarded_messages=ANCHORED_PREV_FWD,
+    )
+    # Everything the provider already billed comes back byte-identical,
+    # injected note included, and only the new message is fresh.
+    assert out[: len(ANCHORED_PREV_FWD)] == ANCHORED_PREV_FWD
+    assert out[len(ANCHORED_PREV_FWD) :] == [M("user", "next question")]
+
+
+def test_shorter_forwarded_without_anchors_still_refuses_to_guess():
+    # Forwarded is SHORTER and nothing is anchored: position cannot say which
+    # message was dropped, so replaying anything risks wrong bytes.
+    prev_orig = [M("user", "a"), M("assistant", "b")]
+    prev_fwd = [M("assistant", "b")]
+    current = prev_orig + [M("user", "c")]
+    optimized = list(prev_orig) + [M("user", "c")]
+    out = overlay_cached_prefix(
+        optimized_messages=optimized,
+        current_original_messages=current,
+        previous_original_messages=prev_orig,
+        previous_forwarded_messages=prev_fwd,
+    )
+    assert out == optimized

@@ -182,3 +182,47 @@ class TestExpectedReadsWithinTtl:
         for _ in range(4):
             tracker.record_turn_gap(5.0)
         assert tracker.expected_reads_within_ttl(0.0, 7.0) == 7.0
+
+
+class TestExpectedSessionReads:
+    """A mask outlives the cache run, so it is priced over the session."""
+
+    def _advance(self, tracker: PrefixCacheTracker, turns: int) -> None:
+        for _ in range(turns):
+            tracker.record_turn_gap(5.0)
+            tracker.update_from_response(0, 0, [])
+
+    def test_short_session_defers_to_the_ttl_run_forecast(self) -> None:
+        tracker = PrefixCacheTracker("anthropic")
+        self._advance(tracker, 3)
+        assert tracker.expected_session_reads(
+            300.0, 10.0
+        ) == tracker.expected_reads_within_ttl(300.0, 10.0)
+
+    def test_long_session_outgrows_the_ttl_run_cap(self) -> None:
+        # The within-TTL forecast cannot exceed 19 by construction. A session
+        # that has already run 60 turns should price a permanent edit well
+        # past that, which is what admits a batch the old horizon declined.
+        tracker = PrefixCacheTracker("anthropic")
+        self._advance(tracker, 60)
+        run = tracker.expected_reads_within_ttl(300.0, 10.0)
+        session = tracker.expected_session_reads(300.0, 10.0)
+        assert run <= 19.0
+        assert session == 60.0
+        assert session > run
+
+    def test_horizon_is_capped(self) -> None:
+        tracker = PrefixCacheTracker("anthropic")
+        self._advance(tracker, 260)
+        assert tracker.expected_session_reads(300.0, 10.0) == 200.0
+
+    def test_never_below_the_within_ttl_forecast(self) -> None:
+        # Sporadic cadence, so the run forecast is small, but the floor still
+        # holds: this must never be more conservative than what it replaces.
+        tracker = PrefixCacheTracker("anthropic")
+        for _ in range(40):
+            tracker.record_turn_gap(900.0)
+            tracker.update_from_response(0, 0, [])
+        assert tracker.expected_session_reads(
+            300.0, 10.0
+        ) >= tracker.expected_reads_within_ttl(300.0, 10.0)

@@ -414,7 +414,12 @@ class TestStatsSnapshotShape:
         log = CacheReconciliationLog(log_path=tmp_path / "log.jsonl")
         snap = log.snapshot()
         json.dumps(snap)
-        assert snap == {"requests": 0, "unplanned_busts": 0, "recent_unplanned_busts": []}
+        assert snap == {
+            "requests": 0,
+            "unplanned_busts": 0,
+            "ttl_expiry_colds": 0,
+            "recent_unplanned_busts": [],
+        }
 
     def test_snapshot_is_json_serializable_with_records(self, tmp_path) -> None:
         log = CacheReconciliationLog(log_path=tmp_path / "log.jsonl")

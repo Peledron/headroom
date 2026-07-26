@@ -48,8 +48,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
+# A marker stays referenceable for as long as the compressed tool result sits
+# in the transcript, which is the whole session, not half an hour. When an
+# entry expires early the marker guard cannot expand it and blocks the tool
+# call outright, so the client loses work that was never at risk. Capacity
+# (``max_entries``, LRU) is the real bound; this TTL only reaps stale sessions.
+DEFAULT_CCR_TTL_SECONDS = 86400  # 24h; override via HEADROOM_CCR_TTL_SECONDS
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
+
+# One marker per compressed tool result, and a long session runs tens of
+# thousands of tool calls. At 1000 the store evicted markers the transcript was
+# still quoting, which surfaced to the client as a blocked tool call. Entries
+# are small next to the payloads they stand in for, so the bound is set where a
+# whole session fits and eviction becomes the exception rather than routine.
+DEFAULT_CCR_MAX_ENTRIES = 50000
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 _SECRET_KEY_VALUE_RE = re.compile(
@@ -129,7 +141,7 @@ CCR_MISS_MESSAGE = (
     "references a file Read, re-read that file (the path is in the "
     "marker; disk is the source of truth). If it was command output, "
     "re-run the command. Entries expire after the store TTL "
-    "(default 30 minutes; configurable via HEADROOM_CCR_TTL_SECONDS)."
+    "(default 24 hours; configurable via HEADROOM_CCR_TTL_SECONDS)."
 )
 
 
@@ -154,6 +166,12 @@ class CompressionEntry:
     # This MUST match the hash used by SmartCrusher when recording compression
     tool_signature_hash: str | None = None
     compression_strategy: str | None = None  # Strategy used for compression
+
+    # Which observation-masking gate admitted this block: "age" for the normal
+    # turn-age gate, "episode" for the closed-episode relaxation. Read by
+    # get_stats to report retrieval rate per gate, which is the only evidence
+    # that says whether the episode boundary masks material still in play.
+    mask_gate: str | None = None
 
     # Feedback tracking
     retrieval_count: int = 0
@@ -206,7 +224,7 @@ class CompressionStore:
 
     def __init__(
         self,
-        max_entries: int = 1000,
+        max_entries: int = DEFAULT_CCR_MAX_ENTRIES,
         default_ttl: int = DEFAULT_CCR_TTL_SECONDS,
         enable_feedback: bool = True,
         backend: CompressionStoreBackend | None = None,
@@ -245,6 +263,17 @@ class CompressionStore:
         # Threshold for triggering heap rebuild (when 50% are stale)
         self._heap_rebuild_threshold = 0.5
 
+        # Lifetime masking-gate counters, keyed by mask_gate. These live on the
+        # store rather than being derived from entries because the interesting
+        # ratio spans evicted and expired entries: a block that was masked,
+        # never retrieved, and then aged out is exactly the success case, and
+        # summing over live entries would drop it from the denominator.
+        # _first_retrieved counts distinct hashes retrieved at least once, so a
+        # block fetched three times still counts as one block that was needed.
+        self._mask_gate_stored: dict[str, int] = {}
+        self._mask_gate_first_retrieved: dict[str, int] = {}
+        self._mask_gate_retrievals: dict[str, int] = {}
+
     @property
     def default_ttl_seconds(self) -> int:
         """Default TTL applied to new entries when callers do not override it."""
@@ -266,6 +295,7 @@ class CompressionStore:
         compression_strategy: str | None = None,
         ttl: int | None = None,
         explicit_hash: str | None = None,
+        mask_gate: str | None = None,
     ) -> str:
         """Store compressed content and return hash for retrieval.
 
@@ -339,6 +369,7 @@ class CompressionStore:
             ttl=ttl if ttl is not None else self._default_ttl,
             tool_signature_hash=tool_signature_hash,
             compression_strategy=compression_strategy,
+            mask_gate=mask_gate,
         )
 
         # Process pending feedback BEFORE acquiring lock for eviction.
@@ -357,6 +388,14 @@ class CompressionStore:
             # turn a marker is re-encountered, so duplicate stores are common.
             existing = self._backend.get(hash_key)
             if existing is None:
+                # Counted here, inside the new-key branch, because the CCR
+                # mirror bridge re-stores the same hash on every turn a marker
+                # survives. Counting each call would inflate the denominator by
+                # roughly the number of turns the marker lives.
+                if mask_gate:
+                    self._mask_gate_stored[mask_gate] = (
+                        self._mask_gate_stored.get(mask_gate, 0) + 1
+                    )
                 self._evict_if_needed()
             else:
                 # Hash already present. Different content means a true (extremely
@@ -409,6 +448,19 @@ class CompressionStore:
                 # CRITICAL FIX: Track stale heap entry
                 self._stale_heap_entries += 1
                 return None
+
+            # Counted before record_access, which is what advances the count
+            # from zero. A block fetched repeatedly is still one block the
+            # model needed back, so the first-retrieval tally is the one that
+            # divides against _mask_gate_stored.
+            if entry.mask_gate:
+                if entry.retrieval_count == 0:
+                    self._mask_gate_first_retrieved[entry.mask_gate] = (
+                        self._mask_gate_first_retrieved.get(entry.mask_gate, 0) + 1
+                    )
+                self._mask_gate_retrievals[entry.mask_gate] = (
+                    self._mask_gate_retrievals.get(entry.mask_gate, 0) + 1
+                )
 
             # Track access for feedback
             entry.record_access(query)
@@ -543,6 +595,17 @@ class CompressionStore:
                 return False
             return True
 
+    def stored_hashes(self) -> list[str]:
+        """Every hash currently held, expired or not.
+
+        The marker guards use this to look for a near miss when a hash does
+        not resolve, so an entry that is present but expired is still worth
+        naming: it tells the caller the hash was right and the content aged
+        out, which is a different problem from a mistyped hash.
+        """
+        with self._lock:
+            return list(self._backend.keys())
+
     def get_entry_status(
         self,
         hash_key: str,
@@ -603,7 +666,37 @@ class CompressionStore:
                 "total_retrievals": total_retrievals,
                 "event_count": len(self._retrieval_events),
                 "backend": backend_stats,
+                "mask_gates": self._mask_gate_stats(),
             }
+
+    def _mask_gate_stats(self) -> dict[str, dict[str, float | int]]:
+        """Per-gate masking outcome, for judging the closed-episode boundary.
+
+        ``retrieval_rate`` is the number that matters. The age gate is the
+        control: it waits for the model to demonstrably move on, so its rate is
+        the floor for how often masking guesses wrong. If the episode gate runs
+        materially above that floor it is closing tasks that are still in play,
+        and the boundary needs to be stricter (two consecutive user asks, or a
+        minimum token distance) rather than firing on the first new ask.
+
+        Caller holds ``self._lock``.
+        """
+        gates = (
+            set(self._mask_gate_stored)
+            | set(self._mask_gate_first_retrieved)
+            | set(self._mask_gate_retrievals)
+        )
+        stats: dict[str, dict[str, float | int]] = {}
+        for gate in sorted(gates):
+            stored = self._mask_gate_stored.get(gate, 0)
+            first_retrieved = self._mask_gate_first_retrieved.get(gate, 0)
+            stats[gate] = {
+                "stored": stored,
+                "retrieved": first_retrieved,
+                "retrievals": self._mask_gate_retrievals.get(gate, 0),
+                "retrieval_rate": (first_retrieved / stored) if stored else 0.0,
+            }
+        return stats
 
     def get_memory_stats(self) -> ComponentStats:
         """Get memory statistics for the MemoryTracker.
@@ -690,6 +783,7 @@ class CompressionStore:
                 self._rebuild_heap()
 
         # If still at capacity, remove oldest entries using heap
+        deferred: list[tuple[float, str]] = []
         while self._backend.count() >= self._max_entries and self._eviction_heap:
             # Pop oldest from heap (O(log n))
             created_at, hash_key = heapq.heappop(self._eviction_heap)
@@ -697,19 +791,34 @@ class CompressionStore:
             # Check if entry still exists and matches timestamp
             # (entry might have been deleted or replaced)
             entry = self._backend.get(hash_key)
-            if entry is not None and entry.created_at == created_at:
-                # HIGH FIX: Track eviction as "successful compression" if never retrieved
-                # This prevents state divergence between store and feedback loop
-                if self._enable_feedback and entry.retrieval_count == 0:
-                    # Entry was never retrieved = compression was successful
-                    # Notify feedback system so it knows this strategy worked
-                    self._record_eviction_success(entry)
-                self._backend.delete(hash_key)
-            else:
+            if entry is None or entry.created_at != created_at:
                 # CRITICAL FIX: This was a stale entry, decrement counter
                 # (we already popped it, so the stale entry is now gone)
                 if self._stale_heap_entries > 0:
                     self._stale_heap_entries -= 1
+                continue
+            if entry.retrieval_count > 0:
+                # A retrieval is proof the marker is still live in a transcript:
+                # the client quoted it back at us. Dropping one of those makes the
+                # response-side marker guard block a legitimate tool call over a
+                # payload only headroom lost, which costs the client real work.
+                # Ordering by created_at alone made this the common case, because
+                # the oldest entries in a long session are exactly the ones still
+                # being quoted. Spare it and let a never-retrieved entry go first.
+                deferred.append((created_at, hash_key))
+                continue
+            # Entry was never retrieved = compression was successful
+            # Notify feedback system so it knows this strategy worked
+            if self._enable_feedback:
+                self._record_eviction_success(entry)
+            self._backend.delete(hash_key)
+
+        # Everything spared goes back, keyed by created_at so the staleness check
+        # above still matches. If every entry is live the loop drains the heap and
+        # capacity is exceeded on purpose: a marker that is still quoted is worth
+        # more than the bound, and the TTL sweep reclaims it when the session ends.
+        for spared in deferred:
+            heapq.heappush(self._eviction_heap, spared)
 
     def _clean_expired(self) -> None:
         """Remove expired entries. Must be called with lock held.
@@ -1000,7 +1109,7 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
 
 
 def get_compression_store(
-    max_entries: int = 1000,
+    max_entries: int = DEFAULT_CCR_MAX_ENTRIES,
     default_ttl: int | None = None,
     backend: CompressionStoreBackend | None = None,
 ) -> CompressionStore:
@@ -1013,7 +1122,7 @@ def get_compression_store(
     Args:
         max_entries: Maximum entries (only used on first call for global store).
         default_ttl: Default TTL (only used on first call for global store).
-            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 1800-second default.
+            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 86400-second default.
         backend: Custom storage backend (only used on first call for global store).
                  Defaults to InMemoryBackend if not provided; env backend used if backend is None.
 

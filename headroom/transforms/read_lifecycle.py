@@ -21,6 +21,7 @@ on the feat/compression-extraction branch.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -82,6 +83,17 @@ def _format_read_lifecycle_transform(classification: ReadClassification) -> str:
 
 
 @dataclass
+class RereadDiff:
+    """A re-read that will be forwarded as a diff against an earlier read."""
+
+    tool_call_id: str
+    base_tool_call_id: str
+    file_path: str
+    marker: str
+    ccr_hash: str
+
+
+@dataclass
 class ReadLifecycleResult:
     """Output of lifecycle management pass."""
 
@@ -90,6 +102,7 @@ class ReadLifecycleResult:
     reads_stale: int = 0
     reads_superseded: int = 0
     reads_fresh: int = 0
+    reads_diffed: int = 0
     bytes_before: int = 0
     bytes_after: int = 0
     transforms_applied: list[str] = field(default_factory=list)
@@ -158,8 +171,15 @@ class ReadLifecycleManager:
                     if c.msg_index < frozen_message_count and c.state != ReadState.FRESH:
                         c.state = ReadState.FRESH
 
+        # Phase 3.5: plan diff-only re-reads. Runs after the frozen-prefix
+        # filter so a base read we intend to keep is not one the earlier phase
+        # already decided to mask.
+        diffs: dict[str, RereadDiff] = {}
+        if self.config.diff_rereads:
+            diffs = self._plan_reread_diffs(messages, file_ops, classifications)
+
         # Phase 4: Replace stale/superseded content
-        return self._apply_lifecycle(messages, classifications)
+        return self._apply_lifecycle(messages, classifications, diffs)
 
     def _build_tool_metadata(
         self, messages: list[dict[str, Any]]
@@ -361,14 +381,16 @@ class ReadLifecycleManager:
         self,
         messages: list[dict[str, Any]],
         classifications: list[ReadClassification],
+        diffs: dict[str, RereadDiff] | None = None,
     ) -> ReadLifecycleResult:
         """Replace stale/superseded Read content with markers."""
         # Build lookup: tool_call_id → classification (for non-fresh reads)
         replacements: dict[str, ReadClassification] = {
             c.tool_call_id: c for c in classifications if c.state != ReadState.FRESH
         }
+        diffs = diffs or {}
 
-        if not replacements:
+        if not replacements and not diffs:
             return ReadLifecycleResult(
                 messages=messages,
                 reads_total=len(classifications),
@@ -381,6 +403,7 @@ class ReadLifecycleManager:
         bytes_before = 0
         bytes_after = 0
         counts = dict.fromkeys(ReadState, 0)
+        diffed = 0
 
         for c in classifications:
             counts[c.state] += 1
@@ -392,6 +415,16 @@ class ReadLifecycleManager:
             # OpenAI format: role=tool with tool_call_id
             if role == "tool":
                 tc_id = msg.get("tool_call_id", "")
+                diff = diffs.get(tc_id)
+                if diff is not None and isinstance(content, str):
+                    result_messages.append({**msg, "content": diff.marker})
+                    transforms.append(f"read_lifecycle:diff:{diff.file_path}")
+                    ccr_hashes.append(diff.ccr_hash)
+                    bytes_before += len(content.encode("utf-8"))
+                    bytes_after += len(diff.marker.encode("utf-8"))
+                    diffed += 1
+                    continue
+
                 classification = replacements.get(tc_id)
                 if classification and isinstance(content, str):
                     replaced, marker, ccr_hash = self._replace_content(content, classification)
@@ -406,9 +439,10 @@ class ReadLifecycleManager:
 
             # Anthropic format: content blocks list
             if isinstance(content, list):
-                new_blocks, block_replaced = self._process_anthropic_blocks(
-                    content, replacements, transforms, ccr_hashes
+                new_blocks, block_replaced, block_diffed = self._process_anthropic_blocks(
+                    content, replacements, diffs, transforms, ccr_hashes
                 )
+                diffed += block_diffed
                 if block_replaced:
                     result_messages.append({**msg, "content": new_blocks})
                     continue
@@ -421,6 +455,7 @@ class ReadLifecycleManager:
             reads_stale=counts[ReadState.STALE],
             reads_superseded=counts[ReadState.SUPERSEDED],
             reads_fresh=counts[ReadState.FRESH],
+            reads_diffed=diffed,
             bytes_before=bytes_before,
             bytes_after=bytes_after,
             transforms_applied=transforms,
@@ -431,12 +466,14 @@ class ReadLifecycleManager:
         self,
         content_blocks: list[Any],
         replacements: dict[str, ReadClassification],
+        diffs: dict[str, RereadDiff],
         transforms: list[str],
         ccr_hashes: list[str],
-    ) -> tuple[list[Any], bool]:
+    ) -> tuple[list[Any], bool, int]:
         """Process Anthropic-format content blocks for lifecycle replacement."""
         new_blocks = []
         any_replaced = False
+        diffed = 0
 
         for block in content_blocks:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
@@ -446,6 +483,15 @@ class ReadLifecycleManager:
             tc_id = block.get("tool_use_id", "")
             classification = replacements.get(tc_id)
             tool_content = block.get("content", "")
+
+            diff = diffs.get(tc_id)
+            if diff is not None and isinstance(tool_content, str):
+                new_blocks.append({**block, "content": diff.marker})
+                transforms.append(f"read_lifecycle:diff:{diff.file_path}")
+                ccr_hashes.append(diff.ccr_hash)
+                any_replaced = True
+                diffed += 1
+                continue
 
             if classification and isinstance(tool_content, str):
                 replaced, marker, ccr_hash = self._replace_content(tool_content, classification)
@@ -459,7 +505,169 @@ class ReadLifecycleManager:
 
             new_blocks.append(block)
 
-        return new_blocks, any_replaced
+        return new_blocks, any_replaced, diffed
+
+    @staticmethod
+    def _collect_tool_result_text(messages: list[dict[str, Any]]) -> dict[str, str]:
+        """Map tool_call_id to its tool result text, for string results only.
+
+        A non-string result (a content block list, an image) has no text to
+        diff, so it is simply absent from the map and the caller falls through
+        to today's behaviour.
+        """
+        texts: dict[str, str] = {}
+
+        for msg in messages:
+            if msg.get("role") == "tool":
+                content = msg.get("content", "")
+                tc_id = msg.get("tool_call_id", "")
+                if tc_id and isinstance(content, str):
+                    texts[tc_id] = content
+                continue
+
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tc_id = block.get("tool_use_id", "")
+                inner = block.get("content", "")
+                if tc_id and isinstance(inner, str):
+                    texts[tc_id] = inner
+
+        return texts
+
+    @staticmethod
+    def _already_compressed(text: str) -> bool:
+        """True when the text is a marker rather than real file content.
+
+        A marker cannot serve as a diff base: the model cannot see the bytes it
+        stands for, so a diff against it is unusable.
+        """
+        return (
+            "Retrieve original: hash=" in text
+            or "Retrieve more: hash=" in text
+            or "<<ccr:" in text
+            or text.startswith("[Read ")
+            or text.startswith("[Tool ")
+        )
+
+    def _plan_reread_diffs(
+        self,
+        messages: list[dict[str, Any]],
+        file_ops: dict[str, list[FileOperation]],
+        classifications: list[ReadClassification],
+    ) -> dict[str, RereadDiff]:
+        """Plan diff-only forwarding for the newest read of each re-read file.
+
+        Only the newest read of a file is ever diffed, so a diff never becomes
+        the base of another diff. The base read is forced back to FRESH so the
+        stale/superseded pass does not mask away the bytes the diff refers to.
+        """
+        texts = self._collect_tool_result_text(messages)
+        by_id = {c.tool_call_id: c for c in classifications}
+        planned: dict[str, RereadDiff] = {}
+
+        for file_path, ops in file_ops.items():
+            reads = sorted(
+                (op for op in ops if op.operation == "read"),
+                key=lambda op: op.msg_index,
+            )
+            if len(reads) < 2:
+                continue
+
+            target = reads[-1]
+            new_text = texts.get(target.tool_call_id)
+            if not new_text or self._already_compressed(new_text):
+                continue
+            if len(new_text.encode("utf-8")) < self.config.min_size_bytes:
+                continue
+
+            # Nearest earlier read of the same window. A different window is a
+            # different slice of the file, so its text is not a base.
+            base = None
+            for candidate in reversed(reads[:-1]):
+                if (candidate.read_offset, candidate.read_limit) != (
+                    target.read_offset,
+                    target.read_limit,
+                ):
+                    continue
+                base_text = texts.get(candidate.tool_call_id)
+                if not base_text or self._already_compressed(base_text):
+                    continue
+                base = (candidate, base_text)
+                break
+
+            if base is None:
+                continue
+
+            base_op, base_text = base
+            if base_text == new_text:
+                # Byte-identical repeat. The superseded path already handles
+                # this and measures at 0.1 percent of read bytes, so leave it.
+                continue
+
+            diff_body = "".join(
+                difflib.unified_diff(
+                    base_text.splitlines(keepends=True),
+                    new_text.splitlines(keepends=True),
+                    fromfile=f"{file_path} (earlier read)",
+                    tofile=f"{file_path} (this read)",
+                    n=3,
+                )
+            )
+            if not diff_body:
+                continue
+
+            marker = (
+                f"[Read forwarded as a diff against the earlier read of {file_path} "
+                f"in tool_use {base_op.tool_call_id}. Every line not shown below is "
+                f"byte-identical to that earlier result. Apply this unified diff to "
+                f"it to reconstruct the file as it is now.\n"
+                f"{diff_body}"
+                f"Retrieve original: hash={{ccr_hash}}]"
+            )
+            if len(marker.encode("utf-8")) > self.config.diff_max_ratio * len(
+                new_text.encode("utf-8")
+            ):
+                # A rewritten file diffs to roughly its own size. Forwarding it
+                # in full is both smaller and easier for the model to read.
+                continue
+
+            ccr_hash = hashlib.sha256(new_text.encode()).hexdigest()[:24]
+            if self.store is not None:
+                try:
+                    ccr_hash = self.store.store(
+                        original=new_text,
+                        compressed="",
+                        tool_name="Read",
+                        tool_call_id=target.tool_call_id,
+                        compression_strategy="read_lifecycle:diff",
+                        explicit_hash=ccr_hash,
+                    )
+                except Exception as e:  # noqa: BLE001 - storage failure must not break the request
+                    logger.warning(
+                        "read_lifecycle: CCR store failed for diff of %s: %s",
+                        target.tool_call_id,
+                        e,
+                    )
+
+            planned[target.tool_call_id] = RereadDiff(
+                tool_call_id=target.tool_call_id,
+                base_tool_call_id=base_op.tool_call_id,
+                file_path=file_path,
+                marker=marker.replace("{ccr_hash}", ccr_hash),
+                ccr_hash=ccr_hash,
+            )
+
+            # Keep the base readable: masking it would delete the bytes this
+            # diff is expressed against.
+            base_classification = by_id.get(base_op.tool_call_id)
+            if base_classification is not None:
+                base_classification.state = ReadState.FRESH
+
+        return planned
 
     def _replace_content(
         self, content: str, classification: ReadClassification

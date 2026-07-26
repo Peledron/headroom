@@ -68,7 +68,7 @@ class TestCCRRetrieveEndpoint:
         response = client.post("/v1/retrieve", json={"hash": "nonexistent123"})
         assert response.status_code == 404
         assert "Entry not found" in response.json()["detail"]
-        assert "CCR TTL: 1800 seconds" in response.json()["detail"]
+        assert "CCR TTL: 86400 seconds" in response.json()["detail"]
 
     def test_retrieve_expired_hash_reports_expiration_detail(self, client):
         """Expired entries report expiration separately from missing hashes."""
@@ -161,13 +161,17 @@ class TestCCRStatsEndpoint:
 
     def test_stats_empty_store(self, client):
         """Stats with empty store returns zeros."""
+        # The store is process-wide, so anything an earlier test left in it
+        # would be counted here. Empty is what this test is about, so it says
+        # so rather than inheriting whatever ran before it.
+        reset_compression_store()
         response = client.get("/v1/retrieve/stats")
         assert response.status_code == 200
 
         data = response.json()
         assert "store" in data
         assert data["store"]["entry_count"] == 0
-        assert data["store"]["default_ttl_seconds"] == 1800
+        assert data["store"]["default_ttl_seconds"] == 86400
         assert "recent_retrievals" in data
 
     def test_stats_exposes_env_configured_ttl(self, client, monkeypatch):

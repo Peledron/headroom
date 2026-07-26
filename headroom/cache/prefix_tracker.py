@@ -39,12 +39,43 @@ _PROVIDER_READ_DISCOUNT = {
     "bedrock": 0.9,
 }
 
+# How much of a cached prefix has to be going down with this turn's own body
+# before a caller may treat its rewrite as already paid for. Providers match a
+# longest common prefix, so a turn that recompresses the last cached message
+# still reads everything ahead of it. Set strict on purpose: claiming a free
+# rewrite that is not free spends real tokens, while missing one only leaves a
+# structural mutation waiting for a later turn.
+ALREADY_BUSTING_SURVIVING_FRACTION = 0.25
+
 _PROVIDER_WRITE_PENALTY = {
     "anthropic": 0.25,  # 25% surcharge on writes
     "openai": 0.0,  # No write penalty
     "gemini": 0.0,
     "bedrock": 0.25,
 }
+
+# A warm turn appends a user message plus one assistant reply and its tool
+# results. Measured over 865 warm turns of live traffic that lands around 7k
+# tokens, so anything past this ceiling is a re-write of already-cached history
+# rather than an append, and must not pollute the steady-state write rate.
+_STEADY_WRITE_CEILING = 32_000
+
+# Anthropic bills a 1h cache write at 2x base and a 5m write at 1.25x, so the
+# premium for holding the longer tier is 0.75x of whatever gets written.
+_TTL_1H_PREMIUM = 0.75
+_TTL_5M_WRITE_PENALTY = 1.25
+
+# Below this the prefix is too small for a re-write to outweigh the premium,
+# whatever the cadence, so the reactive cadence rule keeps the decision.
+_TTL_SIZE_FLOOR_TOKENS = 40_000
+
+# Horizon for pricing an edit whose saving outlives the current cache run.
+# Sessions are heavy tailed, so remaining length is estimated Lindy style: one
+# that has already run n turns is expected to run about n more. The cap keeps a
+# long session from promising an unbounded payback, and the minimum keeps the
+# estimator off until a session has shown it is not a one-shot call.
+_SESSION_READ_HORIZON_CAP = 200.0
+_SESSION_READ_MIN_TURNS = 8
 
 # Smoothing factor for the compression-ratio predictor. The cost gate has to
 # estimate how many tokens the NEXT compression will remove before running it,
@@ -90,6 +121,30 @@ class PrefixFreezeConfig:
     # for workspaces that genuinely run more concurrent conversations on one
     # model + system prompt.
     max_lineages_per_session: int = 32
+    # How much of a recorded lineage chain the incoming history must still
+    # match for the tracker to be reused when it is no longer a strict prefix.
+    #
+    # Client histories are not append-only. Claude Code strips
+    # <system-reminder> blocks out of old user messages, so one edit deep in a
+    # long history used to fail the strict prefix test, start a fresh lineage,
+    # and throw away every message before the edit as well. Measured on the
+    # replay corpus: histories of 20+ messages broke lineage on 18.1 percent of
+    # turns at a mean mismatch depth of 167, discarding 24.1M tokens of prefix
+    # that was still byte-valid.
+    #
+    # Two guards, tuned together against that corpus. The absolute floor is what
+    # keeps sibling conversations apart: a subagent that shares only the system
+    # prompt and opening message overlaps by one to three messages, never eight.
+    # The fraction keeps client compaction out, which lands near 0.01.
+    #
+    # min 8 messages with fraction 0.5 recovers 24.3M of the 25.4M (95.8 percent)
+    # over 191 of 222 broken lineages. Requiring fraction 0.9 instead recovers
+    # only 79.7 percent, because a reminder stripped a dozen messages from the
+    # tail of an 80 message history scores 0.85 and would be refused.
+    #
+    # Set lineage_rematch_min_messages to 0 to restore strict-prefix matching.
+    lineage_rematch_min_messages: int = 8
+    lineage_rematch_fraction: float = 0.5
 
 
 @dataclass
@@ -315,14 +370,25 @@ def overlay_cached_prefix(
     # counts differ, an injected / dropped / merged message shifted the
     # mapping, so replaying prev_fwd[i] at position i could forward the wrong
     # content — bail (leave this turn's output untouched) rather than risk it.
+    mapping: dict[int, int] | None = None
     if len(prev_fwd) != n:
+        mapping = _align_forwarded_to_original(prev_orig, prev_fwd)
+        if not mapping:
+            logger.debug(
+                "overlay: forwarded/original count mismatch (prev_fwd=%d, "
+                "prev_orig=%d) and no tool-id anchor aligned them — skipping "
+                "cached-prefix replay (possible bust)",
+                len(prev_fwd),
+                n,
+            )
+            return optimized_messages
         logger.debug(
             "overlay: forwarded/original count mismatch (prev_fwd=%d, prev_orig=%d) "
-            "— skipping cached-prefix replay (possible bust)",
+            "— realigned %d messages on tool-id anchors",
             len(prev_fwd),
             n,
+            len(mapping),
         )
-        return optimized_messages
     # Append-only guard on CONTENT ONLY, message-by-message. Replay the
     # previously-forwarded (cached, compressed) bytes for the longest LEADING
     # run of messages that is byte-for-byte (content-canonical) identical to
@@ -347,11 +413,17 @@ def overlay_cached_prefix(
     # positionally corresponds to prev_orig[k] (guaranteed by the count check
     # above), so no wrong bytes are ever forwarded.
     limit = min(n, len(current_original_messages), len(optimized_messages))
+    if mapping is not None:
+        # Only replay up to the last original index we could align to a
+        # forwarded message; beyond it the correspondence is unknown again.
+        limit = min(limit, max(mapping) + 1)
     k = 0
     while k < limit and _canonicalize_for_prefix_compare(
         current_original_messages[k]
     ) == _canonicalize_for_prefix_compare(prev_orig[k]):
         k += 1
+    while mapping is not None and k > 0 and (k - 1) not in mapping:
+        k -= 1
     if k == 0:
         logger.debug(
             "overlay: prefix diverged at message 0 — no cached-prefix replay "
@@ -368,7 +440,79 @@ def overlay_cached_prefix(
         )
     # Replay the cached (compressed) prefix byte-identical up to the first
     # divergence; keep this turn's freshly-produced output for the rest.
-    return list(prev_fwd[:k]) + list(optimized_messages[k:])
+    # Under anchor realignment the forwarded run reaching original index k-1
+    # ends at mapping[k - 1], which also carries any message injected inside
+    # that run, so the replayed bytes stay exactly what the provider billed.
+    forwarded_end = k if mapping is None else mapping[k - 1] + 1
+    return list(prev_fwd[:forwarded_end]) + list(optimized_messages[k:])
+
+
+def _tool_anchor(msg: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Return an identity anchor that survives every headroom transform.
+
+    Tool-call ids are minted by the provider and no transform rewrites them, so
+    they still identify a forwarded message after its text has been masked,
+    compressed or re-shaped. Messages carrying no tool id fall back to a
+    role-only anchor and are aligned positionally.
+    """
+    role = str(msg.get("role", ""))
+    ids: list[str] = []
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_id = block.get("id") or block.get("tool_use_id")
+            if isinstance(block_id, str) and block_id:
+                ids.append(block_id)
+    return (role, tuple(ids))
+
+
+def _align_forwarded_to_original(
+    previous_original_messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]],
+) -> dict[int, int]:
+    """Map original index -> forwarded index for last turn's pair of lists.
+
+    Positional 1:1 correspondence only holds when the turn forwarded exactly one
+    message per original. Injection, dropping or merging shifts the mapping, and
+    the previous behaviour was to bail out of cached-prefix replay entirely for
+    the rest of the session. Anchoring on tool ids recovers the mapping instead,
+    which is what keeps the already-billed prefix byte-stable.
+    """
+    mapping: dict[int, int] = {}
+    forwarded_anchors = [_tool_anchor(msg) for msg in previous_forwarded_messages]
+    # Fewer forwarded than original means a message was dropped or merged, and
+    # nothing says where. A tool id still pins its own message, but position no
+    # longer does, so unanchored messages get no positional fallback at all.
+    allow_positional = len(previous_forwarded_messages) >= len(previous_original_messages)
+    cursor = 0
+    for index, original in enumerate(previous_original_messages):
+        if cursor >= len(previous_forwarded_messages):
+            break
+        role, ids = _tool_anchor(original)
+        if ids:
+            scan = cursor
+            while scan < len(forwarded_anchors) and forwarded_anchors[scan] != (
+                role,
+                ids,
+            ):
+                scan += 1
+            if scan >= len(forwarded_anchors):
+                break
+            mapping[index] = scan
+            cursor = scan + 1
+            continue
+        # A message carrying no tool id has nothing to verify a pairing against,
+        # so it may only be paired positionally while the two lists have not
+        # drifted apart yet. Once an anchor has shifted the cursor, pairing an
+        # unanchored message on position alone could silently skip a dropped
+        # message and replay the wrong bytes, so stop the run here instead.
+        if not allow_positional or cursor != index or forwarded_anchors[cursor][0] != role:
+            break
+        mapping[index] = cursor
+        cursor += 1
+    return mapping
 
 
 def latest_message_cache_control_ttl(messages: list[dict[str, Any]]) -> str | None:
@@ -512,19 +656,42 @@ class PrefixCacheTracker:
         self._turn_number: int = 0
         self._last_activity: float = time.time()
         self._last_original_messages: list[dict[str, Any]] = []
+        # Fingerprint of the bytes ahead of every message in the cache prefix
+        # (system + tools). Deferred tool loading grows the tools array
+        # mid-session, which kills the whole cached suffix while the messages
+        # stay byte-identical, so message comparison alone reports a warm
+        # prefix on a turn that is in fact a total bust. See
+        # observe_client_churn and docs/prefix-waste-2026-07-25.md.
+        self._last_head_fingerprint: str | None = None
         self._last_forwarded_messages: list[dict[str, Any]] = []
+        # How many of the above were actually sent upstream, as opposed to
+        # projected onto the tail from the response. See update_from_response.
+        self._last_sent_message_count: int = 0
         # Recent observed inter-turn gaps (seconds between this session's
         # successive requests), for adaptive cache-TTL tier selection. A short,
         # bounded ring: only the recent cadence matters and old gaps should age
         # out. Fed by the handler with the pre-refresh idle gap each turn.
         self._turn_gaps: deque[float] = deque(maxlen=8)
         self._ttl_recommendation: str | None = None
+        # Smoothed incremental cache write per warm turn, and how many turns
+        # this session has run per observed TTL breach. Together they say
+        # whether the 1h write premium is cheaper than re-writing the prefix.
+        self._steady_write_tokens: float | None = None
+        self._ttl_breaches: int = 0
         # Depth fractions (0..1 of last turn's original prefix) where client
         # churn structurally diverged the history, recorded by
         # observe_client_churn. Consumed by anchor placement: the empirical
         # churn-depth profile says where breakpoints stop paying. Bounded ring,
         # recent churn behavior is what matters for this session.
         self._churn_depth_fractions: deque[float] = deque(maxlen=32)
+        # Absolute message indices where 1h anchors were actually attached last
+        # turn. Anchor placement re-solves against inputs that move every turn
+        # (churn fractions rescale with message count, the ring turns over), so
+        # without a memory of where the live anchors sit the argmin walks and
+        # re-writes the span it crosses. Absolute, not fractional: in steady
+        # state messages are only appended, so an anchor that does not move
+        # keeps the same index and the same bytes.
+        self._placed_anchor_depths: list[int] = []
         # Token-mode cost-aware prefix gate state. Once the break-even math
         # decides to compress this session, it latches on: pressure and expected
         # reads only grow, so re-deciding every turn could flip compressed back to
@@ -562,6 +729,99 @@ class PrefixCacheTracker:
         self._tokens_preserved: int = 0
         self._compression_foregone_tokens: int = 0
 
+    def export_state(self) -> dict[str, Any]:
+        """Plain-data snapshot of everything a restart must not lose.
+
+        The two message blobs are the point of the exercise: without them
+        ``overlay_cached_prefix`` has nothing to replay, so every live session
+        re-writes its whole history after a restart (measured at roughly 195k
+        write tokens each). The scalars ride along because rebuilding them from
+        a cold tracker would re-run cold-start behavior on a warm provider
+        cache: turn 0 skips freezing entirely, and a reset compression latch
+        can flip compressed back to original and bust the very prefix it
+        preserved.
+
+        Config is excluded on purpose. It is rebuilt from the environment on
+        load so a restart that changes a knob takes the new value.
+        ``read_maturation_manager`` is excluded too: the handler creates it
+        lazily and it holds no cross-restart value.
+        """
+        return {
+            "provider": self.provider,
+            "last_original_messages": self._last_original_messages,
+            "last_forwarded_messages": self._last_forwarded_messages,
+            # Travels with the list it indexes into. Without it a restored
+            # lineage cannot tell which of those messages it actually sent,
+            # falls back to the whole list, and reports a bust on its first
+            # turn back purely because the list carries a projected tail.
+            "last_sent_message_count": self._last_sent_message_count,
+            "last_head_fingerprint": self._last_head_fingerprint,
+            "turn_number": self._turn_number,
+            "cached_token_count": self._cached_token_count,
+            "cached_message_count": self._cached_message_count,
+            "last_activity": self._last_activity,
+            "steady_write_tokens": self._steady_write_tokens,
+            "ttl_breaches": self._ttl_breaches,
+            "ttl_recommendation": self._ttl_recommendation,
+            "turn_gaps": list(self._turn_gaps),
+            "churn_depth_fractions": list(self._churn_depth_fractions),
+            "placed_anchor_depths": list(self._placed_anchor_depths),
+            "compress_latched": self._compress_latched,
+            "last_compression_kept": self._last_compression_kept,
+            "kept_ewma": self._kept_ewma,
+            "kept_var": self._kept_var,
+            "busts_avoided": self._busts_avoided,
+            "tokens_preserved": self._tokens_preserved,
+            "compression_foregone_tokens": self._compression_foregone_tokens,
+            "hybrid": self.hybrid_controller.export_state(),
+        }
+
+    def restore_state(self, blob: dict[str, Any]) -> None:
+        """Reinstate a snapshot from :meth:`export_state`.
+
+        Every field is read defensively. A snapshot written by an older build
+        can be missing keys, and a half-restored tracker is worse than a cold
+        one: it would claim a frozen prefix it cannot actually replay.
+        """
+        self._last_original_messages = blob.get("last_original_messages") or []
+        self._last_forwarded_messages = blob.get("last_forwarded_messages") or []
+        # A snapshot from a build before this field existed leaves it at 0,
+        # which reads as "unknown" and falls back to the cached count. That
+        # is the old behaviour, not a new failure.
+        self._last_sent_message_count = int(blob.get("last_sent_message_count", 0) or 0)
+        self._last_head_fingerprint = blob.get("last_head_fingerprint")
+        self._turn_number = int(blob.get("turn_number", 0) or 0)
+        self._cached_token_count = int(blob.get("cached_token_count", 0) or 0)
+        self._cached_message_count = int(blob.get("cached_message_count", 0) or 0)
+        self._last_activity = float(blob.get("last_activity", time.time()))
+        steady = blob.get("steady_write_tokens")
+        self._steady_write_tokens = None if steady is None else float(steady)
+        self._ttl_breaches = int(blob.get("ttl_breaches", 0) or 0)
+        self._ttl_recommendation = blob.get("ttl_recommendation")
+        self._turn_gaps = deque(blob.get("turn_gaps") or [], maxlen=8)
+        self._churn_depth_fractions = deque(
+            blob.get("churn_depth_fractions") or [], maxlen=32
+        )
+        self._placed_anchor_depths = list(blob.get("placed_anchor_depths") or [])
+        self._compress_latched = bool(blob.get("compress_latched", False))
+        kept = blob.get("last_compression_kept")
+        self._last_compression_kept = None if kept is None else float(kept)
+        ewma = blob.get("kept_ewma")
+        self._kept_ewma = None if ewma is None else float(ewma)
+        self._kept_var = float(blob.get("kept_var", 0.0) or 0.0)
+        self._busts_avoided = int(blob.get("busts_avoided", 0) or 0)
+        self._tokens_preserved = int(blob.get("tokens_preserved", 0) or 0)
+        self._compression_foregone_tokens = int(
+            blob.get("compression_foregone_tokens", 0) or 0
+        )
+        hybrid = blob.get("hybrid")
+        if isinstance(hybrid, dict):
+            self.hybrid_controller.restore_state(hybrid)
+        # A restored tracker has not been fetched this process, so there is no
+        # meaningful in-process idle gap yet. get_or_create computes the real
+        # one from _last_activity on the next fetch.
+        self._idle_seconds_at_fetch = 0.0
+
     def get_frozen_message_count(self) -> int:
         """How many leading messages to skip compression on the next turn.
 
@@ -597,6 +857,11 @@ class PrefixCacheTracker:
         if not math.isfinite(g) or g < 0.0:
             return
         self._turn_gaps.append(g)
+        # A gap past the 5m tier would have lapsed a 5m entry. Counting these
+        # over the whole session gives the breach rate that
+        # prefers_long_ttl weighs against the 1h write premium.
+        if g > 300.0:
+            self._ttl_breaches += 1
 
     def recommended_ttl(
         self,
@@ -630,10 +895,43 @@ class PrefixCacheTracker:
         elif recent_max > tier_boundary_seconds:
             self._ttl_recommendation = "1h"
         # else: ambiguous band -> keep the previous recommendation (hysteresis).
+        if self._ttl_recommendation == "5m" and self.prefers_long_ttl():
+            self._ttl_recommendation = "1h"
         return self._ttl_recommendation
 
+    def prefers_long_ttl(self) -> bool:
+        """Whether the 1h premium is cheaper than re-writing this prefix once.
+
+        Cadence alone under-buys retention on a large prefix. Staying on 5m
+        costs ``1.25 x prefix`` the first time an idle gap outruns the window,
+        while 1h costs an extra ``0.75 x delta`` per warm turn, and the delta is
+        the appended tail, not the whole prefix. So 1h pays for itself whenever
+        a breach lands within ``1.25 x prefix / (0.75 x delta)`` turns. Measured
+        on this proxy's own traffic: ~200k prefix against ~7k steady writes puts
+        break-even near 46 turns, and breaches arrived roughly every 30, so a
+        long conversation wants 1h even when the recent cadence looks fast.
+
+        Small prefixes stay on 5m: below the size floor a re-write is cheap and
+        the premium is not worth paying against a cadence that may stay fast.
+        """
+        prefix_tokens = self._cached_token_count
+        steady_write = self._steady_write_tokens
+        if prefix_tokens < _TTL_SIZE_FLOOR_TOKENS or not steady_write:
+            return False
+        breakeven_turns = (_TTL_5M_WRITE_PENALTY * prefix_tokens) / (
+            _TTL_1H_PREMIUM * steady_write
+        )
+        # Observed turns per breach, with the whole session as the sample. No
+        # breach yet means no evidence for the premium, so 5m holds.
+        if self._ttl_breaches <= 0:
+            return False
+        turns_per_breach = self._turn_number / self._ttl_breaches
+        return turns_per_breach < breakeven_turns
+
     def observe_client_churn(
-        self, current_original_messages: list[dict[str, Any]]
+        self,
+        current_original_messages: list[dict[str, Any]],
+        head_fingerprint: str | None = None,
     ) -> float:
         """Surviving fraction of last turn's ORIGINAL prefix in this turn's bytes.
 
@@ -653,14 +951,40 @@ class PrefixCacheTracker:
         conservative direction only when churn hits size-typical messages;
         callers treat it as an estimate, not an exact token ratio.
 
+        ``head_fingerprint`` covers the bytes ahead of every message in the
+        cache prefix (system + tools). Those bytes are not messages, so message
+        comparison cannot see them change, yet a single added tool schema
+        invalidates the entire transcript behind it. Measured at 14% of all
+        billed write, and it silently suppressed the free-rebase path: the turn
+        was a total bust that reported as a warm prefix, so queued compression
+        never flushed on the one turn where rewriting costs nothing. When the
+        fingerprint moves, the surviving fraction is 0.0 by construction.
+
         Call BEFORE :meth:`update_from_response` (which overwrites
         ``_last_original_messages``), once per request. A real divergence
         (``k < n``) is also recorded into the churn-depth ring consumed by
         anchor placement.
         """
+        previous_head = self._last_head_fingerprint
+        if head_fingerprint is not None:
+            self._last_head_fingerprint = head_fingerprint
+
+        if (
+            head_fingerprint is not None
+            and previous_head is not None
+            and previous_head != head_fingerprint
+        ):
+            # Checked ahead of the no-history guard: the head sits in front of
+            # every message, so it busts the prefix whether or not this tracker
+            # recorded last turn's originals. Nothing behind it survives, so
+            # every message is already being rewritten and mutating them is free.
+            self._churn_depth_fractions.append(0.0)
+            return 0.0
+
         prev = self._last_original_messages
         if not prev:
             return 1.0
+
         n = len(prev)
         limit = min(n, len(current_original_messages))
         k = 0
@@ -678,6 +1002,30 @@ class PrefixCacheTracker:
     def churn_depth_samples(self) -> list[float]:
         """Recent structural-churn depth fractions (0 = head, 1 = tail)."""
         return list(self._churn_depth_fractions)
+
+    @property
+    def placed_anchor_depths(self) -> list[int]:
+        """Absolute message indices carrying a live 1h anchor from last turn."""
+        return list(self._placed_anchor_depths)
+
+    def record_placed_anchors(self, depths: list[int]) -> None:
+        """Remember where 1h anchors were actually attached this turn.
+
+        The caller passes the indices it attached, not the ones it asked for.
+        Attachment scans backwards for a usable message, so the two differ, and
+        recording the request instead of the result would make next turn read a
+        move where none happened.
+        """
+        self._placed_anchor_depths = sorted({int(d) for d in depths if int(d) > 0})
+
+    def forget_placed_anchors(self) -> None:
+        """Drop anchor memory when the prefix those anchors sat on is gone.
+
+        After a rebase or a full bust the old indices name bytes that are no
+        longer in the cache, so keeping them would price a move against an
+        entry that cannot be read back anyway.
+        """
+        self._placed_anchor_depths = []
 
     def survival_p_alive(
         self, ttl_seconds: float, linear_fallback: float
@@ -728,6 +1076,29 @@ class PrefixCacheTracker:
         forecast = p / (1.0 - p)
         weight = n / (n + 4.0)
         return max(weight * forecast + (1.0 - weight) * max(fallback, 0.0), 0.0)
+
+    def expected_session_reads(self, ttl_seconds: float, fallback: float) -> float:
+        """Forecast reads for an edit whose saving outlives the current cache run.
+
+        :meth:`expected_reads_within_ttl` answers "how many turns until this
+        cache lapses", which is the right horizon for a mutation whose value
+        dies with the cache. Masking is not such a mutation. Once a result is
+        masked it stays masked for the rest of the session, so it keeps paying
+        on every later turn, and on the turn after a lapse it saves a 1.25x
+        rewrite rather than a 0.1x read. Pricing it over a single TTL run caps
+        R at 19 and declines batches that pay back several times over.
+
+        Remaining turns are estimated Lindy style, a session that has run n
+        turns is expected to run about n more, bounded by
+        ``_SESSION_READ_HORIZON_CAP``. The within-TTL forecast is the floor, so
+        this is never more optimistic than refusing to look past the cache and
+        never more conservative than the estimate it replaces.
+        """
+        run = self.expected_reads_within_ttl(ttl_seconds, fallback)
+        turns = self.turn_number()
+        if turns < _SESSION_READ_MIN_TURNS:
+            return run
+        return max(run, min(float(turns), _SESSION_READ_HORIZON_CAP))
 
     @property
     def compress_latched(self) -> bool:
@@ -840,6 +1211,7 @@ class PrefixCacheTracker:
         messages: list[dict[str, Any]],
         message_token_counts: list[int] | None = None,
         original_messages: list[dict[str, Any]] | None = None,
+        sent_message_count: int | None = None,
     ) -> None:
         """Update tracker with cache metrics from the API response.
 
@@ -857,6 +1229,27 @@ class PrefixCacheTracker:
         self._turn_number += 1
         self._last_original_messages = copy.deepcopy(original_messages or messages)
         self._last_forwarded_messages = copy.deepcopy(messages)
+        # Callers pass the projected next-turn state: what we forwarded, plus the
+        # assistant reply reconstructed from the response. That projection is
+        # right for freezing, but it is not a record of bytes any provider
+        # hashed. The reconstruction never byte-matches the client's own echo of
+        # the same reply, so anything comparing against it has to stop at the
+        # boundary between what was sent and what was projected.
+        self._last_sent_message_count = (
+            len(messages) if sent_message_count is None else max(0, sent_message_count)
+        )
+
+        # Steady-state write rate feeds the TTL break-even in recommended_ttl.
+        # Only cheap incremental writes belong in it: a full re-write is the
+        # cost being avoided, so folding it in would inflate the rate and argue
+        # against the very tier that prevents it.
+        if 0 < cache_write_tokens <= _STEADY_WRITE_CEILING and cache_read_tokens > 0:
+            if self._steady_write_tokens is None:
+                self._steady_write_tokens = float(cache_write_tokens)
+            else:
+                self._steady_write_tokens = (
+                    0.7 * self._steady_write_tokens + 0.3 * cache_write_tokens
+                )
 
         # Compute total cached tokens (read + write = what's in cache now)
         total_cached = cache_read_tokens + cache_write_tokens
@@ -1009,6 +1402,92 @@ class PrefixCacheTracker:
         if len(current_forwarded_messages) < len(prev):
             return False
         return current_forwarded_messages[: len(prev)] == prev
+
+    def forwarded_prefix_will_change(
+        self, current_forwarded_messages: list[dict[str, Any]] | None
+    ) -> bool:
+        """Whether this turn's body already invalidates the provider's cached prefix.
+
+        For the gates that price a rewrite before the request goes out. On a
+        turn that is busting anyway, a structural mutation is free, so this
+        decides whether they get that discount.
+
+        Two things this deliberately is not. It is not
+        ``body_mutation_tracker.mutated``: that flag says a transform touched
+        the body, which only turns off byte-faithful forwarding, and a
+        re-serialized body with an unchanged lead still hits the cache. And it
+        is not ``_forwarded_prefix_stable``, which compares the whole previous
+        forwarded list. Last turn's uncached tail is this turn's mid-prefix, and
+        recompressing it fails that compare while the region the provider
+        actually cached is untouched. Measured 2026-07-25: that comparison
+        reported a bust on every turn of a lineage billing 97 to 100% cache
+        hits.
+
+        What the provider cached is ``_cached_message_count`` messages, sized
+        from the read it billed us, and the comparable region stops where the
+        recorded list stops being a record of what we sent.
+
+        Depth is the last thing that matters, and the reason this returns a
+        judgement rather than a raw comparison. A prefix match is a longest
+        common prefix, not all or nothing. Recompressing the final cached
+        message rewrites twelve characters and leaves the other 99% of the
+        prefix readable, which is nothing like the rewrite a caller gets a
+        discount for. Measured 2026-07-25: divergence sat at message 76 of 77
+        on turn after turn while the same lineage billed near-total hits. So a
+        rewrite counts as already paid only once most of the cached prefix is
+        going down with it.
+        """
+        if not isinstance(current_forwarded_messages, list):
+            return False
+        cached_count = min(
+            self._cached_message_count,
+            self._last_sent_message_count or self._cached_message_count,
+        )
+        if cached_count <= 0:
+            # Nothing cached yet, so there is no prefix to invalidate. A cold
+            # lineage pays its first write regardless of what we do here.
+            return False
+        prev = self._last_forwarded_messages
+        if len(current_forwarded_messages) < cached_count:
+            # This turn sends fewer messages than were cached, so history was
+            # rewritten from underneath us. Compaction looks exactly like this.
+            logger.info(
+                "PREFIX_DIVERGE truncated: cached=%d now=%d",
+                cached_count,
+                len(current_forwarded_messages),
+            )
+            return True
+        if len(prev) < cached_count:
+            # No record to compare against, which is not evidence of a bust.
+            # Callers get no discount rather than a guessed one.
+            return False
+        # The breakpoint slides forward every turn, so the same cached message
+        # carries cache_control on one turn and not the next. That is a
+        # directive about where to place a marker, not content, and comparing it
+        # reports a bust on a prefix the provider is still reading happily.
+        now = _strip_cache_control(current_forwarded_messages[:cached_count])
+        was = _strip_cache_control(prev[:cached_count])
+        if now == was:
+            return False
+        diverge_at = next(
+            (i for i, (a, b) in enumerate(zip(now, was, strict=False)) if a != b),
+            len(now),
+        )
+        counts = self._estimate_message_tokens(was)
+        cached_tokens = sum(counts) or 1
+        surviving = sum(counts[:diverge_at]) / cached_tokens
+        already_busting = surviving <= ALREADY_BUSTING_SURVIVING_FRACTION
+        # A bust report with no depth is not actionable, and this only fires on
+        # turns whose prefix moved at all, so it stays at INFO. If it ever
+        # becomes chatty that is itself the finding.
+        logger.info(
+            "PREFIX_DIVERGE at %d/%d surviving=%.3f busting=%s",
+            diverge_at,
+            cached_count,
+            surviving,
+            already_busting,
+        )
+        return already_busting
 
     def record_bust_avoided(self, tokens_preserved: int, compression_foregone: int) -> None:
         """Record when we chose to preserve cache over compressing."""
@@ -1200,6 +1679,67 @@ class SessionTrackerStore:
         self._trackers[session_id] = tracker
         return tracker
 
+    def _rematch_partial_lineage(
+        self,
+        family: dict[str, list[str]],
+        snap: list[str],
+    ) -> str | None:
+        """Deepest chain that agrees with `snap` for most of its length.
+
+        Returns None when no chain agrees closely enough, which keeps the
+        caller on its existing new-lineage path.
+
+        Both guards matter, and they catch different things. Two sibling
+        requests under one session id share a short head and then diverge for
+        good, and merging those is the cross-contamination this store exists to
+        prevent. They overlap by one to three messages, so the absolute floor
+        rejects them. Client compaction agrees on almost nothing relative to the
+        chain it replaces, so the fraction rejects that. A client that edits one
+        old message clears both.
+        """
+        floor = self._default_config.lineage_rematch_min_messages
+        if floor <= 0:
+            return None
+        threshold = self._default_config.lineage_rematch_fraction
+
+        best_key: str | None = None
+        best_common = 0
+        deepest_common = 0
+        deepest_len = 0
+        for key, chain in family.items():
+            if not chain:
+                continue
+            common = 0
+            for recorded, incoming in zip(chain, snap):
+                if recorded != incoming:
+                    break
+                common += 1
+            if common > deepest_common:
+                deepest_common, deepest_len = common, len(chain)
+            if common <= best_common or common < floor:
+                continue
+            if common < threshold * len(chain):
+                continue
+            best_key, best_common = key, common
+
+        if best_key is None and deepest_len:
+            # A rejection here discards the whole recorded prefix, so record how
+            # close it came. An early divergence means the provider cache was
+            # dead regardless and starting fresh costs nothing. A late one means
+            # a guard threw away bytes that were still worth replaying, which is
+            # the case worth retuning for.
+            logger.info(
+                "LINEAGE_REJECT: deepest_common=%d chain_len=%d incoming=%d "
+                "fraction=%.3f floor=%d threshold=%.2f",
+                deepest_common,
+                deepest_len,
+                len(snap),
+                deepest_common / deepest_len if deepest_len else 0.0,
+                floor,
+                threshold,
+            )
+        return best_key
+
     def resolve_tracker(
         self,
         session_id: str,
@@ -1279,6 +1819,21 @@ class SessionTrackerStore:
                 best_key, best_len = key, len(chain)
 
         if best_key is None:
+            # No chain prefixes the incoming history, but the client may have
+            # edited one old message rather than started a new conversation.
+            # Strict matching treated those alike and discarded the whole
+            # lineage, including the forwarded bytes for every message BEFORE
+            # the edit — the run that overlay_cached_prefix could still have
+            # replayed for free. Fall back to the deepest common prefix and
+            # keep the lineage when it still covers most of the recorded chain.
+            #
+            # Replaying past the edit is not a risk here: overlay_cached_prefix
+            # re-checks every message against the incoming history and stops at
+            # the first divergence, so a partial match can only ever restore the
+            # agreeing head.
+            best_key = self._rematch_partial_lineage(family, snap)
+
+        if best_key is None:
             cap = self._default_config.max_lineages_per_session
             if len(family) >= cap:
                 # Family is full: over-cap conversations share one overflow
@@ -1316,6 +1871,101 @@ class SessionTrackerStore:
         family[best_key] = snap
         return tracker
 
+    _OVERFLOW_SUFFIX = "\x00overflow"
+
+    def export_state(self) -> dict[str, Any]:
+        """Plain-data snapshot of every live tracker, for cross-restart reuse.
+
+        The lineage families are exported verbatim. An earlier version rebuilt
+        them on load from each tracker's ``_last_original_messages``, on the
+        assumption that those are the same messages ``resolve_tracker`` stamps
+        into ``family[key]``. Measured against the live proxy that assumption is
+        wrong: the rebuilt chain never matched, so every restart minted a fresh
+        lineage and rewrote the whole history anyway, which is the exact cost
+        this is meant to remove. ``family[key]`` is the object the prefix
+        comparison actually runs against, so it is the object that gets saved.
+
+        Expired trackers are dropped here rather than on load, so a snapshot
+        never carries state that the in-memory store would already have pruned.
+        """
+        trackers: dict[str, Any] = {}
+        for key, tracker in self._trackers.items():
+            if tracker.is_expired:
+                continue
+            try:
+                trackers[key] = tracker.export_state()
+            except Exception:  # pragma: no cover - defensive, never fail a save
+                logger.debug("SessionTrackerStore: skipping unexportable tracker")
+
+        lineages: dict[str, Any] = {}
+        for session_id, family in self._lineages.items():
+            kept = {key: snap for key, snap in family.items() if key in trackers}
+            if kept:
+                lineages[session_id] = kept
+
+        return {"trackers": trackers, "lineages": lineages}
+
+    def restore_state(self, blob: dict[str, Any]) -> int:
+        """Rebuild trackers and lineage families from :meth:`export_state`.
+
+        Returns the number of trackers restored. Existing in-memory trackers
+        win: this is startup rehydration, not a merge, and a tracker created by
+        live traffic reflects the provider's actual cache state better than a
+        snapshot does.
+        """
+        trackers = blob.get("trackers")
+        if not isinstance(trackers, dict):
+            return 0
+
+        raw_lineages = blob.get("lineages")
+        saved_lineages: dict[str, Any] = (
+            raw_lineages if isinstance(raw_lineages, dict) else {}
+        )
+
+        restored = 0
+        highest_lineage = 0
+        for key, state in trackers.items():
+            if not isinstance(key, str) or not isinstance(state, dict):
+                continue
+            if key in self._trackers:
+                continue
+            try:
+                tracker = PrefixCacheTracker(
+                    str(state.get("provider") or "anthropic"), self._default_config
+                )
+                tracker.restore_state(state)
+                if tracker.is_expired:
+                    # Snapshot sat on disk past the cleanup TTL. Dropping it
+                    # matches _maybe_cleanup, and matters for correctness as
+                    # well as hygiene: a dead lineage must not win a match in
+                    # resolve_tracker.
+                    continue
+                self._trackers[key] = tracker
+                restored += 1
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("SessionTrackerStore: skipping unrestorable tracker")
+                continue
+
+            session_id, _, suffix = key.partition("\x00")
+            if suffix == "overflow":
+                # Over-cap conversations share this tracker without owning a
+                # lineage, so it must not be matched against as one.
+                continue
+            if suffix.isdigit():
+                highest_lineage = max(highest_lineage, int(suffix))
+
+            snap = saved_lineages.get(session_id, {}).get(key)
+            if snap is None:
+                continue
+            family = self._lineages.setdefault(session_id, OrderedDict())
+            family[key] = snap
+
+        if highest_lineage:
+            # Never hand out a synthetic key that a restored tracker already
+            # holds: a collision would silently merge two conversations.
+            self._lineage_counter = itertools.count(highest_lineage + 1)
+        return restored
+
     def peek_idle_seconds(self, session_id: str) -> float | None:
         """Idle gap for an existing session without refreshing activity.
 
@@ -1328,6 +1978,19 @@ class SessionTrackerStore:
         if tracker is None:
             return None
         return tracker.seconds_since_activity()
+
+    def peek_tracker(self, session_id: str) -> PrefixCacheTracker | None:
+        """An existing tracker without creating one or stamping activity.
+
+        Model routing has to price a switch before the request reaches
+        ``resolve_tracker``, because the model chooses the tokenizer that
+        compression runs under. Peeking keeps that early read from creating a
+        tracker for a session the request may never establish, and from
+        moving ``_last_activity`` ahead of the idle-gap read that follows.
+        Returns None for an unknown session, where a cold prefix is the right
+        assumption anyway.
+        """
+        return self._trackers.get(session_id)
 
     def compute_session_id(
         self,

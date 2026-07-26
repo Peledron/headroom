@@ -44,6 +44,13 @@ def _assert_compressed_event_carries_originals(events: list) -> None:
     )
 
 
+# INPUT_ROUTED is conditional by design: every emitter (the two proxy handlers,
+# compress(), and the SDK client) fires it only when summarize_routing_markers
+# returns something, so a request that routed nowhere never reaches that stage.
+# It is checked for position, not for presence.
+_CONDITIONAL_STAGES = frozenset({PipelineStage.INPUT_ROUTED})
+
+
 def _assert_stage_order(stages: list[PipelineStage]) -> None:
     expected = [
         PipelineStage.SETUP,
@@ -57,7 +64,9 @@ def _assert_stage_order(stages: list[PipelineStage]) -> None:
         PipelineStage.POST_SEND,
         PipelineStage.RESPONSE_RECEIVED,
     ]
-    positions = [stages.index(stage) for stage in expected]
+    for stage in expected:
+        assert stage in stages or stage in _CONDITIONAL_STAGES, f"missing stage {stage}"
+    positions = [stages.index(stage) for stage in expected if stage in stages]
     assert positions == sorted(positions)
 
 

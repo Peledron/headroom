@@ -151,6 +151,110 @@ def optimal_anchor_depths(
     return sorted(chosen)
 
 
+EXPECTED_REMAINING_BUSTS = 4.0
+"""How many future busts a re-placed anchor is assumed to still serve.
+
+A move pays its rewrite once and collects its loss improvement once per later
+bust, so the two are only comparable across a horizon. Four is the conservative
+end of the observed per-session bust count: overstating it would let a marginal
+gain buy a certain rewrite, which is the failure this gate exists to stop.
+"""
+
+
+def _anchor_below(position: float, anchors: list[int]) -> float:
+    """Deepest anchor at or above ``position``, or the head at 0."""
+    best = 0.0
+    for anchor in anchors:
+        if anchor <= position and anchor > best:
+            best = float(anchor)
+    return best
+
+
+def _mean_rewrite_depth(anchors: list[int], samples: list[float]) -> float:
+    """Average messages re-written per bust under this anchor set."""
+    if not samples:
+        return 0.0
+    return sum(c - _anchor_below(c, anchors) for c in samples) / len(samples)
+
+
+def _move_write_cost(old: int, new: int) -> int:
+    """Messages re-written at the 1h premium by relocating a live anchor.
+
+    Asymmetric on purpose. Moving forward keeps the old entry as a matching
+    prefix, so only the gap between the two positions is new. Moving backward
+    lands on a boundary no cached entry ends at, so the whole prefix below the
+    new position is written again. That asymmetry is why an anchor that walks
+    back and forth across a grid boundary is so expensive: the return leg pays
+    for everything, not just the distance travelled.
+    """
+    return new - old if new > old else new
+
+
+def stabilize_anchor_depths(
+    previous_depths: list[int],
+    proposed_depths: list[int],
+    n_messages: int,
+    churn_fractions: list[float],
+    k_anchors: int,
+) -> list[int]:
+    """Hold live anchors in place unless moving them is priced worth it.
+
+    :func:`optimal_anchor_depths` re-solves from scratch every turn against two
+    inputs that both move: churn fractions are rescaled by the current message
+    count, and the sample ring itself turns over. The argmin therefore walks
+    even when nothing about the conversation changed, and the QUANTUM grid only
+    defers the walk until the drift crosses a boundary, at which point the
+    anchor jumps a full quantum. Measured over 825 steady-state turns of
+    production traffic, that produced 75 anchor moves and 1.59M tokens of 1h
+    cache write, 37 forward and 38 backward, in oscillations of 62 to 65
+    messages. An anchor exists to be a stable prefix, so re-placing it must
+    clear the rewrite it forces, not merely improve an expectation.
+
+    Previous anchors that are still anchorable are kept. Spare budget goes to
+    proposed positions that are not already covered. A previous anchor is only
+    displaced when the loss it would shed, over
+    :data:`EXPECTED_REMAINING_BUSTS`, beats what the move re-writes.
+    """
+    if k_anchors <= 0:
+        return []
+    ceiling = n_messages - TAIL_GUARD
+    live = sorted({d for d in previous_depths if MIN_DEPTH <= d <= ceiling})
+    proposed = sorted({d for d in proposed_depths if MIN_DEPTH <= d <= ceiling})
+    if not live:
+        return proposed[:k_anchors]
+
+    samples = sorted(min(max(f, 0.0), 1.0) * n_messages for f in churn_fractions)
+    kept = live[:k_anchors]
+    # Spend leftover budget first. Adding an anchor never displaces a cached
+    # prefix, so it needs no price gate beyond not duplicating one we hold.
+    for depth in proposed:
+        if len(kept) >= k_anchors:
+            break
+        if all(abs(depth - held) >= QUANTUM for held in kept):
+            kept.append(depth)
+    kept.sort()
+    if not samples:
+        return kept
+
+    # With the budget full, a proposed position can only enter by evicting a
+    # live one. Every swap is priced against the same baseline and at most one
+    # is applied: two moves in a turn would each pay a rewrite while only the
+    # combined placement was ever costed, which is how an oscillation starts.
+    baseline_loss = _mean_rewrite_depth(kept, samples)
+    best: list[int] | None = None
+    best_loss = baseline_loss
+    for depth in proposed:
+        if depth in kept:
+            continue
+        for held in kept:
+            candidate = sorted([d for d in kept if d != held] + [depth])
+            loss = _mean_rewrite_depth(candidate, samples)
+            gain = (baseline_loss - loss) * EXPECTED_REMAINING_BUSTS
+            if gain > _move_write_cost(held, depth) and loss < best_loss:
+                best, best_loss = candidate, loss
+    return best if best is not None else kept
+
+
 _KEEP_WARM_PRICE_PER_TOKEN_TURN = 0.1
 """Price of keeping one history token warm for one expected future turn,
 relative to the write premium below."""
