@@ -87,11 +87,40 @@ UNKNOWN_TURN_SCORE = 0.5
 QUICK_QUESTION_CHARS = 200
 
 _CODE_FENCE = re.compile(r"```|^\s*diff --git|^\s*@@ ", re.MULTILINE)
-_HARD_WORDS = re.compile(
-    r"\b(why|design|architect|refactor|debug|race|deadlock|prove|derive|"
-    r"trade-?off|root cause|explain)\b",
+
+# Every word below is kept because it measured, not because it sounds hard.
+# See docs/difficulty-gate-population-2026-07-26.md. An earlier list held
+# twelve hand-picked words, of which ten did not predict effort in 2713 real
+# turns and four predicted the opposite: "architect", "race", "trade-off" and
+# "explain" all fired on turns that finished in a quarter of the median work.
+# These two carry a 3.00x lift on follow-on assistant turns.
+_HARD_WORDS = re.compile(r"\b(deadlock|prove|proving)\b", re.IGNORECASE)
+
+# Language that sets up an unattended run. 1.38x lift, so a small weight: it
+# says the turn is opening a stretch of work, not that the work is subtle.
+_RUN_CONTROL = re.compile(
+    r"\b(untill|until|acknowledge|breakers?|recovery|reaches|"
+    r"exit condition|stopping condition)\b",
     re.IGNORECASE,
 )
+
+# Assent that opens work: "yes do that", "good, now merge it". 2.12x lift
+# overall and the strongest signal measured, but the reason it matters is the
+# tail rather than the median. These are the turns that ran 76 to 158 further
+# assistant turns and a fifth of a million output tokens, and they look easy
+# by every other signal here: short, no code, phrased as a question.
+#
+# Deliberately excludes "continue", "proceed" and the other resumption words.
+# Those are confounded with context size rather than difficulty. Stratified by
+# prefix size they run a median of 1 follow-on turn under 50k, the cheapest
+# turn shape in the corpus, and only climb past 50k where ``large_context``
+# already accounts for them. Scoring them here would count that twice.
+_STEERING_ASSENT = re.compile(
+    r"^\W*(yes|yeah|yep|no|nope|ok|okay|well|good|sure|right|correct|"
+    r"exactly|indeed)\b",
+    re.IGNORECASE,
+)
+
 # What a quick question looks like: a short ask that wants a fact back. The
 # question mark is the strongest single signal, the openers cover the ones
 # phrased as requests ("tell me what X does").
@@ -173,8 +202,13 @@ def estimate_difficulty(
 
     Every signal here is something the proxy already has in hand, so the
     estimate costs no model call and cannot itself become the expensive part
-    of the request. The weights are a starting point, not a measurement, and
-    the threshold is what an operator should tune rather than these.
+    of the request. The text signals were rebuilt on 2026-07-26 against 2713
+    real turns, ranking candidate vocabulary by the assistant work that
+    actually followed it, so each weight below is ordered by a measured lift
+    rather than by how hard the word sounds. Two-thirds of the vocabulary
+    that cleared the bar on one half of the corpus failed to replicate on the
+    other half, which is the reason the surviving lists are short. Prefer
+    tuning the threshold over adding words back.
 
     The scoring is asymmetric on purpose. A turn is hard until something says
     otherwise, and only one thing says otherwise: a fresh, short, plainly
@@ -211,6 +245,19 @@ def estimate_difficulty(
         score += 0.4
         signals.append("hard_words")
 
+    # Assent that opens work. Same weight as pasted code, for the same reason:
+    # it has to disqualify on its own, because nothing else in this function
+    # sees anything unusual about "yes, do that".
+    if _STEERING_ASSENT.match(text.strip()):
+        score += 0.4
+        signals.append("steering_assent")
+
+    # Opening an unattended stretch. Small weight, so it tips a turn that is
+    # already borderline rather than deciding one by itself.
+    if _RUN_CONTROL.search(text):
+        score += 0.15
+        signals.append("run_control")
+
     # Long asks carry more constraints to satisfy at once. The cut points are
     # coarse on purpose, a smooth curve here would imply a precision the
     # signal does not have.
@@ -227,13 +274,24 @@ def estimate_difficulty(
 
     # The one way down. Everything it requires is a way of saying the turn is
     # a question rather than a piece of work: asked now, asked briefly, no
-    # code in it, nothing that wants reasoning about a system.
+    # code in it, nothing that wants reasoning about a system, and not an
+    # instruction wearing a question mark.
+    #
+    # The last two exclusions are what stop the discount landing on the worst
+    # possible turns. Measured over the local corpus they drop 35 asks out of
+    # 401, and those 35 have a p99 of 158 follow-on assistant turns against
+    # 116 for the population they were removed from. The additive weights
+    # above would disqualify them anyway. Restating the exclusions here keeps
+    # the reported signals honest, so no routing log claims a steering message
+    # was a quick question.
     if (
         not is_tool_continuation
         and text.strip()
         and len(text) <= QUICK_QUESTION_CHARS
         and not _CODE_FENCE.search(text)
         and not _HARD_WORDS.search(text)
+        and not _STEERING_ASSENT.match(text.strip())
+        and not _RUN_CONTROL.search(text)
         and _QUICK_QUESTION.search(text.strip())
     ):
         score -= 0.35

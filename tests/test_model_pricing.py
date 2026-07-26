@@ -68,12 +68,62 @@ class TestDifficultyEstimate:
         assert not estimate.is_easy()
         assert "quick_question" not in estimate.signals
 
-    def test_a_design_question_is_not_easy(self):
+    def test_a_measured_hard_word_is_not_easy(self):
+        estimate = estimate_difficulty(latest_user_text="can you prove that holds?")
+        assert not estimate.is_easy()
+        assert "hard_words" in estimate.signals
+
+    def test_sounding_hard_is_not_scoring_hard(self):
+        """The dropped words measured at or below the corpus median.
+
+        "why", "architect", "refactor", "explain" and the rest were picked by
+        hand and never earned the weight. They stay unscored until something
+        says otherwise, which leaves the turn at the unknown-work base rather
+        than at a difficulty nobody measured.
+        """
         estimate = estimate_difficulty(
             latest_user_text="why did you choose this architecture over the other one"
         )
+        assert "hard_words" not in estimate.signals
         assert not estimate.is_easy()
-        assert "hard_words" in estimate.signals
+
+    def test_assent_that_opens_work_is_not_easy(self):
+        """The turn shape that cost the most and looked the cheapest.
+
+        Short, no code, ends in a question mark. Every signal but this one
+        reads it as a quick question, and in the corpus these ran a p99 of 158
+        further assistant turns.
+        """
+        estimate = estimate_difficulty(
+            latest_user_text="yes repo health, then what did the speculation say?"
+        )
+        assert not estimate.is_easy()
+        assert "steering_assent" in estimate.signals
+        assert "quick_question" not in estimate.signals
+
+    def test_resumption_is_not_scored_as_difficulty(self):
+        """"continue" is confounded with context size, not hard on its own.
+
+        Stratified by prefix size it runs a median of one follow-on turn under
+        50k, the cheapest shape measured. Past 50k it does get expensive, and
+        ``large_context`` is what charges for that. Scoring the word here too
+        would count the same evidence twice.
+        """
+        estimate = estimate_difficulty(latest_user_text="continue")
+        assert "steering_assent" not in estimate.signals
+
+        small = estimate_difficulty(latest_user_text="continue", input_tokens=10_000)
+        large = estimate_difficulty(latest_user_text="continue", input_tokens=150_000)
+        assert small.score < large.score
+        assert "large_context" in large.signals
+
+    def test_run_control_tips_rather_than_decides(self):
+        """1.38x lift buys a weight that cannot disqualify a turn alone."""
+        estimate = estimate_difficulty(latest_user_text="run it untill it converges")
+        assert "run_control" in estimate.signals
+        assert estimate.score < estimate_difficulty(
+            latest_user_text="prove it converges"
+        ).score
 
     def test_pasted_code_is_not_easy(self):
         estimate = estimate_difficulty(latest_user_text="fix this\n```py\nx=1\n```")
@@ -117,7 +167,7 @@ class TestDifficultyEstimate:
 
     def test_signals_name_what_moved_the_score(self):
         estimate = estimate_difficulty(
-            latest_user_text="why is this slow", tool_count=3, input_tokens=150_000
+            latest_user_text="prove this is slow", tool_count=3, input_tokens=150_000
         )
         assert set(estimate.signals) == {
             "tools_available",
@@ -305,12 +355,19 @@ def test_only_a_quick_question_clears_the_default_threshold():
         "what is the default port?",
         "list the open ports",
         "is the proxy running?",
+        # "why" was refused here until the words were measured. It carries a
+        # 0.88x lift on follow-on work, meaning a short "why" question is
+        # ordinary, so refusing it was the hand-picked list talking.
+        "why is the cache ratio bad?",
     ]
     refused = [
         "",
         "run the test suite and fix what breaks",
-        "why is the cache ratio bad?",
         "what does this do?\n```py\nx=1\n```",
+        # Reads as a quick question on every other signal, and is the single
+        # most expensive turn shape in the measured corpus.
+        "yes, and what did the speculation say?",
+        "good, is that merged now?",
     ]
     for text in admitted:
         assert estimate_difficulty(latest_user_text=text).score <= DEFAULT_EASY_THRESHOLD, text
