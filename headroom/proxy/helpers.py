@@ -2382,7 +2382,15 @@ def inject_tool_search_deferral(
             dropped_cache_control = True
             # Keep the marker itself, not just the fact of it: re-placing a bare
             # ephemeral would downgrade a 1h breakpoint to the 5m default.
-            if isinstance(_dropped, dict):
+            # Last-write-wins defeats that: a bare (5m) marker stripped from a
+            # LATER deferred tool overwrites the 1h one, so the tools prefix goes
+            # upstream at 5m while the client's message breakpoints stay 1h, and
+            # Anthropic rejects that ordering with 400 invalid_request_error.
+            # Keep the longest TTL we stripped.
+            if isinstance(_dropped, dict) and (
+                dropped_marker is None
+                or (_dropped.get("ttl") == "1h" and dropped_marker.get("ttl") != "1h")
+            ):
                 dropped_marker = _dropped
         out.append(new_tool)
         deferred += 1
