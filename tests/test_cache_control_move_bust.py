@@ -282,3 +282,142 @@ def test_pure_append_over_20_blocks_keeps_newest_breakpoint():
         )
         assert _markers(out) == 1
         assert _strip_cache_control(out) == _strip_cache_control(msgs)
+# ── fix-4: a message that grows IN PLACE needs the breakpoint off its newest ──
+# block. Sub-call shapes pack a transcript into one block-style message and
+# rewrite its tail each turn, so the newest block never repeats and the whole
+# message re-writes forever (cache_read pinned at the system+tools constant).
+# These tests drive the REAL path — resolve_tracker -> normalize -> record — so
+# they fail if the previous turn's state never reaches the placement decision,
+# which is how the first attempt at this fix passed while doing nothing.
+
+from headroom.cache.prefix_tracker import SessionTrackerStore  # noqa: E402
+
+LOOKBACK = 20  # provider walks back this many block boundaries from a breakpoint
+
+
+def _blocks(*texts):
+    return [{"type": "text", "text": t} for t in texts]
+
+
+def _grown(stable: int, churn: int, tail: str, suffix: str = "end-of-transcript"):
+    """One block-style message shaped like the captured production sub-call:
+    `stable` unchanging blocks, a churning middle, and a fixed instruction
+    pinned at the very end (the real shape's final blocks are byte-identical
+    turn over turn while the blocks before them are rewritten).
+    """
+    return {
+        "role": "user",
+        "content": _blocks(
+            *[f"stable-{i}" for i in range(stable)],
+            *[f"{tail}-churn-{i}" for i in range(churn)],
+            suffix,
+        ),
+    }
+
+
+def _bp_index(messages):
+    """Index of the breakpoint inside the last block-style message."""
+    for msg in reversed(messages):
+        content = msg.get("content")
+        if isinstance(content, list):
+            return next(
+                (i for i, b in enumerate(content) if isinstance(b, dict) and "cache_control" in b),
+                -1,
+            )
+    return -1
+
+
+def _drive_turns(shapes, provider="anthropic", session="sub-call"):
+    """Replay `shapes` through the live path; return [(forwarded, breakpoint)]."""
+    store = SessionTrackerStore(PrefixFreezeConfig())
+    out = []
+    for client in shapes:
+        tracker = store.resolve_tracker(session, provider, messages=client)
+        forwarded = normalize_message_cache_control(client, tracker.get_last_forwarded_messages())
+        out.append((forwarded, _bp_index(forwarded)))
+        tracker.update_from_response(
+            cache_read_tokens=1000,
+            cache_write_tokens=1000,
+            messages=forwarded,
+            original_messages=client,
+        )
+    return out
+
+
+def test_breakpoint_anchors_to_static_prefix_when_message_grows_in_place():
+    """The production shape: 40 stable blocks + a tail rewritten every turn."""
+    shapes = [
+        [B("user", "kickoff"), _grown(40, churn, f"t{turn}")]
+        for turn, churn in enumerate([3, 5, 8], start=1)
+    ]
+    turns = _drive_turns(shapes)
+
+    assert turns[0][1] == 43, "cold turn has nothing to compare — newest block"
+    for forwarded, bp in turns[1:]:
+        blocks = forwarded[-1]["content"]
+        assert bp == 39, f"breakpoint must sit at the end of the static prefix, got {bp}"
+        assert bp < len(blocks) - 1, "must NOT ride the varying tail"
+        assert _markers(forwarded) == 1
+
+
+def test_relocated_breakpoint_stays_within_provider_lookback():
+    """Chaining property: each turn's breakpoint must be reachable from the
+    region the previous turn wrote, or the relocation only helps once."""
+    shapes = [[B("user", "kickoff"), _grown(30 + turn, 4, f"t{turn}")] for turn in range(1, 6)]
+    turns = _drive_turns(shapes)
+    previous_bp = turns[0][1]
+    for _, bp in turns[1:]:
+        assert bp - previous_bp <= LOOKBACK, f"breakpoint jumped {bp - previous_bp} blocks"
+        previous_bp = bp
+
+
+def test_breakpoint_stays_newest_when_conversation_appends_messages():
+    """A main conversation grows by appending MESSAGES; its newest message is
+    genuinely new, so the newest-block placement (which the provider's lookback
+    reaches) must be left alone."""
+    conv = []
+    shapes = []
+    for turn in range(1, 6):
+        conv = [*conv, B("user", f"turn-{turn}"), B("assistant", f"reply-{turn}")]
+        shapes.append(list(conv))
+    for forwarded, bp in _drive_turns(shapes):
+        assert bp == len(forwarded[-1]["content"]) - 1, "main conversation must keep newest block"
+
+
+def test_breakpoint_stays_newest_for_short_messages():
+    """Under the lookback window there is nothing to gain and cache to lose."""
+    shapes = [
+        [B("user", "kickoff"), _grown(4, churn, f"t{turn}")]
+        for turn, churn in enumerate([1, 2, 3], start=1)
+    ]
+    for forwarded, bp in _drive_turns(shapes):
+        assert bp == len(forwarded[-1]["content"]) - 1
+
+
+def test_breakpoint_stays_newest_when_most_of_the_message_changed():
+    """A short stable run would cache less than the newest-block placement
+    writes — relocating there reads a little and forfeits a lot."""
+    shapes = [[B("user", "kickoff"), _grown(5, 30, f"t{turn}")] for turn in range(1, 4)]
+    for forwarded, bp in _drive_turns(shapes):
+        assert bp == len(forwarded[-1]["content"]) - 1
+
+
+def test_kill_switch_restores_newest_block(monkeypatch):
+    monkeypatch.setenv("HEADROOM_STABLE_BOUNDARY_BREAKPOINT", "0")
+    shapes = [
+        [B("user", "kickoff"), _grown(40, churn, f"t{turn}")]
+        for turn, churn in enumerate([3, 5, 8], start=1)
+    ]
+    for forwarded, bp in _drive_turns(shapes):
+        assert bp == len(forwarded[-1]["content"]) - 1
+
+
+def test_relocation_never_adds_a_second_marker_or_edits_content():
+    shapes = [
+        [B("user", "kickoff"), _grown(40, churn, f"t{turn}")]
+        for turn, churn in enumerate([3, 5], start=1)
+    ]
+    turns = _drive_turns([list(s) for s in shapes])
+    for client, (forwarded, _) in zip(shapes, turns, strict=True):
+        assert _markers(forwarded) == 1  # bounded regardless of where it moved
+        assert _strip_cache_control(forwarded) == _strip_cache_control(client)

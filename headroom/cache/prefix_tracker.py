@@ -22,6 +22,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -644,8 +645,154 @@ def latest_message_cache_control_ttl(messages: list[dict[str, Any]]) -> str | No
     return None
 
 
+def _stable_leading_block_run(
+    current_blocks: list[Any],
+    previous_blocks: list[Any] | None,
+) -> int:
+    """Length of the longest leading run of content blocks that canonicalize-equal
+    the previous turn's blocks.
+
+    Uses :func:`_canonicalize_for_prefix_compare`, which drops ``cache_control``
+    and other non-semantic keys, so a moved breakpoint or per-turn annotation
+    churn does not shorten the run. Two blocks canonicalize-equal iff their
+    forwarded content is the same, which is exactly what the provider's prefix
+    cache keys on, so this run is the part of a message that can still be read
+    from cache.
+    """
+    if not previous_blocks:
+        return 0
+    limit = min(len(current_blocks), len(previous_blocks))
+    k = 0
+    while k < limit and _canonicalize_for_prefix_compare(
+        current_blocks[k]
+    ) == _canonicalize_for_prefix_compare(previous_blocks[k]):
+        k += 1
+    return k
+
+
+# A leading run shorter than this is not conversation identity. Injected
+# boilerplate can bracket a message on both sides, so two unrelated sub-calls
+# under one session id can agree on their first few blocks by construction.
+_MIN_CONTINUATION_RUN_BLOCKS = 8
+
+
+def _is_message_continuation(recorded: Any, incoming: Any) -> bool:
+    """Return True iff ``incoming`` is ``recorded`` grown in place.
+
+    Client histories are append-only at MESSAGE granularity, which is what
+    lineage matching assumes, except for sub-call shapes that pack a transcript
+    into one block-style message and extend that message's block list each turn.
+    Such a turn is the same conversation continuing, but its newest message is
+    not equal to the recorded one, so the whole-message prefix test rejects it.
+
+    "Grown in place" is deliberately narrow, because a false match makes two
+    concurrent conversations share one tracker, the thrash lineages exist to
+    prevent. All of the following must hold:
+
+    * same role, block-style content on both sides, and no blocks lost.
+    * a leading run of byte-stable blocks that is both substantial in absolute
+      terms and MOST of the recorded version. A few shared blocks is not a
+      conversation identity.
+    * an unchanged FINAL block. Conversations that pack the same parent
+      transcript differ in the instruction they append after it, so the tail is
+      what distinguishes siblings from a continuation of one stream. The shapes
+      this exists for keep a fixed suffix pinned at the end while the blocks
+      before it churn.
+
+    Anything that fails these keeps its own lineage, which is the pre-existing
+    behaviour and merely forgoes the cache win.
+    """
+    if not (isinstance(recorded, dict) and isinstance(incoming, dict)):
+        return False
+    if recorded.get("role") != incoming.get("role"):
+        return False
+    old = recorded.get("content")
+    new = incoming.get("content")
+    if not (isinstance(old, list) and isinstance(new, list)):
+        return False
+    if not old or len(new) < len(old):
+        return False
+    if old[-1] != new[-1]:
+        return False
+    run = _stable_leading_block_run(new, old)
+    return run >= _MIN_CONTINUATION_RUN_BLOCKS and run * 2 >= len(old)
+
+
+# Env kill switch for the stable-boundary breakpoint placement below. Default on.
+# Set to 0/false/no/off to restore the newest-block placement unconditionally.
+# This sits on the cache-key path of every Anthropic request, so it needs a
+# rollback that does not require shipping a new build.
+_STABLE_BOUNDARY_ENV = "HEADROOM_STABLE_BOUNDARY_BREAKPOINT"
+
+# Below this many blocks a message cannot benefit from relocation: the provider
+# walks back up to 20 content-block boundaries from the breakpoint looking for a
+# previous write, so a short message's prefix is still found from the newest
+# block, and anchoring backwards would only shrink what gets cached.
+_MIN_BLOCKS_FOR_RELOCATION = 20
+
+
+def _stable_boundary_enabled() -> bool:
+    return os.environ.get(_STABLE_BOUNDARY_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _breakpoint_index(
+    content: list[Any],
+    msg: dict[str, Any],
+    msg_idx: int,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> int:
+    """Index within ``content`` that should carry the single message breakpoint.
+
+    Default is the newest block, which is right whenever the provider's 20-block
+    lookback can still reach last turn's write from there, meaning a cold turn or
+    a conversation that grows by appending messages.
+
+    It is wrong for a message that grows IN PLACE with a varying tail: the
+    breakpoint then rides a block that never repeats, so no stable prefix is ever
+    found and the whole message re-writes every turn. For that shape the
+    breakpoint belongs at the end of the static prefix, which is the previous
+    turn's counterpart message compared block by block.
+
+    The counterpart is looked up by position AND role: the recorded forwarded
+    list is last turn's, so a growing conversation only lines up where the shape
+    really is stable, and any mismatch falls back to the newest block.
+    """
+    newest = len(content) - 1
+    if not previous_forwarded_messages or not _stable_boundary_enabled():
+        return newest
+    if len(content) < _MIN_BLOCKS_FOR_RELOCATION or msg_idx >= len(previous_forwarded_messages):
+        return newest
+    counterpart = previous_forwarded_messages[msg_idx]
+    if not isinstance(counterpart, dict) or counterpart.get("role") != msg.get("role"):
+        return newest
+    previous_blocks = counterpart.get("content")
+    if not isinstance(previous_blocks, list):
+        return newest
+    run = _stable_leading_block_run(content, previous_blocks)
+    # Only anchor backwards when the stable run is real (the message diverged
+    # before its end) and covers most of the message. A short run would cache
+    # less than the newest-block placement writes, which is a worse trade even
+    # though it reads.
+    if 1 <= run < len(content) and run * 2 >= len(content):
+        logger.debug(
+            "cache breakpoint anchored to the stable run of %d/%d blocks in message %d "
+            "(its newest block varies turn over turn)",
+            run,
+            len(content),
+            msg_idx,
+        )
+        return run - 1
+    return newest
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]] | None = None,
     *,
     force_ttl: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -658,13 +805,29 @@ def normalize_message_cache_control(
     so on a long conversation the accumulation eventually 400s.
 
     Fix: strip EVERY message-level cache_control and re-place a **single**
-    ephemeral breakpoint on the last block of the last block-style message. One
-    breakpoint caches the whole message prefix up to it, and — because the
-    provider's cache key is message CONTENT, not marker presence (moving the
-    breakpoint forward is the documented client pattern and it hits) — stripping
-    and re-placing markers never busts. system/tools breakpoints live outside
-    ``messages`` and are left untouched (they still count toward the 4 limit, so
-    holding messages to one breakpoint leaves room for them).
+    ephemeral breakpoint. One breakpoint caches the whole message prefix up to
+    it, and because the provider's cache key is message CONTENT, not marker
+    presence (moving the breakpoint forward is the documented client pattern and
+    it hits), stripping and re-placing markers never busts. system/tools
+    breakpoints live outside ``messages`` and are left untouched (they still
+    count toward the 4 limit, so holding messages to one breakpoint leaves room
+    for them).
+
+    WHERE that one breakpoint goes is the last block of the last block-style
+    message, except when that message grew IN PLACE since last turn. Sub-call
+    shapes pack a transcript into one block-style message and rewrite its tail
+    each turn, so a breakpoint on its newest block can never match next turn and
+    pins ``cache_read`` at the system+tools constant forever, however stable the
+    rest of the message is. When ``previous_forwarded_messages`` shows that the
+    same message diverged partway through, the breakpoint is anchored to the end
+    of its byte-stable leading run instead: that boundary IS cached, so the run
+    reads from cache and the breakpoint advances one turn behind the growth.
+
+    Relocation only fires when the stable run covers most of the message
+    (otherwise anchoring backwards would cache less than it saves) and only for
+    the same message position and role, so a main conversation whose newest
+    message is genuinely new each turn keeps the newest-block placement.
+    ``HEADROOM_STABLE_BOUNDARY_BREAKPOINT=0`` restores it unconditionally.
 
     Headroom owns WHERE the breakpoint goes; the client still owns WHAT it says:
     the re-placed marker reuses the newest client marker verbatim, so an explicit
@@ -736,7 +899,8 @@ def normalize_message_cache_control(
         marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
         if force_ttl is not None:
             marker["ttl"] = force_ttl
-        content[-1] = {**content[-1], "cache_control": marker}
+        bp_idx = _breakpoint_index(content, msg, last_block_idx, previous_forwarded_messages)
+        content[bp_idx] = {**content[bp_idx], "cache_control": marker}
         out[last_block_idx] = {**msg, "content": content}
         changed = True
     return out if changed else messages
@@ -1963,6 +2127,31 @@ class SessionTrackerStore:
             # on a long history.
             if _classify_append_only_canonical(snap, chain) is not None:
                 best_key, best_len = key, len(chain)
+
+        if best_key is None:
+            # No chain prefixes the incoming history at MESSAGE granularity, but
+            # a sub-call shape packs its transcript into one block-style message
+            # and rewrites that message's blocks each turn. That is the same
+            # conversation continuing, and the strict test above cannot see it
+            # because the newest message is not equal to the recorded one.
+            #
+            # Narrower than the strict pass, not merely weaker: the message
+            # COUNT must be unchanged, every message before the last must still
+            # match exactly, and only the last may differ, by having grown in
+            # place. A history that both gained a message and rewrote an older
+            # one did not grow in place and starts a fresh lineage. Longest
+            # chain first, so an exact continuation is never displaced.
+            for key, chain in sorted(
+                family.items(), key=lambda kv: len(kv[1]), reverse=True
+            ):
+                if len(chain) != len(snap) or not chain:
+                    continue
+                head = len(chain) - 1
+                if snap[:head] == chain[:head] and _is_message_continuation(
+                    chain[head], snap[head]
+                ):
+                    best_key = key
+                    break
 
         if best_key is None:
             # No chain prefixes the incoming history, but the client may have

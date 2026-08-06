@@ -3467,7 +3467,14 @@ class AnthropicHandlerMixin:
                 _force_ttl = "5m"
             if _force_ttl is None:
                 _force_ttl = _client_message_ttl
-            _norm = normalize_message_cache_control(optimized_messages, force_ttl=_force_ttl)
+            # Pass last turn's forwarded messages so the breakpoint can be anchored
+            # to the static prefix of a message that grows in place, whose newest
+            # block never repeats. Reuses the copy read above for the overlay
+            # replay: both only READ it and each read deep-copies the whole
+            # transcript, so one copy is enough on this per-request hot path.
+            _norm = normalize_message_cache_control(
+                optimized_messages, _prev_fwd_diag, force_ttl=_force_ttl
+            )
             if _norm is not optimized_messages:
                 optimized_messages = _norm
                 if _force_ttl:

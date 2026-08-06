@@ -1119,6 +1119,310 @@ class TestConversationLineageResolution:
         assert id_a == id_b
 
 
+    @staticmethod
+    def _history(name: str, turn: int) -> list[dict]:
+        """Client-shaped request messages for `turn` (1-based): u0,a0,...,u_{turn-1}."""
+        messages: list[dict] = []
+        for t in range(turn):
+            messages.append({"role": "user", "content": f"[{name}] user {t} " + "x" * 200})
+            if t < turn - 1:
+                messages.append(
+                    {"role": "assistant", "content": f"[{name}] assistant {t} " + "y" * 200}
+                )
+        return messages
+
+    @staticmethod
+    def _block_history(turn: int, cc_on: int | None) -> list[dict]:
+        """Block-content history; cache_control breakpoint on message `cc_on` (or none)."""
+        messages: list[dict] = []
+        for t in range(turn):
+            messages.append(
+                {"role": "user", "content": [{"type": "text", "text": f"user {t} " + "x" * 200}]}
+            )
+            if t < turn - 1:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"assistant {t} " + "y" * 200}],
+                    }
+                )
+        if cc_on is not None:
+            msg = messages[cc_on]
+            blocks = [dict(b) for b in msg["content"]]
+            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            messages[cc_on] = {**msg, "content": blocks}
+        return messages
+
+    def test_interleaved_conversations_resolve_to_independent_trackers(self, store):
+        """The #2085 production shape: two conversations, one session id,
+        alternating requests. Each must keep its own tracker and per-turn state
+        (on a shared tracker, _turn_number would count both conversations)."""
+        sid = "shared-fallback-id"
+        trackers: dict[str, PrefixCacheTracker] = {}
+        for turn in range(1, 5):
+            for name in ("A", "B"):
+                history = self._history(name, turn)
+                tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+                trackers.setdefault(name, tracker)
+                assert tracker is trackers[name], f"[{name}] turn {turn} switched trackers"
+                tracker.update_from_response(
+                    cache_read_tokens=1000 * turn,
+                    cache_write_tokens=500,
+                    messages=history,
+                )
+        assert trackers["A"] is not trackers["B"]
+        assert trackers["A"]._turn_number == 4
+        assert trackers["B"]._turn_number == 4
+
+    def test_identical_first_turns_share_until_divergence_then_split(self, store):
+        """Templated fan-outs send byte-identical first turns. While histories
+        are identical, sharing a tracker is harmless (the provider cache line
+        is identical too); they must split as soon as the histories diverge."""
+        sid = "shared"
+        first = [{"role": "user", "content": "verify the fix " + "p" * 300}]
+        t_a1 = store.resolve_tracker(sid, "anthropic", messages=first)
+        t_b1 = store.resolve_tracker(sid, "anthropic", messages=first)
+        assert t_b1 is t_a1
+
+        a2 = first + [
+            {"role": "assistant", "content": "answer A"},
+            {"role": "user", "content": "next A"},
+        ]
+        b2 = first + [
+            {"role": "assistant", "content": "answer B"},
+            {"role": "user", "content": "next B"},
+        ]
+        t_a2 = store.resolve_tracker(sid, "anthropic", messages=a2)
+        t_b2 = store.resolve_tracker(sid, "anthropic", messages=b2)
+        assert t_a2 is not t_b2
+
+        a3 = a2 + [
+            {"role": "assistant", "content": "answer A2"},
+            {"role": "user", "content": "next A2"},
+        ]
+        assert store.resolve_tracker(sid, "anthropic", messages=a3) is t_a2
+
+    @pytest.mark.parametrize(
+        "cc_turn2",
+        [0, -1, None],
+        ids=["breakpoint-stays", "breakpoint-moved-to-last", "breakpoint-removed"],
+    )
+    def test_cache_control_movement_does_not_split_lineage(self, store, cc_turn2):
+        """Clients move the cache_control breakpoint every turn; that must not
+        read as a rewritten history."""
+        sid = "shared"
+        t1 = store.resolve_tracker(sid, "anthropic", messages=self._block_history(1, cc_on=0))
+        t2 = store.resolve_tracker(
+            sid, "anthropic", messages=self._block_history(2, cc_on=cc_turn2)
+        )
+        assert t2 is t1
+
+    @pytest.mark.parametrize(
+        "requote",
+        [
+            lambda m: {**m, "content": [{"type": "text", "text": m["content"]}]},
+            lambda m: {
+                **m,
+                "content": [{"type": "text", "text": m["content"], "index": 0}],
+            },
+            lambda m: {
+                **m,
+                "content": [
+                    {"type": "text", "text": m["content"]},
+                    {"cachePoint": {"type": "default"}},
+                ],
+            },
+        ],
+        ids=["string-to-block-sugar", "streaming-index-annotation", "bedrock-cachepoint-block"],
+    )
+    def test_representation_churn_does_not_split_lineage(self, store, requote):
+        """Clients re-encode history turn-to-turn without changing content
+        (litellm flips string<->block sugar, streaming assembly adds `index`,
+        Bedrock moves its cachePoint block). Lineage matching must use the
+        same canonical equivalence as the cache-stable delta path."""
+        sid = "shared"
+        first = {"role": "user", "content": "hello " + "x" * 200}
+        t1 = store.resolve_tracker(sid, "anthropic", messages=[first])
+        grown = [
+            requote(first),
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "next"},
+        ]
+        assert store.resolve_tracker(sid, "anthropic", messages=grown) is t1
+
+    @pytest.mark.parametrize(
+        "rewrite",
+        [
+            lambda h: [{"role": "user", "content": "[summary of the conversation so far]"}],
+            lambda h: [h[0], {"role": "assistant", "content": "EDITED"}, *h[2:]],
+            lambda h: h[:-2],
+        ],
+        ids=["compacted", "middle-edited", "truncated"],
+    )
+    def test_rewritten_history_gets_fresh_tracker(self, store, rewrite):
+        """A rewritten history (client-side /compact, edits, truncation) means
+        the provider cache line is gone anyway: start a fresh lineage, keep the
+        old tracker until TTL, and never touch the session id."""
+        sid = "shared"
+        history = self._history("A", 3)
+        tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+        fresh = store.resolve_tracker(sid, "anthropic", messages=rewrite(history))
+        assert fresh is not tracker
+        assert store.active_sessions == 2
+
+    @staticmethod
+    def _in_place_growth(
+        stable: int, churn: int, tail: str, suffix: str = "end of transcript"
+    ) -> list[dict]:
+        """The sub-call shape: a transcript packed into ONE block-style message
+        whose leading blocks are stable, whose middle churns, and which keeps a
+        fixed instruction pinned at the very end. This history grows at BLOCK
+        granularity, not message granularity.
+
+        The pinned suffix mirrors the captured production shape, where the final
+        blocks are byte-identical turn over turn while the blocks before them are
+        rewritten. ``suffix`` is what distinguishes sibling conversations that
+        pack the same parent transcript.
+        """
+        blocks = [{"type": "text", "text": f"stable {i} " + "x" * 200} for i in range(stable)]
+        blocks += [{"type": "text", "text": f"{tail} churn {i}"} for i in range(churn)]
+        blocks += [{"type": "text", "text": suffix}]
+        return [{"role": "user", "content": "kickoff"}, {"role": "user", "content": blocks}]
+
+    def test_in_place_message_growth_keeps_its_lineage(self, store):
+        """Lineage matching assumes histories append MESSAGES. A conversation
+        whose newest message grows in place used to fail that test on every turn
+        and get a FRESH tracker each time — no frozen prefix, no overlay replay,
+        and one leaked lineage per turn. It must reuse its own tracker instead."""
+        sid = "sub-call"
+        first = None
+        for turn, churn in enumerate([2, 4, 7, 11], start=1):
+            history = self._in_place_growth(20, churn, f"t{turn}")
+            tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+            first = first or tracker
+            assert tracker is first, f"turn {turn} switched trackers"
+            # The previous turn's state has to actually ARRIVE, not just exist.
+            if turn > 1:
+                assert tracker.get_last_forwarded_messages(), f"turn {turn} lost prev messages"
+            tracker.update_from_response(
+                cache_read_tokens=1000,
+                cache_write_tokens=500,
+                messages=history,
+                original_messages=history,
+            )
+        assert store.active_sessions == 1, "one conversation must not leak lineages"
+        assert first._turn_number == 4
+
+    def test_fan_out_diverging_in_its_newest_message_still_splits(self, store):
+        """Guard on the loosened match: templated fan-outs share the head and
+        differ from the first block of the newest message. They must keep
+        separate trackers (that thrash is what lineages exist to prevent)."""
+        sid = "shared-fallback-id"
+        a = self._in_place_growth(0, 6, "agent-a")
+        b = self._in_place_growth(0, 6, "agent-b")
+        assert store.resolve_tracker(sid, "anthropic", messages=a) is not store.resolve_tracker(
+            sid, "anthropic", messages=b
+        )
+
+    def test_mostly_rewritten_newest_message_gets_a_fresh_tracker(self, store):
+        """Continuation requires MOST of the recorded message to survive. A
+        message rewritten past that point is a new conversation, not growth."""
+        sid = "shared"
+        tracker = store.resolve_tracker(
+            sid, "anthropic", messages=self._in_place_growth(2, 20, "t1")
+        )
+        rewritten = self._in_place_growth(2, 20, "t2")  # only 2 of 22 blocks survive
+        assert store.resolve_tracker(sid, "anthropic", messages=rewritten) is not tracker
+
+    def test_shrinking_newest_message_gets_a_fresh_tracker(self, store):
+        """Growth only. A shorter block list means the client dropped content,
+        so the provider's cache line for it is gone."""
+        sid = "shared"
+        tracker = store.resolve_tracker(
+            sid, "anthropic", messages=self._in_place_growth(20, 8, "t1")
+        )
+        shrunk = self._in_place_growth(20, 2, "t1")
+        assert store.resolve_tracker(sid, "anthropic", messages=shrunk) is not tracker
+
+    def test_shared_preamble_does_not_merge_parallel_subagents(self, store):
+        """Parallel subagents of the same type open with the same injected
+        boilerplate and then diverge. Sharing a preamble is not a conversation
+        identity — they must keep separate trackers, or they thrash one."""
+        sid = "shared-fallback-id"
+        preamble = {"type": "text", "text": "<system-reminder>shared boilerplate</system-reminder>"}
+
+        def spawn(name: str) -> list[dict]:
+            return [
+                {"role": "user", "content": [preamble, {"type": "text", "text": f"task {name}"}]}
+            ]
+
+        a = store.resolve_tracker(sid, "anthropic", messages=spawn("a"))
+        b = store.resolve_tracker(sid, "anthropic", messages=spawn("b"))
+        assert a is not b
+        assert store.active_sessions == 2
+
+    def test_boilerplate_on_both_ends_is_not_enough_to_share_a_lineage(self, store):
+        """Injected boilerplate can bracket a message on BOTH sides — a preamble
+        in front and a reminder pinned at the end. Two conversations then agree
+        on their first blocks and their last block while differing in the only
+        part that is theirs, so a proportional test alone ("most of the recorded
+        blocks survived") would merge them. A few shared blocks is not identity.
+        """
+        sid = "shared-fallback-id"
+        head = [{"type": "text", "text": f"boilerplate {i}"} for i in range(2)]
+        pinned = {"type": "text", "text": "<system-reminder>stay on task</system-reminder>"}
+
+        def spawn(name: str) -> list[dict]:
+            content = [*head, {"type": "text", "text": f"task {name}"}, pinned]
+            return [{"role": "user", "content": content}]
+
+        a = store.resolve_tracker(sid, "anthropic", messages=spawn("a"))
+        b = store.resolve_tracker(sid, "anthropic", messages=spawn("b"))
+        assert a is not b
+        assert store.active_sessions == 2
+
+    def test_sibling_sub_calls_over_one_transcript_do_not_ping_pong(self, store):
+        """Two sub-call streams can pack the SAME parent transcript and differ
+        only in the instruction appended after it. Their leading blocks match
+        almost entirely, so without a tail check they would trade one tracker
+        back and forth on every turn — forever, since neither ever gains a
+        message to tell them apart."""
+        sid = "shared-fallback-id"
+        seen: dict[str, PrefixCacheTracker] = {}
+        for turn, churn in enumerate([2, 4, 7], start=1):
+            for stream in ("summarize", "title"):
+                history = self._in_place_growth(
+                    30, churn, f"t{turn}", suffix=f"instruction: {stream}"
+                )
+                tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+                seen.setdefault(stream, tracker)
+                assert tracker is seen[stream], f"[{stream}] turn {turn} switched trackers"
+                tracker.update_from_response(
+                    cache_read_tokens=1000,
+                    cache_write_tokens=500,
+                    messages=history,
+                    original_messages=history,
+                )
+        assert seen["summarize"] is not seen["title"]
+
+    def test_added_message_plus_rewritten_older_one_is_not_in_place_growth(self, store):
+        """Growing in place means the message COUNT held still. A history that
+        gained a message AND rewrote an earlier one was rewritten, not grown."""
+        sid = "shared"
+        base = self._in_place_growth(30, 4, "t1")
+        tracker = store.resolve_tracker(sid, "anthropic", messages=base)
+        grown_and_rewritten = [*self._in_place_growth(30, 9, "t2"), {"role": "assistant", "c": 1}]
+        assert store.resolve_tracker(sid, "anthropic", messages=grown_and_rewritten) is not tracker
+
+    def test_strict_prefix_match_wins_over_in_place_growth(self, store):
+        """An exact continuation must never be displaced by a looser one."""
+        sid = "shared"
+        base = self._in_place_growth(20, 4, "t1")
+        exact = store.resolve_tracker(sid, "anthropic", messages=base)
+        # A second lineage that would ALSO match `base` under in-place growth.
+        store.resolve_tracker(sid, "anthropic", messages=self._in_place_growth(20, 2, "t1"))
+        assert store.resolve_tracker(sid, "anthropic", messages=base) is exact
+
 class TestMultiTurnScenario:
     """Integration-style tests simulating multi-turn conversations."""
 
