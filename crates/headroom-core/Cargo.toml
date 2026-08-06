@@ -175,6 +175,12 @@ fastembed = { version = "5", default-features = false, optional = true, features
 # `ort::value::Tensor`). Keep this pinned to the lock entry and optional so
 # `default-features = false` consumers can still build without ONNX Runtime.
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
+# Used by the magika detector to read the ONNX Runtime version out of the dylib
+# before handing it to `ort`. Upstream has no such gate and so does not carry
+# this dependency, but `ml` here lists `dep:libloading`, and the merge that took
+# upstream's dependency block dropped the declaration while leaving the feature
+# referencing it, which fails `cargo metadata` outright.
+libloading = { version = "0.8", optional = true }
 
 [features]
 # `ml` is ON by default, so a stock build is byte-for-byte what it was before:
