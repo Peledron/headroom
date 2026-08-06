@@ -6,6 +6,7 @@ import json
 
 from headroom.proxy.cache_reconciliation import (
     CacheReconciliationLog,
+    head_fingerprints,
     is_unplanned_bust,
 )
 
@@ -339,3 +340,101 @@ class TestMaxCacheTtlSeconds:
                  "cache_control": {"type": "ephemeral", "ttl": "5m"}}]}],
         }
         assert message_segment_ttl_seconds(body) == 300.0
+
+
+class TestHeadFingerprints:
+    """The tools array and system block precede every message in the prefix.
+
+    Message-level churn tracking cannot see either, which is why 176 of 191
+    observed unplanned busts carried alive_fraction 1.0: the client had rewritten
+    no history, yet the cache still missed. These fields make the remaining
+    suspect measurable instead of argued.
+    """
+
+    def test_tools_change_is_detected_against_the_previous_request(self, tmp_path) -> None:
+        log, _ = _log(tmp_path)
+        tools = [{"name": "Read", "input_schema": {"type": "object"}}]
+        first = log.record(
+            session_key="s",
+            request_id="r1",
+            model="m",
+            billed_cache_read=0,
+            billed_cache_creation=100,
+            alive_fraction=1.0,
+            first_diverged_index=None,
+            body={"tools": tools, "system": "base"},
+        )
+        # No prior request to compare against: unknown, not unchanged.
+        assert first.tools_changed is None
+        assert first.tools_count == 1
+
+        same = log.record(
+            session_key="s",
+            request_id="r2",
+            model="m",
+            billed_cache_read=100,
+            billed_cache_creation=10,
+            alive_fraction=1.0,
+            first_diverged_index=5,
+            body={"tools": tools, "system": "base"},
+        )
+        assert same.tools_changed is False
+        assert same.system_changed is False
+
+        # A deferred tool resolving mid-session appends to the array.
+        grown = log.record(
+            session_key="s",
+            request_id="r3",
+            model="m",
+            billed_cache_read=0,
+            billed_cache_creation=5000,
+            alive_fraction=1.0,
+            first_diverged_index=None,
+            body={"tools": [*tools, {"name": "WebFetch"}], "system": "base"},
+        )
+        assert grown.tools_changed is True
+        assert grown.system_changed is False
+        assert grown.tools_count == 2
+        assert grown.tools_fingerprint != same.tools_fingerprint
+
+    def test_key_order_is_not_a_change(self) -> None:
+        # A client that re-serializes an identical schema in a different key
+        # order has not moved a cache byte the provider keys on, and counting
+        # it as a change would manufacture the correlation being tested for.
+        a, _, _ = head_fingerprints({"tools": [{"name": "Read", "type": "custom"}]})
+        b, _, _ = head_fingerprints({"tools": [{"type": "custom", "name": "Read"}]})
+        assert a == b
+
+    def test_missing_and_unserializable_bodies_are_survivable(self) -> None:
+        assert head_fingerprints(None) == (None, None, None)
+        assert head_fingerprints({}) == (None, None, None)
+        # Anything json cannot render must degrade to no fingerprint, never
+        # raise: this runs on the hot response path.
+        tools_fp, _, count = head_fingerprints({"tools": [object()]})
+        assert count == 1
+        assert isinstance(tools_fp, str)
+
+    def test_sessions_do_not_share_head_state(self, tmp_path) -> None:
+        log, _ = _log(tmp_path)
+        for key in ("a", "b"):
+            log.record(
+                session_key=key,
+                request_id=f"r-{key}",
+                model="m",
+                billed_cache_read=0,
+                billed_cache_creation=1,
+                alive_fraction=1.0,
+                first_diverged_index=None,
+                body={"tools": [{"name": key}]},
+            )
+        second = log.record(
+            session_key="a",
+            request_id="r-a2",
+            model="m",
+            billed_cache_read=1,
+            billed_cache_creation=1,
+            alive_fraction=1.0,
+            first_diverged_index=1,
+            body={"tools": [{"name": "a"}]},
+        )
+        assert second.tools_changed is False

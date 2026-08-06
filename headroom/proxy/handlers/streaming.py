@@ -925,6 +925,8 @@ class StreamingMixin:
                 first_diverged_index=_first_diverged_index,
                 transforms=transforms_applied,
                 ttl_seconds=message_segment_ttl_seconds(body),
+                body=body,
+                anchor_depths=list(getattr(prefix_tracker, "placed_anchor_depths", []) or []),
             )
         except Exception:
             logger.debug(

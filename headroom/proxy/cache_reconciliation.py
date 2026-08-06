@@ -9,12 +9,13 @@ call from the hot request path: no exception raised here escapes the caller.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,13 @@ logger = logging.getLogger("headroom.proxy")
 DEFAULT_LOG_PATH = Path(os.path.expanduser("~/.headroom/logs/cache_reconciliation.jsonl"))
 RING_SIZE = 200
 RECENT_BUST_SIZE = 5
+# Per-session chaining state is keyed by a value the proxy does not control and
+# never sees again once a session ends, so an unbounded map grows for as long as
+# the proxy runs. Only the most recent sessions can still chain a prediction, so
+# older keys are evicted rather than retained. Sized well above any plausible
+# count of concurrently live sessions, since evicting a live one costs a
+# prediction rather than correctness.
+MAX_TRACKED_SESSIONS = 2048
 # The Anthropic 5-minute cache tier. A cold read after a longer idle gap is
 # scheduled expiry, not an unplanned bust, and must not trip the alarm.
 CACHE_TTL_SECONDS = 300.0
@@ -73,6 +81,46 @@ def message_segment_ttl_seconds(body: dict | None) -> float:
     return longest
 
 
+def _fingerprint(value: Any) -> str | None:
+    """Short stable digest of a request-head component. Never raises.
+
+    Sorted keys so a client that reorders an unchanged schema does not read as
+    a change, which is the exact distinction this field exists to make.
+    """
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return None
+    return hashlib.sha256(encoded.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def head_fingerprints(body: dict | None) -> tuple[str | None, str | None, int | None]:
+    """Digest the two prefix components that sit ahead of every message.
+
+    Attribution of the residual unplanned busts ran out of road at the message
+    history: 176 of 191 had ``alive_fraction`` 1.0, so the client had rewritten
+    nothing, and mutating transforms were no more common on a bust than off one.
+    What that leaves is the region the message-level churn tracker cannot see,
+    the tools array and the system block, both of which precede every message in
+    the cached prefix and so invalidate all of it when either changes.
+
+    Deferred tool loading is the specific suspect: resolving a tool schema
+    mid-session appends to ``tools``, ahead of the entire conversation. The
+    system block is digested alongside it as a control, since a tools digest
+    that stays put during a bust only rules the tools array out if the other
+    head component was not moving at the same time.
+
+    Never raises: this runs on the hot response path and is diagnostic only.
+    """
+    if not isinstance(body, dict):
+        return None, None, None
+    tools = body.get("tools")
+    count = len(tools) if isinstance(tools, list) else None
+    return _fingerprint(tools), _fingerprint(body.get("system")), count
+
+
 @dataclass(frozen=True)
 class CacheReconciliationRecord:
     """One request's predicted-vs-billed cache accounting."""
@@ -87,6 +135,15 @@ class CacheReconciliationRecord:
     transforms: list[str] = field(default_factory=list)
     unplanned_bust: bool = False
     ttl_expired: bool = False
+    tools_fingerprint: str | None = None
+    tools_count: int | None = None
+    # Tri-state on purpose. False means the head was verified unchanged against
+    # the previous request of this session, None means there was no previous
+    # request to compare against. Collapsing the two would let every session's
+    # first turn read as evidence that the head holds still.
+    tools_changed: bool | None = None
+    system_changed: bool | None = None
+    anchor_depths: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +157,11 @@ class CacheReconciliationRecord:
             "transforms": list(self.transforms),
             "unplanned_bust": self.unplanned_bust,
             "ttl_expired": self.ttl_expired,
+            "tools_fingerprint": self.tools_fingerprint,
+            "tools_count": self.tools_count,
+            "tools_changed": self.tools_changed,
+            "system_changed": self.system_changed,
+            "anchor_depths": list(self.anchor_depths),
         }
 
 
@@ -134,6 +196,7 @@ class CacheReconciliationLog:
         log_path: Path | str = DEFAULT_LOG_PATH,
         ring_size: int = RING_SIZE,
         recent_bust_size: int = RECENT_BUST_SIZE,
+        max_sessions: int = MAX_TRACKED_SESSIONS,
     ) -> None:
         self._log_path = Path(log_path)
         self._lock = threading.Lock()
@@ -142,7 +205,13 @@ class CacheReconciliationLog:
         # session_key -> (billed_cache_read, billed_cache_creation, monotonic
         # timestamp) of its last request. The timestamp separates scheduled
         # 5m-TTL expiry from a genuine unplanned bust.
-        self._session_prior: dict[str, tuple[int, int, float]] = {}
+        self._session_prior: OrderedDict[str, tuple[int, int, float]] = OrderedDict()
+        # session_key -> (tools_fingerprint, system_fingerprint) of its last
+        # request, so a head change is detectable without re-reading the body.
+        # Kept separate from _session_prior so the billing chain above stays
+        # untouched by diagnostic state.
+        self._session_head: OrderedDict[str, tuple[str | None, str | None]] = OrderedDict()
+        self._max_sessions = max(1, int(max_sessions))
         self._request_count = 0
         self._unplanned_bust_count = 0
         self._ttl_expiry_count = 0
@@ -160,8 +229,19 @@ class CacheReconciliationLog:
         transforms: list[str] | None = None,
         now: float | None = None,
         ttl_seconds: float = CACHE_TTL_SECONDS,
+        body: dict | None = None,
+        anchor_depths: list[int] | None = None,
     ) -> CacheReconciliationRecord:
         """Assemble, count, ring, and log one record. Never raises."""
+        # Materialized once, up front, because the fallback below needs it too.
+        # Building it inside the try means the fallback rebuilds it from the
+        # same argument that just failed, and that second failure has nothing
+        # left to catch it: the exception escapes a method documented never to
+        # raise, on the hot request path.
+        try:
+            safe_transforms = list(transforms) if transforms else []
+        except Exception:
+            safe_transforms = []
         try:
             return self._record(
                 now=now,
@@ -172,8 +252,10 @@ class CacheReconciliationLog:
                 billed_cache_creation=billed_cache_creation,
                 alive_fraction=alive_fraction,
                 first_diverged_index=first_diverged_index,
-                transforms=transforms,
+                transforms=safe_transforms,
                 ttl_seconds=ttl_seconds,
+                body=body,
+                anchor_depths=anchor_depths,
             )
         except Exception:
             logger.debug(
@@ -187,7 +269,7 @@ class CacheReconciliationLog:
                 billed_cache_creation=billed_cache_creation,
                 alive_fraction=alive_fraction,
                 first_diverged_index=first_diverged_index,
-                transforms=list(transforms or []),
+                transforms=safe_transforms,
                 unplanned_bust=False,
             )
 
@@ -204,25 +286,44 @@ class CacheReconciliationLog:
         transforms: list[str] | None,
         now: float | None = None,
         ttl_seconds: float = CACHE_TTL_SECONDS,
+        body: dict | None = None,
+        anchor_depths: list[int] | None = None,
     ) -> CacheReconciliationRecord:
         billed_cache_read = max(0, int(billed_cache_read))
         billed_cache_creation = max(0, int(billed_cache_creation))
         if now is None:
             now = time.monotonic()
+        tools_fp, system_fp, tools_count = head_fingerprints(body)
+        # Anything that can raise has to run before the session maps are
+        # written. Past that point a raise is caught by record()'s blanket
+        # handler, which returns a stub and leaves the request uncounted, yet
+        # the maps already carry this request's billing and fingerprints. The
+        # next request would then chain a prediction off state belonging to a
+        # request that, as far as every counter says, never happened.
+        safe_depths = sorted(anchor_depths) if anchor_depths else []
         # A 1h-tier write stays warm 12x longer than the 5m default, so a flat
         # threshold would flag a genuine 1h bust as benign expiry. Judge expiry
         # against the actual TTL the prior request was written with.
         ttl_seconds = ttl_seconds if ttl_seconds > 0 else CACHE_TTL_SECONDS
+        planned = is_planned_bust(transforms)
         with self._lock:
             prior = self._session_prior.get(session_key)
             predicted = (prior[0] + prior[1]) if prior else 0
             prior_age = (now - prior[2]) if prior else 0.0
             self._session_prior[session_key] = (billed_cache_read, billed_cache_creation, now)
+            self._session_prior.move_to_end(session_key)
+            prior_head = self._session_head.get(session_key)
+            self._session_head[session_key] = (tools_fp, system_fp)
+            self._session_head.move_to_end(session_key)
+            while len(self._session_prior) > self._max_sessions:
+                self._session_prior.popitem(last=False)
+            while len(self._session_head) > self._max_sessions:
+                self._session_head.popitem(last=False)
+        tools_changed = None if prior_head is None else prior_head[0] != tools_fp
+        system_changed = None if prior_head is None else prior_head[1] != system_fp
         ttl_expired = prior is not None and prior_age > ttl_seconds
         unplanned_bust = (
-            not ttl_expired
-            and not is_planned_bust(transforms)
-            and is_unplanned_bust(predicted, billed_cache_read)
+            not ttl_expired and not planned and is_unplanned_bust(predicted, billed_cache_read)
         )
         record = CacheReconciliationRecord(
             request_id=request_id,
@@ -235,6 +336,11 @@ class CacheReconciliationLog:
             transforms=list(transforms or []),
             unplanned_bust=unplanned_bust,
             ttl_expired=ttl_expired,
+            tools_fingerprint=tools_fp,
+            tools_count=tools_count,
+            tools_changed=tools_changed,
+            system_changed=system_changed,
+            anchor_depths=safe_depths,
         )
         payload = record.to_dict()
         with self._lock:

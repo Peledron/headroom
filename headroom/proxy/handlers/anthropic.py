@@ -4972,16 +4972,35 @@ class AnthropicHandlerMixin:
                                 stabilize_anchor_depths,
                             )
 
+                            # Per-message size estimates, so the DP minimizes the
+                            # tokens a bust re-writes rather than the messages it
+                            # spans. The two diverge sharply here: a single tool
+                            # result can outweigh thirty short turns, and an
+                            # anchor placed to balance message counts will sit on
+                            # the wrong side of one. Serialized length over four
+                            # is the standard rough token ratio, and only the
+                            # relative weights matter to the argmin, so an exact
+                            # tokenizer pass would cost real time to buy nothing.
+                            _weights: list[float] | None
+                            try:
+                                _weights = [
+                                    len(json.dumps(_m, default=str)) / 4.0 for _m in _msgs
+                                ]
+                            except Exception:
+                                _weights = None
+
                             _targets = stabilize_anchor_depths(
                                 prefix_tracker.placed_anchor_depths,
                                 optimal_anchor_depths(
                                     len(_msgs),
                                     prefix_tracker.churn_depth_samples,
                                     _budget,
+                                    _weights,
                                 ),
                                 len(_msgs),
                                 prefix_tracker.churn_depth_samples,
                                 _budget,
+                                _weights,
                             )
                         else:
                             _anchor = max(32, (len(_msgs) - 16) // 64 * 64)

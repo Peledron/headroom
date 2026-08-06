@@ -3,8 +3,8 @@
 from itertools import combinations
 
 from headroom.cache.anchor_dp import (
+    CANDIDATE_STEP,
     MIN_DEPTH,
-    QUANTUM,
     TAIL_GUARD,
     AbstractVsKeepWarmArmStats,
     _candidate_positions,
@@ -45,7 +45,7 @@ class TestEdgeCases:
     def test_positions_quantized_and_tail_guarded(self) -> None:
         depths = optimal_anchor_depths(300, [0.1, 0.5, 0.9], 3)
         for d in depths:
-            assert d % QUANTUM == 0
+            assert d % CANDIDATE_STEP == 0
             assert MIN_DEPTH <= d <= 300 - TAIL_GUARD
 
     def test_returns_sorted_unique(self) -> None:
@@ -77,7 +77,7 @@ class TestOptimality:
         depths = optimal_anchor_depths(n, [0.9, 0.88, 0.92], 1)
         assert len(depths) == 1
         # Deepest grid point at or below the shallowest sample (0.88 * 640).
-        assert depths[0] == int(0.88 * n) // QUANTUM * QUANTUM
+        assert depths[0] == int(0.88 * n) // CANDIDATE_STEP * CANDIDATE_STEP
 
     def test_bimodal_churn_splits_anchors(self) -> None:
         # Churn at two distinct depths: with budget 2 the DP must cover both
@@ -145,3 +145,61 @@ class TestAbstractVsKeepWarmArm:
         assert snapshot["would_abstract"] == 1
         assert snapshot["agrees_with_production"] == 1
         assert snapshot["disagrees_with_production"] == 1
+
+
+class TestTokenWeightedObjective:
+    """The bill is in tokens, so the anchor must be placed against token mass.
+
+    Message index and token cost only agree when messages are the same size,
+    and in real traffic they are not: one tool result routinely outweighs
+    dozens of short turns. An anchor chosen to balance message counts can
+    therefore sit on the wrong side of the mass it was meant to protect.
+    """
+
+    def test_weights_move_the_anchor_to_the_heavier_cluster(self) -> None:
+        # Bimodal churn, one anchor to spend. Counting messages, the deep
+        # cluster is the one worth covering: it is further from the head, so
+        # protecting it sheds more message-distance. But a single very large
+        # message sits below the shallow cluster, which means leaving that
+        # cluster to fall back to the head re-writes its bulk on every bust.
+        # Measured in tokens the choice inverts, and tokens are what is billed.
+        n = 400
+        fractions = [0.30] * 3 + [0.85] * 3
+        weights = [10.0] * n
+        weights[60] = 40_000.0
+        unweighted = optimal_anchor_depths(n, fractions, 1)
+        weighted = optimal_anchor_depths(n, fractions, 1, weights)
+        assert unweighted[0] > 0.30 * n, unweighted
+        assert weighted[0] < 0.30 * n, weighted
+
+    def test_absent_weights_reproduce_message_distance(self) -> None:
+        # Uniform weights are the message-count objective up to a scale factor,
+        # so the argmin must not move. This is what keeps callers that have no
+        # token estimate on exactly their previous behaviour.
+        n = 400
+        fractions = [0.3, 0.55, 0.9]
+        assert optimal_anchor_depths(n, fractions, 2, [7.0] * n) == optimal_anchor_depths(
+            n, fractions, 2
+        )
+
+    def test_degenerate_weights_fall_back_to_message_distance(self) -> None:
+        n = 300
+        fractions = [0.4, 0.8]
+        baseline = optimal_anchor_depths(n, fractions, 2)
+        assert optimal_anchor_depths(n, fractions, 2, [0.0] * n) == baseline
+        assert optimal_anchor_depths(n, fractions, 2, [1.0] * 5) == baseline
+
+
+def test_refined_grid_stays_cheap_on_the_hot_path() -> None:
+    """The grid refinement multiplied the DP table by sixteen. It runs inside
+    request assembly, so the segment-loss prefix sums have to keep it in the
+    microsecond range on a long history with a full sample ring."""
+    import time
+
+    fractions = [i / 64.0 for i in range(64)]
+    weights = [200.0] * 2000
+    start = time.perf_counter()
+    for _ in range(20):
+        optimal_anchor_depths(2000, fractions, 4, weights)
+    elapsed = (time.perf_counter() - start) / 20
+    assert elapsed < 0.05, f"DP took {elapsed * 1000:.1f}ms per call"

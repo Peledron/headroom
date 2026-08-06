@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import itertools
 
-from headroom.cache.anchor_dp import optimal_anchor_depths, stabilize_anchor_depths
+from headroom.cache.anchor_dp import (
+    QUANTUM,
+    optimal_anchor_depths,
+    stabilize_anchor_depths,
+)
 
 
 def test_anchor_never_walks_backward_while_history_grows():
@@ -28,7 +32,13 @@ def test_anchor_never_walks_backward_while_history_grows():
         proposed = optimal_anchor_depths(n, [0.9] * 20, 2)
         after = stabilize_anchor_depths(depths, proposed, n, [0.9] * 20, 2)
         for previous in depths:
-            retreated = [d for d in after if d < previous and previous not in after]
+            if previous in after:
+                continue
+            # Only a *newly placed* shallower anchor is a retreat. An anchor
+            # that was already live below the one being replaced has not moved
+            # and has cost nothing, so counting it here reported a retreat
+            # every time a deeper anchor legitimately advanced.
+            retreated = [d for d in after if d < previous and d not in depths]
             assert not retreated, f"anchor {previous} retreated to {retreated} at n={n}"
         depths = after
 
@@ -78,3 +88,41 @@ def test_anchor_past_the_tail_is_released():
     a position that no longer exists."""
     depths = stabilize_anchor_depths([900], [128], 200, [0.6] * 20, 1)
     assert 900 not in depths
+
+
+def test_near_neighbour_relocation_is_refused_however_well_it_prices():
+    """A live anchor must not chase the argmin in small steps.
+
+    Churn pinned to a fraction of a growing history marches forward in absolute
+    terms, so every turn offers a slightly better position just ahead. Each such
+    step prices well alone, and following them all is a treadmill that pays a
+    rewrite per turn. The coarse candidate grid used to make these proposals
+    impossible; with the grid refined for placement accuracy the hysteresis has
+    to hold explicitly.
+    """
+    # Churn at 0.9 * 304 = 273.6, sixteen messages past the live anchor.
+    assert stabilize_anchor_depths([256], [272], 304, [0.9] * 20, 2) == [256]
+
+
+def test_growth_does_not_march_the_anchor_forward_every_turn():
+    """The end-to-end version: over a run of appended turns under fixed-fraction
+    churn, anchor moves must be bounded by the hysteresis, not by the turn count.
+
+    An anchor is allowed to advance, and under fixed-fraction churn it should:
+    the target really is moving. What it must not do is take a step per turn.
+    QUANTUM is what separates those, so the ceiling is how many whole QUANTUM
+    steps the history grew by, per anchor, and it does not rise if the same
+    growth is delivered over more and smaller turns.
+    """
+    k_anchors = 2
+    start, stop, step = 300, 420, 2
+    depths = [128]
+    moves = 0
+    for n in range(start, stop, step):
+        proposed = optimal_anchor_depths(n, [0.9] * 20, k_anchors)
+        after = stabilize_anchor_depths(depths, proposed, n, [0.9] * 20, k_anchors)
+        if sorted(after) != sorted(depths) and depths:
+            moves += 1
+        depths = after
+    ceiling = -(-(stop - start) // QUANTUM) * k_anchors
+    assert moves <= ceiling, f"anchor moved {moves} times, ceiling {ceiling}"
