@@ -116,10 +116,24 @@ def blocked_message(hash_key: str, *, suggestions: list[str] | None = None) -> s
             "A hash one character off is a retyped hash. Copy it from the marker "
             "instead of writing it out."
         )
-    parts.append(
-        "To recover: call the headroom_retrieve tool with the hash exactly as it "
-        "appears in the marker, or re-read the file or re-run the command that "
-        "produced the content, since disk is the source of truth. Do not put "
-        "marker text into a tool input."
-    )
+    if suggestions:
+        # Retrieval can only work against a hash the store actually holds, and
+        # the suggestions are the ones it holds. Point at those, never at the
+        # hash that just missed.
+        parts.append(
+            "To recover: call the headroom_retrieve tool with one of those stored "
+            "hashes, or re-read the file or re-run the command that produced the "
+            "content, since disk is the source of truth."
+        )
+    else:
+        # No near miss means the store does not hold anything resembling this
+        # hash, so retrieval cannot resolve it either. Saying otherwise sends
+        # the caller into a retry loop against a call that must fail, which is
+        # the whole reason this branch exists.
+        parts.append(
+            "Nothing in the store resembles that hash, so retrieval cannot "
+            "resolve it. Re-read the file or re-run the command that produced "
+            "the content, since disk is the source of truth."
+        )
+    parts.append("Do not put marker text into a tool input.")
     return " ".join(parts)

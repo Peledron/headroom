@@ -5742,6 +5742,73 @@ class AnthropicHandlerMixin:
                                 )
                                 # Continue with original response
 
+                        # Last response mutation before metrics, cache tracking, and
+                        # client delivery. This covers ordinary non-stream responses,
+                        # CCR continuations, memory continuations, and buffered SSE
+                        # resynthesis from the same complete response object.
+                        if resp_json and response.status_code == 200:
+                            routed_notice = False
+                            if model != client_model and isinstance(resp_json.get("content"), list):
+                                # Announced on every routed turn, not only the first.
+                                # Stickiness means a lineage can sit on the cheap
+                                # model for a long stretch, and a notice the user
+                                # has to scroll back to find is not a notice.
+                                resp_json["content"] = [
+                                    self._model_route_notice(model, client_model),
+                                    *resp_json["content"],
+                                ]
+                                routed_notice = True
+                                logger.warning(
+                                    "[%s] MODEL_ROUTE: answered by %s instead of %s",
+                                    request_id,
+                                    model,
+                                    client_model,
+                                )
+                            guard_result = _guard_anthropic_tool_use_markers(
+                                resp_json, request_id=request_id
+                            )
+                            if routed_notice:
+                                guard_result = MarkerGuardResult(
+                                    changed=True,
+                                    stalled=guard_result.stalled,
+                                    message=guard_result.message,
+                                )
+                            if guard_result.stalled:
+                                healed = await self._retry_marker_blocked_turn(
+                                    url=url,
+                                    headers=headers,
+                                    body=body,
+                                    messages=optimized_messages,
+                                    guard_message=guard_result.message,
+                                    request_id=request_id,
+                                )
+                                if healed is not None:
+                                    healed_json = healed
+                                    # The retry gets one pass of the same guard. If
+                                    # it comes back carrying a marker too, the turn
+                                    # ends for real: a second copy of the message is
+                                    # not going to land where the first did not.
+                                    second = _guard_anthropic_tool_use_markers(
+                                        healed_json, request_id=request_id
+                                    )
+                                    resp_json = healed_json
+                                    guard_result = MarkerGuardResult(
+                                        changed=True,
+                                        stalled=second.stalled,
+                                        message=second.message,
+                                    )
+                            if guard_result:
+                                guarded_headers = {
+                                    k: v
+                                    for k, v in response.headers.items()
+                                    if k.lower() not in ("content-encoding", "content-length")
+                                }
+                                response = httpx.Response(
+                                    status_code=200,
+                                    content=json.dumps(resp_json).encode(),
+                                    headers=guarded_headers,
+                                )
+
                         total_latency = (time.time() - start_time) * 1000
 
                         # Parse response for output token count and cache metrics
