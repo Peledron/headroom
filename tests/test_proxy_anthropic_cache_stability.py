@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,8 +13,8 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
-from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy import runtime_env
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.transforms.observation_masking import (
     apply_candidates,
@@ -797,7 +798,7 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
             proxy.config.ccr_inject_system_instructions = False
 
             fake_tracker = _FakePrefixTracker(frozen_count=0)
-            proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            proxy.session_tracker_store.compute_session_id = lambda request, model, messages, system=None: (
                 "frozen-transition-session"
             )
             proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
@@ -1400,10 +1401,22 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
 
         tracker = _FakePrefixTracker(frozen_count=0)
         tracker._last_original_messages = [
-            {"role": "user", "content": "shared-prefix"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "shared-prefix"},
+                    {"type": "text", "text": "stable-frontier"},
+                ],
+            },
         ]
         tracker._last_forwarded_messages = [
-            {"role": "user", "content": "COMPRESSED_PREFIX"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "COMPRESSED_PREFIX"},
+                    {"type": "text", "text": "COMPRESSED_FRONTIER"},
+                ],
+            },
         ]
         tracker.get_last_original_messages = lambda: tracker._last_original_messages.copy()
         tracker.get_last_forwarded_messages = lambda: tracker._last_forwarded_messages.copy()
@@ -1453,16 +1466,392 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 64,
                 "messages": [
-                    {"role": "user", "content": "shared-prefix + raw suffix"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "shared-prefix"},
+                            {"type": "text", "text": "stable-frontier"},
+                            {
+                                "type": "text",
+                                "text": "raw suffix",
+                                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                            },
+                        ],
+                    },
                 ],
             },
         )
 
         assert response.status_code == 200
         assert captured["calls"] == []
+        # The previously forwarded (compressed) blocks are replayed byte-identical
+        # and the appended block rides after them, so the prefix the provider
+        # hashed last turn is still there to hit. The single breakpoint stays on
+        # the newest block, which is where Anthropic writes the entry that covers
+        # the whole prefix including the new tail.
         assert captured["body"]["messages"] == [
-            {"role": "user", "content": "shared-prefix + raw suffix"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "COMPRESSED_PREFIX"},
+                    {"type": "text", "text": "COMPRESSED_FRONTIER"},
+                    {
+                        "type": "text",
+                        "text": "raw suffix",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    },
+                ],
+            },
         ]
+
+
+_LIVE_ASSISTANT_TURN = {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+
+
+def test_cache_mode_reuses_lineage_across_a_live_same_message_append() -> None:
+    """Two real turns through the handler, with the real SessionTrackerStore.
+
+    Nothing about the tracker is stubbed here: the session id, the lineage
+    lookup, and the recorded prior state all come from the real
+    ``SessionTrackerStore``. Turn one's forwarded body and the assistant reply
+    are recorded by the handler's own ``update_from_response`` call, and turn two
+    reads that state back.
+
+    The issue warns that the previously forwarded messages arrive empty on every
+    turn for this caller shape, which is what left an earlier attempt inert. That
+    is the lineage lookup: it required the whole prior history to
+    canonicalize-equal the current prefix, which a message that grew by blocks
+    never does, so every turn allocated a fresh tracker with no recorded state.
+    Turn two here has to find turn one's tracker.
+    """
+    captured_bodies = []
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        proxy.config.image_optimize = False
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured_bodies.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"msg_live_{len(captured_bodies)}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 80,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 40 if len(captured_bodies) > 1 else 0,
+                        "cache_creation_input_tokens": 40,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        # Spy on the real lookup rather than replacing it, so the assertion sees
+        # which tracker each turn actually resolved to.
+        resolved = []
+        real_resolve = proxy.session_tracker_store.resolve_tracker
+
+        def _spy_resolve(session_id, provider, messages=None):
+            tracker = real_resolve(session_id, provider, messages=messages)
+            resolved.append(tracker)
+            return tracker
+
+        proxy.session_tracker_store.resolve_tracker = _spy_resolve
+
+        def _blocks(*texts, marked=None):
+            return [
+                {
+                    "type": "text",
+                    "text": text,
+                    **(
+                        {"cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                        if index == marked
+                        else {}
+                    ),
+                }
+                for index, text in enumerate(texts)
+            ]
+
+        headers = {"x-api-key": "test-key", "anthropic-version": "2023-06-01"}
+        first = client.post(
+            "/v1/messages",
+            headers=headers,
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": _blocks("a", "b", marked=1)}],
+            },
+        )
+        # The client resends the recorded history with the first message grown by
+        # one block, which is the append-only shape the issue reports.
+        second = client.post(
+            "/v1/messages",
+            headers=headers,
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "user", "content": _blocks("a", "b", "c", marked=2)},
+                    copy.deepcopy(_LIVE_ASSISTANT_TURN),
+                ],
+            },
+        )
+
+        assert first.status_code == second.status_code == 200
+
+        # Turn two resolved turn one's tracker rather than allocating a fresh
+        # one, so the recorded forwarded prefix was there to replay.
+        assert len(resolved) == 2
+        assert resolved[1] is resolved[0]
+        assert resolved[1].get_last_forwarded_messages()
+
+        first_content = captured_bodies[0]["messages"][0]["content"]
+        second_content = captured_bodies[1]["messages"][0]["content"]
+        assert [block["text"] for block in second_content] == ["a", "b", "c"]
+        assert [
+            {k: v for k, v in block.items() if k != "cache_control"} for block in second_content[:2]
+        ] == [
+            {k: v for k, v in block.items() if k != "cache_control"} for block in first_content[:2]
+        ]
+
+        # Exactly one breakpoint in the whole body, on the last block of the last
+        # block-style message. That is the position Anthropic writes the entry
+        # at, and its backward lookup finds last turn's entry from there.
+        markers = [
+            (message_index, block_index)
+            for message_index, message in enumerate(captured_bodies[1]["messages"])
+            if isinstance(message.get("content"), list)
+            for block_index, block in enumerate(message["content"])
+            if isinstance(block, dict) and "cache_control" in block
+        ]
+        last_block_message = max(
+            index
+            for index, message in enumerate(captured_bodies[1]["messages"])
+            if isinstance(message.get("content"), list)
+        )
+        last_block = len(captured_bodies[1]["messages"][last_block_message]["content"]) - 1
+        assert markers == [(last_block_message, last_block)]
+
+
+def test_same_message_append_with_changed_role_is_not_append_only() -> None:
+    """A message that grew blocks *and* changed role is a replacement.
+
+    ``overlay_cached_prefix`` replays the previously forwarded message's fields
+    under the merged block list, so classifying this as append-only would forward
+    last turn's role with this turn's blocks.
+    """
+    from headroom.cache.prefix_tracker import (
+        classify_append_only_prefix,
+        overlay_cached_prefix,
+    )
+
+    previous = [{"role": "user", "content": [{"type": "text", "text": "a"}]}]
+    current = [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+        }
+    ]
+
+    assert classify_append_only_prefix(current, previous) is None
+
+    forwarded = [{"role": "user", "content": [{"type": "text", "text": "A"}]}]
+    assert overlay_cached_prefix(current, current, previous, forwarded) == current
+
+
+def test_a_message_that_canonicalizes_away_refuses_the_whole_classification() -> None:
+    """The projection has to stay positionally 1:1 with the raw list.
+
+    A message whose keys are all non-semantic projects to ``{}`` and the
+    canonicalizer drops it, so the canonical index no longer addresses the raw
+    list. Callers slice raw lists by raw counts, so handing them a classification
+    derived from the shorter projection drops whole messages.
+    """
+    from headroom.cache.prefix_tracker import (
+        classify_append_only_prefix,
+        extract_cache_stable_delta,
+        overlay_cached_prefix,
+    )
+
+    previous_original = [
+        {"cachePoint": {"type": "default"}},
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+    ]
+    previous_forwarded = [
+        {"cachePoint": {"type": "default"}},
+        {"role": "user", "content": [{"type": "text", "text": "A_compressed"}]},
+    ]
+    current = [
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "B"}]},
+    ]
+
+    assert classify_append_only_prefix(current, previous_original) is None
+    assert extract_cache_stable_delta(current, previous_original, previous_forwarded) is None
+    assert overlay_cached_prefix(current, current, previous_original, previous_forwarded) == current
+
+
+def test_a_dropped_message_past_the_compared_prefix_still_replays() -> None:
+    """The refusal is bounded to the region the callers index.
+
+    A message that canonicalizes away in the appended tail cannot shift the
+    prefix count or the frontier index, and the delta is taken from the raw
+    list, so giving up the replay there would cost a cache hit for nothing.
+    """
+    from headroom.cache.prefix_tracker import extract_cache_stable_delta
+
+    previous_original = [{"role": "user", "content": [{"type": "text", "text": "A"}]}]
+    previous_forwarded = [{"role": "user", "content": [{"type": "text", "text": "A_compressed"}]}]
+    current = [
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+        {"cachePoint": {"type": "default"}},
+        {"role": "assistant", "content": [{"type": "text", "text": "B"}]},
+    ]
+
+    result = extract_cache_stable_delta(current, previous_original, previous_forwarded)
+
+    assert result is not None
+    prefix, delta = result
+    assert prefix == previous_forwarded
+    assert delta == current[1:]
+
+
+def test_growth_on_a_directive_only_message_is_not_a_clean_prefix_match() -> None:
+    """A message whose blocks all canonicalize away still grew.
+
+    ``_canonicalize_for_prefix_compare`` drops pure cache-directive blocks, so
+    the previous canonical content can be empty. Reporting no frontier would let
+    the delta path read this as a whole-message append and slice the newly
+    appended block out of the forwarded request.
+    """
+    from headroom.cache.prefix_tracker import (
+        classify_append_only_prefix,
+        extract_cache_stable_delta,
+    )
+
+    previous = [{"role": "user", "content": [{"cachePoint": {"type": "default"}}]}]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"cachePoint": {"type": "default"}},
+                {"type": "text", "text": "NEW BLOCK"},
+            ],
+        }
+    ]
+
+    match = classify_append_only_prefix(current, previous)
+    assert match is not None
+    assert match.block_frontier is not None
+
+    # The delta path must refuse rather than forward last turn's bytes with the
+    # appended block missing.
+    assert extract_cache_stable_delta(current, previous, previous) is None
+
+
+def test_overlay_split_uses_raw_blocks_not_the_canonical_frontier() -> None:
+    """The frontier index is canonical; the block lists it would slice are raw.
+
+    Here canonicalization drops the directive block, so a canonical-space split
+    point lands mid-list: it would drop the appended "B" and emit the directive
+    block twice.
+    """
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    previous_original = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "A"}, {"cachePoint": {}}],
+        }
+    ]
+    previous_forwarded = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "A_compressed"}, {"cachePoint": {}}],
+        }
+    ]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "B"},
+                {"cachePoint": {}},
+                {"type": "text", "text": "C"},
+            ],
+        }
+    ]
+
+    out = overlay_cached_prefix(current, current, previous_original, previous_forwarded)
+
+    blocks = out[0]["content"]
+    assert {"type": "text", "text": "B"} in blocks
+    assert sum(1 for block in blocks if "cachePoint" in block) == 1
+
+
+def test_overlay_merge_replays_the_forwarded_blocks_and_appends_the_tail() -> None:
+    """Observe the merge output, not just that nothing was corrupted.
+
+    Without this the sibling guards would still pass if the merge branch stopped
+    firing altogether, since not merging also leaves the input intact.
+    """
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    previous_original = [
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+    ]
+    previous_forwarded = [
+        {"role": "user", "content": [{"type": "text", "text": "A_compressed"}]},
+    ]
+    current = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}],
+        }
+    ]
+
+    out = overlay_cached_prefix(current, current, previous_original, previous_forwarded)
+
+    assert out[0]["content"] == [
+        {"type": "text", "text": "A_compressed"},
+        {"type": "text", "text": "B"},
+    ]
+
+
+def test_overlay_bails_when_forwarded_block_count_differs_from_original() -> None:
+    """Compression that merged blocks breaks the positional block mapping.
+
+    The merge splits the current block list at the forwarded block count, so a
+    forwarded message with fewer blocks than its original would swallow or
+    duplicate the appended tail. Leave the turn untouched instead.
+    """
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    previous_original = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+        }
+    ]
+    # Last turn forwarded the two originals merged into one compressed block.
+    previous_forwarded = [{"role": "user", "content": [{"type": "text", "text": "ab"}]}]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+
+    assert overlay_cached_prefix(current, current, previous_original, previous_forwarded) == current
 
 
 # ─── Issue #327 regression tests ─────────────────────────────────────────────

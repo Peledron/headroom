@@ -251,3 +251,34 @@ def test_latest_message_cache_control_ttl_survives_precompression_strip():
         "ttl": "1h",
     }
     assert _strip_cache_control(normalized) == stripped
+
+
+
+# ── fix-4 (#2671): a pure block append keeps the newest-block breakpoint ──────
+# The lineage fix keeps one tracker when a message grows by APPENDING blocks.
+# For that shape the breakpoint must stay on the NEWEST block: once written,
+# appended blocks are stable, so next turn's newest block matches and the write
+# covers the new tail. Relocating to the end of the stable run is only valid
+# when the PREVIOUS message itself diverged (its stable run is shorter than its
+# own block count). A pure append has run == previous block count, so any
+# relocation keyed off the current message alone would fire on appends, rewrite
+# the already-cached prefix, and leave the freshly appended blocks out of this
+# turn's cache write. This pins newest-block placement on the >=20-block pure
+# append (above the provider's lookback window), the case that separates the
+# two designs and must survive any merged relocation.
+
+
+def test_pure_append_over_20_blocks_keeps_newest_breakpoint():
+    stable = 20
+    for appended in (1, 5):
+        content = [{"type": "text", "text": f"stable-{i}"} for i in range(stable)]
+        content += [{"type": "text", "text": f"appended-{i}"} for i in range(appended)]
+        msgs = [{"role": "user", "content": content}]
+        out = normalize_message_cache_control(msgs)
+        last = out[-1]
+        bp = next(i for i, b in enumerate(last["content"]) if "cache_control" in b)
+        assert bp == len(content) - 1, (
+            f"pure append must keep newest-block placement, got {bp} (want {len(content) - 1})"
+        )
+        assert _markers(out) == 1
+        assert _strip_cache_control(out) == _strip_cache_control(msgs)

@@ -296,6 +296,67 @@ def _canonicalize_for_prefix_compare(obj: Any) -> Any:
     return obj
 
 
+@dataclass(frozen=True)
+class AppendOnlyClassification:
+    """Canonical relationship between two consecutive message histories."""
+
+    block_frontier: tuple[int, int] | None = None
+
+
+def _message_fields_outside_content(message: dict[str, Any]) -> dict[str, Any]:
+    """The message minus its ``content``, for identity comparison."""
+    return {key: value for key, value in message.items() if key != "content"}
+
+
+def _classify_append_only_canonical(
+    current_messages: list[Any],
+    previous_messages: list[Any],
+) -> AppendOnlyClassification | None:
+    """Classify a history that preserves the previous history's semantics."""
+    if len(current_messages) < len(previous_messages):
+        return None
+
+    block_frontier: tuple[int, int] | None = None
+    for index, previous_message in enumerate(previous_messages):
+        current_message = current_messages[index]
+        if current_message == previous_message:
+            continue
+
+        # A single existing message may grow by appending content blocks. Any
+        # replacement, insertion, or second changed message is a divergence.
+        if block_frontier is not None:
+            return None
+        if not isinstance(previous_message, dict) or not isinstance(current_message, dict):
+            return None
+        # Everything outside ``content`` must be unchanged. A message whose
+        # role, name, tool ids, or any other field moved is a replacement, not a
+        # block append: ``overlay_cached_prefix`` replays the previously
+        # forwarded message's fields under the merged block list, so a changed
+        # field would silently forward last turn's metadata.
+        if _message_fields_outside_content(previous_message) != _message_fields_outside_content(
+            current_message
+        ):
+            return None
+        previous_content = previous_message.get("content")
+        current_content = current_message.get("content")
+        if (
+            not isinstance(previous_content, list)
+            or not isinstance(current_content, list)
+            or len(current_content) <= len(previous_content)
+            or current_content[: len(previous_content)] != previous_content
+        ):
+            return None
+        # Record the frontier unconditionally. An empty previous content list
+        # still means this message grew, and reporting no frontier would let
+        # ``extract_cache_stable_delta`` read the history as a pure
+        # whole-message append and slice the appended blocks away. A canonical
+        # content list is empty whenever every block projected to ``{}``, which
+        # is what a pure cache-directive block does.
+        block_frontier = (index, len(previous_content) - 1)
+
+    return AppendOnlyClassification(block_frontier=block_frontier)
+
+
 def extract_cache_stable_delta(
     current_messages: list[dict[str, Any]],
     previous_original_messages: list[dict[str, Any]] | None,
@@ -318,12 +379,11 @@ def extract_cache_stable_delta(
     """
     if not previous_original_messages or previous_forwarded_messages is None:
         return None
+    match = classify_append_only_prefix(current_messages, previous_original_messages)
+    if match is None or match.block_frontier is not None:
+        return None
     prefix_len = len(previous_original_messages)
     if len(current_messages) < prefix_len:
-        return None
-    if _canonicalize_for_prefix_compare(
-        current_messages[:prefix_len]
-    ) != _canonicalize_for_prefix_compare(previous_original_messages):
         return None
     return (
         copy.deepcopy(previous_forwarded_messages),
@@ -389,6 +449,54 @@ def overlay_cached_prefix(
             n,
             len(mapping),
         )
+    match = classify_append_only_prefix(current_original_messages, prev_orig)
+    if match is not None and match.block_frontier is not None:
+        message_index, _ = match.block_frontier
+        if message_index < len(optimized_messages):
+            previous_message = prev_fwd[message_index]
+            previous_original_message = prev_orig[message_index]
+            current_message = optimized_messages[message_index]
+            previous_content = (
+                previous_message.get("content") if isinstance(previous_message, dict) else None
+            )
+            previous_original_content = (
+                previous_original_message.get("content")
+                if isinstance(previous_original_message, dict)
+                else None
+            )
+            current_content = (
+                current_message.get("content") if isinstance(current_message, dict) else None
+            )
+            # The frontier index comes from the CANONICAL projection, so it
+            # cannot be used to slice raw block lists: canonicalization drops
+            # pure directive blocks, and compression can change the count too.
+            # Re-establish the split in raw terms instead. Last turn must have
+            # forwarded one block per original block, and this turn's leading
+            # blocks must still be last turn's originals verbatim. Then, and
+            # only then, replaying the forwarded blocks and appending the rest
+            # is exactly the growth.
+            split = (
+                len(previous_original_content)
+                if isinstance(previous_original_content, list)
+                else -1
+            )
+            if (
+                isinstance(previous_content, list)
+                and isinstance(current_content, list)
+                and isinstance(previous_original_content, list)
+                and len(previous_content) == split
+                and len(current_content) >= split
+                and current_content[:split] == previous_original_content
+            ):
+                merged = copy.deepcopy(previous_message)
+                merged["content"] = copy.deepcopy(previous_content) + copy.deepcopy(
+                    current_content[split:]
+                )
+                return (
+                    list(prev_fwd[:message_index])
+                    + [merged]
+                    + list(optimized_messages[message_index + 1 :])
+                )
     # Append-only guard on CONTENT ONLY, message-by-message. Replay the
     # previously-forwarded (cached, compressed) bytes for the longest LEADING
     # run of messages that is byte-for-byte (content-canonical) identical to
@@ -614,7 +722,12 @@ def normalize_message_cache_control(
                 last_block_idx = i
         else:
             out.append(msg)
-    # Re-place exactly one breakpoint on the last block-style message.
+    # Re-place exactly one breakpoint on the last block-style message. Anthropic
+    # writes a cache entry only at the breakpoint and looks backward up to 20
+    # blocks for a prior write, so the newest block is the position that both
+    # reads last turn's entry and writes this turn's growth. Anchoring further
+    # back would re-write a prefix that is already cached and leave the appended
+    # blocks out of the cache entirely.
     if last_block_idx >= 0:
         msg = out[last_block_idx]
         content = list(msg["content"])
@@ -1636,6 +1749,34 @@ def _lineage_snapshot(obj: Any) -> Any:
     return obj
 
 
+def classify_append_only_prefix(
+    current_messages: list[dict[str, Any]],
+    previous_messages: list[dict[str, Any]],
+) -> AppendOnlyClassification | None:
+    """Return the shared append-only classification for two message histories."""
+    if not current_messages or not previous_messages:
+        return None
+    current = _lineage_snapshot(_canonicalize_for_prefix_compare(current_messages))
+    previous = _lineage_snapshot(_canonicalize_for_prefix_compare(previous_messages))
+    # Callers slice raw message lists by raw counts and index them by the
+    # frontier's message index, so the canonical projection has to stay
+    # positionally 1:1 with its input over the region they address. It does not
+    # when a whole message projects to ``{}`` and the list comprehension in
+    # ``_canonicalize_for_prefix_compare`` drops it, which happens when every key
+    # on that message is non-semantic. Refuse rather than hand back an index into
+    # a list the caller does not have.
+    #
+    # Only the compared prefix matters. A dropped message past it cannot shift
+    # any index the callers use, and the delta they take is the raw tail, so
+    # refusing there would give up a sound replay for nothing.
+    prefix_len = len(previous_messages)
+    if len(previous) != prefix_len:
+        return None
+    if len(_canonicalize_for_prefix_compare(current_messages[:prefix_len])) != prefix_len:
+        return None
+    return _classify_append_only_canonical(current, previous)
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
@@ -1809,13 +1950,18 @@ class SessionTrackerStore:
 
         family = self._lineages.setdefault(session_id, OrderedDict())
 
-        # Longest recorded chain that prefixes the incoming history wins.
+        # Longest recorded append-only chain that matches the incoming history wins.
         best_key: str | None = None
         best_len = -1
         for key, chain in family.items():
             if len(chain) > len(snap) or len(chain) <= best_len:
                 continue
-            if snap[: len(chain)] == chain:
+            # `snap` and `chain` are already canonical projections, so this
+            # calls the classifier's inner form directly. Going through
+            # `classify_append_only_prefix` would re-canonicalize both on every
+            # recorded lineage, which is ~30x the cost of the comparison itself
+            # on a long history.
+            if _classify_append_only_canonical(snap, chain) is not None:
                 best_key, best_len = key, len(chain)
 
         if best_key is None:
