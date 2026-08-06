@@ -28,7 +28,7 @@ from headroom.proxy.handlers.anthropic import (
     AnthropicHandlerMixin,
     _structural_bust_requires_fresh_5m,
 )
-from headroom.proxy.helpers import apply_session_sticky_ccr_tool, should_inject_ccr_tool
+from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 from headroom.proxy.models import ProxyConfig
 
 # --------------------------------------------------------------------------- #
@@ -455,41 +455,16 @@ class TestBustFlushZeroFrozenIsNoOp:
         assert not _structural_bust_requires_fresh_5m(0.1, -1)
 
 
-class TestBustFlushMutualExclusionWithMarkerOverride:
-    """J1(c): is_bust_flush and is_marker_override must never both fire --
-    is_bust_flush is only computed when `not should_inject`, and
-    is_marker_override implies should_inject=True already, so the two
-    branches are exclusive by construction. Verified against the real
-    should_inject_ccr_tool, and the is_bust_flush formula transcribed
-    verbatim from anthropic.py:3217-3223."""
-
-    @pytest.mark.parametrize(
-        "frozen_message_count,has_new_compressed_content,flush_into_forced_write",
-        [
-            (3, True, True),  # marker override should already cover this
-            (3, True, False),
-            (3, False, True),  # pure flush case
-            (3, False, False),  # neither fires
-            (0, True, False),  # no frozen prefix at all
-        ],
-    )
-    def test_exclusivity_holds(
-        self, frozen_message_count, has_new_compressed_content, flush_into_forced_write
-    ) -> None:
-        should_inject, is_marker_override = should_inject_ccr_tool(
-            configured_inject_tool=True,
-            frozen_message_count=frozen_message_count,
-            has_compressed_content=has_new_compressed_content,
-        )
-        # anthropic.py:3216-3223 verbatim:
-        is_bust_flush = False
-        if not should_inject and True and flush_into_forced_write:  # configured_inject_tool=True
-            should_inject = True
-            is_bust_flush = True
-        assert not (is_bust_flush and is_marker_override), (
-            f"double-fire: is_bust_flush={is_bust_flush} "
-            f"is_marker_override={is_marker_override}"
-        )
+# J1(c) asserted that is_bust_flush and is_marker_override could never both
+# fire. Upstream removed the gate those names belonged to: injection no longer
+# consults frozen_message_count at all, because that counter answers "is the
+# prefix warm?" when the decision needs "does the established prefix already
+# contain the tool?". Gating on it dropped tools that were already inside the
+# cached prefix, and since tools is the head of Anthropic's cache key, every
+# toggle invalidated the whole prefix in both directions. With should_inject
+# and is_marker_override gone, the exclusivity claim has no subjects left to
+# range over, so the test is retired rather than rewritten. The behaviour that
+# replaced it is covered by the apply_session_sticky_ccr_tool classes above.
 
 
 # --------------------------------------------------------------------------- #

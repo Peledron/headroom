@@ -87,7 +87,7 @@ class TestOpenAIModelLimits:
 
 class TestOpenAICostEstimation:
     def test_pricing_provenance_is_current(self):
-        assert _PRICING_LAST_UPDATED.isoformat() == "2026-07-13"
+        assert _PRICING_LAST_UPDATED.isoformat() == "2026-08-04"
         assert _PRICING_SOURCE_URL == "https://platform.openai.com/docs/pricing"
 
     @pytest.mark.parametrize(
