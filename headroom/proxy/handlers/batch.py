@@ -53,7 +53,12 @@ class BatchHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.ccr import CCRToolInjector
-        from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
+        from headroom.proxy.helpers import (
+            MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
+            _read_request_json,
+            get_body_too_large_status,
+        )
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -76,6 +81,17 @@ class BatchHandlerMixin:
         # Parse request
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge as e:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "code": get_body_too_large_status(),
+                        "message": f"{e!s}",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                },
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -804,7 +820,11 @@ class BatchHandlerMixin:
         """
         from fastapi.responses import JSONResponse, Response
 
-        from headroom.proxy.helpers import _read_request_json
+        from headroom.proxy.helpers import (
+            RequestBodyTooLarge,
+            _read_request_json,
+            get_body_too_large_status,
+        )
 
         start_time = time.time()
         request_id = await self._next_request_id()
@@ -812,6 +832,17 @@ class BatchHandlerMixin:
         # Parse request
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge as e:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "message": f"{e!s}",
+                        "type": "invalid_request_error",
+                        "code": "request_too_large",
+                    }
+                },
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -1207,6 +1238,7 @@ class BatchHandlerMixin:
 
         from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
         from headroom.proxy.helpers import (
+            RequestBodyTooLarge,
             _read_request_body_bytes,
             _strip_internal_headers,
             log_outbound_headers,
@@ -1230,8 +1262,12 @@ class BatchHandlerMixin:
         # Best effort: capture the original (decompressed) bytes so the
         # passthrough is truly byte-faithful. If the body was already
         # consumed upstream we fall through to canonical re-serialization.
+        # A size-policy rejection is never best-effort: the handler's 413
+        # path must see it, so re-raise instead of swallowing it here.
         try:
             original_body_bytes: bytes | None = await _read_request_body_bytes(request)
+        except RequestBodyTooLarge:
+            raise
         except Exception:
             original_body_bytes = None
 

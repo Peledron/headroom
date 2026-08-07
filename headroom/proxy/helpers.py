@@ -501,6 +501,14 @@ MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
 # Maximum SSE buffer size (10MB - prevents memory exhaustion from malformed streams)
 MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
 
+# Hard ceiling on the *decompressed* size of request bodies. Compressed
+# bodies (zstd/gzip/deflate/br) are expanded against this cap so a tiny
+# compressed request cannot balloon into an unbounded in-memory buffer
+# (decompression-bomb DoS). Mirrors MAX_REQUEST_BODY_SIZE: any payload that
+# would exceed the uncompressed request budget is rejected outright. Read at
+# call time so tests can shrink it without a module reload.
+MAX_DECOMPRESSED_BODY_BYTES = MAX_REQUEST_BODY_SIZE
+
 # Per-event SSE size cap (PR-A8 / P1-8). Configurable via
 # HEADROOM_SSE_BUFFER_MAX_BYTES. Guards against pathological huge events
 # (a single event > 1 MB by default is treated as an upstream protocol bug
@@ -1857,12 +1865,114 @@ def apply_session_sticky_ccr_tool(
     return tools_out, True
 
 
+class RequestBodyTooLarge(ValueError):
+    """A compressed request body expanded beyond the decompression cap.
+
+    Subclasses ``ValueError`` so the exception always degrades to a client
+    error even if a caller forgets to handle it explicitly. Handlers that
+    read request bodies MUST translate this into
+    :func:`get_body_too_large_status` (default 413) — never a 400, and
+    never a fail-open forward: a size-policy rejection is a client error
+    distinct from malformed JSON, and the whole point of the cap is that
+    the expanded body must never be materialized or forwarded. The
+    pristine message matters: it names the limit instead of the wrapped
+    decompressor error.
+    """
+
+
+def _enforce_decompression_cap(size: int, label: str) -> None:
+    """Raise :class:`RequestBodyTooLarge` if *size* exceeds the cap."""
+    max_output_bytes = MAX_DECOMPRESSED_BODY_BYTES
+    if size > max_output_bytes:
+        raise RequestBodyTooLarge(
+            f"{label} request body exceeds the {max_output_bytes}-byte decompression limit"
+        )
+
+
+def _decompress_capped(
+    decompressor: Any, data: bytes, *, label: str, out: bytearray | None = None
+) -> bytes:
+    """Incrementally decompress *data* (zlib ``decompressobj``) under a hard cap.
+
+    ``zlib.decompressobj.decompress(data, max_length)`` returns at most
+    ``max_length`` bytes per call and parks unconsumed input on
+    ``unconsumed_tail``, so feeding in bounded slices and checking the
+    running total keeps peak memory under ``MAX_DECOMPRESSED_BODY_BYTES``.
+    A decompression bomb becomes a clean :class:`RequestBodyTooLarge`
+    instead of an OOM kill. Pass *out* to accumulate across calls (used
+    for multi-member gzip) so the cap applies to the whole payload.
+    """
+    out = out if out is not None else bytearray()
+    remaining = data
+    while remaining and not decompressor.eof:
+        chunk = decompressor.decompress(remaining, 64 * 1024)
+        out.extend(chunk)
+        _enforce_decompression_cap(len(out), label)
+        remaining = decompressor.unconsumed_tail
+    # Input exhausted without the stream end marker: truncated. The old
+    # one-shot calls (gzip.decompress / zlib.decompress) raised on this;
+    # keep that behavior so the generic handler turns it into a 400.
+    # (The main loop always drains pending output via unconsumed_tail, so
+    # there is no buffered output left to flush here.)
+    if not decompressor.eof:
+        raise ValueError(f"truncated {label} stream")
+    return bytes(out)
+
+
+def _decompress_gzip_capped(data: bytes) -> bytes:
+    """Decompress *data*, including multi-member gzip, under the hard cap.
+
+    zlib's gzip mode stops at the end of the first member and parks the
+    remainder on ``unused_data``, whereas ``gzip.decompress()`` used to
+    decompress every member. Loop the members against one shared running
+    total so the cap applies to the whole payload, and reject trailing
+    bytes that are not another gzip member (old behavior raised
+    ``BadGzipFile`` on garbage).
+    """
+    import zlib
+
+    out = bytearray()
+    remaining = data
+    while True:
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        _decompress_capped(decompressor, remaining, label="gzip", out=out)
+        remaining = decompressor.unused_data
+        if not remaining:
+            break
+        if not remaining.startswith(b"\x1f\x8b"):
+            raise ValueError(f"unexpected trailing data after gzip stream ({len(remaining)} bytes)")
+    return bytes(out)
+
+
+def _decompress_zstd_capped(zstandard: Any, data: bytes) -> bytes:
+    """Decompress a zstd frame via its streaming reader, capped on output.
+
+    ``ZstdDecompressor.stream_reader`` can emit an unbounded output from a
+    small input; read it in bounded slices and enforce the same cap as the
+    zlib/brotli paths.
+    """
+    reader = zstandard.ZstdDecompressor().stream_reader(data)
+    try:
+        out = bytearray()
+        while True:
+            chunk = reader.read(64 * 1024)
+            if not chunk:
+                break
+            out.extend(chunk)
+            _enforce_decompression_cap(len(out), "zstd")
+        return bytes(out)
+    finally:
+        reader.close()
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
-    Raises ``ValueError`` on any decompression failure.
+    Raises ``ValueError`` on any decompression failure. Decompression is
+    bounded by ``MAX_DECOMPRESSED_BODY_BYTES`` so a small compressed body
+    cannot balloon into an unbounded in-memory buffer (decompression bomb).
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
@@ -1870,43 +1980,56 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     if encoding in ("zstd", "zstandard"):
         try:
             import zstandard
-
-            dctx = zstandard.ZstdDecompressor()
-            reader = dctx.stream_reader(raw)
-            raw = reader.read()
-            reader.close()
         except ImportError:
             raise ValueError(
                 "Request body is zstd-compressed but the 'zstandard' package is not installed. "
                 "Install it with: pip install zstandard"
             ) from None
+        try:
+            raw = _decompress_zstd_capped(zstandard, raw)
+        except RequestBodyTooLarge:
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
     elif encoding == "gzip":
-        import gzip as _gzip
+        import zlib
 
         try:
-            raw = _gzip.decompress(raw)
+            # zlib's gzip mode (wbits=31) gives us a bounded incremental API;
+            # gzip.decompress() has no output cap and would materialize a
+            # decompression bomb in full before we could reject it.
+            raw = _decompress_gzip_capped(raw)
+        except RequestBodyTooLarge:
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
     elif encoding == "deflate":
         import zlib
 
         try:
-            raw = zlib.decompress(raw)
+            decompressor = zlib.decompressobj()
+            raw = _decompress_capped(decompressor, raw, label="deflate")
+        except RequestBodyTooLarge:
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
     elif encoding == "br":
-        try:
-            import brotli
-
-            raw = brotli.decompress(raw)
-        except ImportError:
-            raise ValueError(
-                "Request body is brotli-compressed but the 'brotli' package is not installed."
-            ) from None
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress brotli request body: {exc}") from exc
+        # Brotli request bodies are rejected outright. The Python brotli
+        # bindings (brotli 1.2.0 and brotlicffi) expose no output-bounded
+        # streaming API: ``Decompressor.process(input_slice)`` returns ALL
+        # output produced from that slice before returning, so a highly
+        # compressible stream smaller than any feed slice can expand well
+        # past ``MAX_DECOMPRESSED_BODY_BYTES`` inside a single call — the
+        # exact allocation the cap exists to prevent. Rejecting the
+        # encoding (rather than decompressing) is the only way the
+        # process-wide decompression-bomb boundary holds for br; clients
+        # that send compressed request bodies can use gzip, deflate, or
+        # zstd, which all have bounded streaming APIs.
+        raise ValueError(
+            "Request body is brotli-compressed, but brotli request bodies are not "
+            "accepted: the Python brotli API cannot bound decompressed output "
+            "(decompression-bomb risk). Use Content-Encoding: gzip, deflate, or zstd."
+        )
     elif encoding and encoding != "identity":
         raise ValueError(f"Unsupported Content-Encoding: {encoding}")
 

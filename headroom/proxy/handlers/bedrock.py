@@ -76,9 +76,11 @@ class BedrockHandlerMixin:
         from headroom.proxy.helpers import (
             COMPRESSION_TIMEOUT_SECONDS,
             MAX_MESSAGE_ARRAY_LENGTH,
+            RequestBodyTooLarge,
             _headroom_bypass_enabled,
             _strip_internal_headers,
             extract_tags,
+            get_body_too_large_status,
             read_request_json_with_bytes,
         )
         from headroom.proxy.modes import is_cache_mode
@@ -126,8 +128,27 @@ class BedrockHandlerMixin:
 
         # Read the body up front so we can fail open to a verbatim forward on any
         # parse error (a malformed body is the gateway's problem, not ours).
+        # A size-policy rejection (decompression cap) is NOT a parse error:
+        # it must never fail open or forward the expanding body, or the
+        # decompression-bomb boundary is meaningless.
         try:
             body, raw = await read_request_json_with_bytes(request)
+        except RequestBodyTooLarge as e:
+            logger.warning(
+                "[%s] %s rejecting request body past decompression cap: %s",
+                request_id,
+                LOG_TAG,
+                e,
+            )
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "type": "request_too_large",
+                        "message": f"{e!s}",
+                    }
+                },
+            )
         except Exception as err:
             from starlette.requests import ClientDisconnect
 

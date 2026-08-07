@@ -269,7 +269,12 @@ class GeminiHandlerMixin:
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response
 
-        from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
+        from headroom.proxy.helpers import (
+            MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
+            _read_request_json,
+            get_body_too_large_status,
+        )
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -291,6 +296,16 @@ class GeminiHandlerMixin:
         # Parse request
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge as e:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "message": f"{e!s}",
+                        "code": get_body_too_large_status(),
+                    }
+                },
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -828,7 +843,11 @@ class GeminiHandlerMixin:
         """Handle Pi/OpenClaw Google Cloud Code Assist and Antigravity streaming requests."""
         from fastapi.responses import JSONResponse
 
-        from headroom.proxy.helpers import _read_request_json
+        from headroom.proxy.helpers import (
+            RequestBodyTooLarge,
+            _read_request_json,
+            get_body_too_large_status,
+        )
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -836,6 +855,16 @@ class GeminiHandlerMixin:
 
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge as e:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "message": f"{e!s}",
+                        "code": get_body_too_large_status(),
+                    }
+                },
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -994,7 +1023,11 @@ class GeminiHandlerMixin:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
         from fastapi.responses import JSONResponse
 
-        from headroom.proxy.helpers import _read_request_json
+        from headroom.proxy.helpers import (
+            RequestBodyTooLarge,
+            _read_request_json,
+            get_body_too_large_status,
+        )
 
         start_time = time.time()
         request_id = await self._next_request_id()
@@ -1002,6 +1035,16 @@ class GeminiHandlerMixin:
         # Parse request
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge as e:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "message": f"{e!s}",
+                        "code": get_body_too_large_status(),
+                    }
+                },
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -1084,7 +1127,11 @@ class GeminiHandlerMixin:
         """
         from fastapi.responses import JSONResponse, Response
 
-        from headroom.proxy.helpers import _read_request_json
+        from headroom.proxy.helpers import (
+            RequestBodyTooLarge,
+            _read_request_json,
+            get_body_too_large_status,
+        )
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1093,6 +1140,16 @@ class GeminiHandlerMixin:
         # Parse request
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge as e:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "message": f"{e!s}",
+                        "code": get_body_too_large_status(),
+                    }
+                },
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,

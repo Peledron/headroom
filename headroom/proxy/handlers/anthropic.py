@@ -1268,8 +1268,10 @@ class AnthropicHandlerMixin:
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
             _get_image_compressor,
             compute_turn_id,
+            get_body_too_large_status,
             read_request_json_with_bytes,
         )
         from headroom.proxy.modes import (
@@ -1423,6 +1425,18 @@ class AnthropicHandlerMixin:
             try:
                 async with stage_timer.measure("read_request_json"):
                     body, original_body_bytes = await read_request_json_with_bytes(request)
+            except RequestBodyTooLarge as e:
+                await _finalize_pre_upstream()
+                return JSONResponse(
+                    status_code=get_body_too_large_status(),
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "request_too_large",
+                            "message": f"{e!s}",
+                        },
+                    },
+                )
             except (json.JSONDecodeError, ValueError) as e:
                 await _finalize_pre_upstream()
                 return JSONResponse(
@@ -6331,7 +6345,12 @@ class AnthropicHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.ccr import CCRToolInjector
-        from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
+        from headroom.proxy.helpers import (
+            MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
+            _read_request_json,
+            get_body_too_large_status,
+        )
         from headroom.proxy.modes import is_cache_mode
         from headroom.utils import extract_user_query
 
@@ -6355,6 +6374,17 @@ class AnthropicHandlerMixin:
         # Parse request
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge as e:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "request_too_large",
+                        "message": f"{e!s}",
+                    },
+                },
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
