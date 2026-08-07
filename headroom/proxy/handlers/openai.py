@@ -2663,6 +2663,7 @@ class OpenAIHandlerMixin:
             MAX_REQUEST_BODY_SIZE,
             RequestBodyTooLarge,
             _read_request_json,
+            content_length_exceeds,
             get_body_too_large_status,
         )
         from headroom.proxy.modes import (
@@ -2685,7 +2686,7 @@ class OpenAIHandlerMixin:
 
         # Check request body size
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+        if content_length_exceeds(content_length):
             return JSONResponse(
                 status_code=413,
                 content={
@@ -4615,6 +4616,7 @@ class OpenAIHandlerMixin:
         from headroom.proxy.helpers import (
             MAX_REQUEST_BODY_SIZE,
             RequestBodyTooLarge,
+            content_length_exceeds,
             get_body_too_large_status,
             read_request_json_with_bytes,
         )
@@ -4633,7 +4635,7 @@ class OpenAIHandlerMixin:
 
         # Check request body size
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+        if content_length_exceeds(content_length):
             return JSONResponse(
                 status_code=413,
                 content={

@@ -1340,6 +1340,7 @@ class AnthropicHandlerMixin:
             RequestBodyTooLarge,
             _get_image_compressor,
             compute_turn_id,
+            content_length_exceeds,
             get_body_too_large_status,
             read_request_json_with_bytes,
         )
@@ -1471,7 +1472,7 @@ class AnthropicHandlerMixin:
         try:
             # Check request body size
             content_length = request.headers.get("content-length")
-            if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+            if content_length_exceeds(content_length):
                 await _finalize_pre_upstream()
                 return JSONResponse(
                     status_code=413,
@@ -2059,7 +2060,17 @@ class AnthropicHandlerMixin:
             # straight through to `tokenizer.count_messages`, and the memo is
             # bound to the tokenizer instance so a mid-session swap resets it
             # rather than serving counts computed under a different tokenizer.
-            _token_count_memo = self._get_token_count_memo(session_id)
+            # The memo is a pure speed-up, so a handler that predates it must
+            # still serve the request. Lightweight handler doubles in this
+            # fork's tests do not implement _get_token_count_memo, and a hard
+            # AttributeError here turned a perf optimisation into a request
+            # failure. Absent a memo, count_messages_memoized falls through to
+            # the tokenizer and the only cost is the recount.
+            _token_count_memo = (
+                self._get_token_count_memo(session_id)
+                if hasattr(self, "_get_token_count_memo")
+                else None
+            )
 
             def _count_msgs(
                 msgs: list[dict[str, Any]],
@@ -6469,6 +6480,7 @@ class AnthropicHandlerMixin:
             MAX_REQUEST_BODY_SIZE,
             RequestBodyTooLarge,
             _read_request_json,
+            content_length_exceeds,
             get_body_too_large_status,
         )
         from headroom.proxy.modes import is_cache_mode
@@ -6479,7 +6491,7 @@ class AnthropicHandlerMixin:
 
         # Check request body size
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+        if content_length_exceeds(content_length):
             return JSONResponse(
                 status_code=413,
                 content={

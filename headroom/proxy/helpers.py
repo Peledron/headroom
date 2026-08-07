@@ -509,6 +509,25 @@ MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
 # call time so tests can shrink it without a module reload.
 MAX_DECOMPRESSED_BODY_BYTES = MAX_REQUEST_BODY_SIZE
 
+
+def content_length_exceeds(content_length: str | None, limit: int = MAX_REQUEST_BODY_SIZE) -> bool:
+    """True when a Content-Length header declares more than ``limit`` bytes.
+
+    Handlers used to call ``int(content_length)`` directly, so a header that was
+    not a base-10 integer ("1.5", "0x10", " ", "not-a-number") raised ValueError
+    out of the size guard itself, before any handler could turn it into a
+    response. A malformed Content-Length is a malformed request, so it is
+    reported as over-limit and refused rather than crashing or being waved
+    through. An absent or empty header is not a size claim and returns False,
+    which leaves the body-read cap as the real bound.
+    """
+    if not content_length:
+        return False
+    try:
+        return int(content_length) > limit
+    except (TypeError, ValueError):
+        return True
+
 # Per-event SSE size cap (PR-A8 / P1-8). Configurable via
 # HEADROOM_SSE_BUFFER_MAX_BYTES. Guards against pathological huge events
 # (a single event > 1 MB by default is treated as an upstream protocol bug
@@ -1951,6 +1970,12 @@ def _decompress_zstd_capped(zstandard: Any, data: bytes) -> bytes:
     small input; read it in bounded slices and enforce the same cap as the
     zlib/brotli paths.
     """
+    if not data:
+        # gzip and deflate both raise on a zero-length body ("truncated stream").
+        # zstd's stream_reader treats the immediate empty read as a clean EOF and
+        # returned b"", so the same malformed request was refused on two codecs
+        # and accepted on the third. Match the other two.
+        raise ValueError("truncated zstd stream")
     reader = zstandard.ZstdDecompressor().stream_reader(data)
     try:
         out = bytearray()
@@ -1976,6 +2001,15 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
+
+    if encoding in ("", "identity"):
+        # Nothing to inflate, but "nothing to inflate" is not "nothing to check".
+        # This branch returned the body unread-past, so a plain uncompressed
+        # request sailed past the ceiling every compressed one is held to. The
+        # cap is a memory bound, and an uncompressed body occupies exactly as
+        # much memory as a decompressed one.
+        _enforce_decompression_cap(len(raw), encoding or "identity")
+        return raw
 
     if encoding in ("zstd", "zstandard"):
         try:

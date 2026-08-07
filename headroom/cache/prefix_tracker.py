@@ -710,7 +710,17 @@ def _is_message_continuation(recorded: Any, incoming: Any) -> bool:
     new = incoming.get("content")
     if not (isinstance(old, list) and isinstance(new, list)):
         return False
-    if not old or len(new) < len(old):
+    # Strictly longer, not merely no-shorter. "Grown in place" means the message
+    # gained content, so an incoming message of the SAME block count is not
+    # growth however well its edges line up. Accepting equal lengths let two
+    # unrelated conversations under one session id be judged continuations of
+    # each other whenever they shared a large enough artifact: quote one
+    # 20-block document into two sibling sub-agent prompts, end both with the
+    # same boilerplate instruction, and the leading-run and final-block tests
+    # both pass while the messages differ only in the middle. That is #2085,
+    # and the second caller's first-ever message would take over the first
+    # caller's tracker.
+    if not old or len(new) <= len(old):
         return False
     if old[-1] != new[-1]:
         return False
@@ -778,7 +788,16 @@ def _breakpoint_index(
     # before its end) and covers most of the message. A short run would cache
     # less than the newest-block placement writes, which is a worse trade even
     # though it reads.
-    if 1 <= run < len(content) and run * 2 >= len(content):
+    #
+    # `run < len(previous_blocks)` is what makes "diverged" true rather than
+    # merely assumed. A message that only ever APPENDS blocks has all of last
+    # turn's content as its stable run, so run == len(previous_blocks) and
+    # nothing diverged at all. Without this test that shape relocated from its
+    # second turn onward and then stayed pinned one block behind forever,
+    # permanently excluding every freshly appended block from the write. That
+    # is the case the docstring above says newest is right for.
+    diverged = run < len(previous_blocks)
+    if diverged and 1 <= run < len(content) and run * 2 >= len(content):
         logger.debug(
             "cache breakpoint anchored to the stable run of %d/%d blocks in message %d "
             "(its newest block varies turn over turn)",
@@ -803,6 +822,13 @@ def normalize_message_cache_control(
     replays the markers that rode on each turn's then-newest message. Anthropic
     hard-errors at **>4 cache_control blocks total** (system + tools + messages),
     so on a long conversation the accumulation eventually 400s.
+
+    Scope, stated exactly because "exactly one always survives" is not true in
+    every shape: this strips every message-level cache_control, both the
+    block-level ones and a cache_control sitting directly on the message, and
+    re-places a single marker on the last message whose content is a non-empty
+    list of blocks. A conversation whose target message carries a plain string
+    or an empty list has no block to put a marker on and ends up with none.
 
     Fix: strip EVERY message-level cache_control and re-place a **single**
     ephemeral breakpoint. One breakpoint caches the whole message prefix up to
@@ -867,6 +893,17 @@ def normalize_message_cache_control(
     # are replay leftovers.
     last_marker: dict[str, Any] | None = None
     for i, msg in enumerate(messages):
+        # A cache_control sitting on the MESSAGE, sibling to content rather than
+        # inside a block, is a shape the API accepts and clients do send. The
+        # block scan below never sees it, so it used to survive every turn
+        # untouched: six such messages left seven live markers, past the hard
+        # four-breakpoint limit this function exists to enforce. Strip it here
+        # and let it feed marker selection like any block-level one.
+        if isinstance(msg, dict) and "cache_control" in msg:
+            if isinstance(msg["cache_control"], dict):
+                last_marker = msg["cache_control"]
+            msg = {k: v for k, v in msg.items() if k != "cache_control"}
+            changed = True
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list):
             had = False

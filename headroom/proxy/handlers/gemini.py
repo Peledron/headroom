@@ -273,6 +273,7 @@ class GeminiHandlerMixin:
             MAX_REQUEST_BODY_SIZE,
             RequestBodyTooLarge,
             _read_request_json,
+            content_length_exceeds,
             get_body_too_large_status,
         )
         from headroom.utils import extract_user_query
@@ -282,7 +283,7 @@ class GeminiHandlerMixin:
 
         # Check request body size
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+        if content_length_exceeds(content_length):
             return JSONResponse(
                 status_code=413,
                 content={
