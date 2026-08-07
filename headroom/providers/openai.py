@@ -153,7 +153,15 @@ _CONTEXT_LIMITS: dict[str, int] = {
 # model_cost; keep the newer families explicit, because these are matched by
 # prefix and "gpt-4.1" would otherwise fall into "gpt-4" and be priced at the
 # legacy $30/$60 -- 15x its real rate, and 300x for gpt-4.1-nano.
-_PRICING: dict[str, tuple[float, float]] = {
+# Entries are (input, output) or (input, cached_input, output) where the
+# model publishes a distinct cached-input rate. _get_pricing passes either
+# shape through and _estimate_cost_manual normalises it.
+_PRICING: dict[str, tuple[float, float] | tuple[float, float, float]] = {
+    # gpt-5.6 family, standard processing, verified 2026-08-04. These publish
+    # a cached-input rate at a tenth of input, so they carry the 3-tuple form.
+    "gpt-5.6-sol": (5.00, 0.50, 30.00),
+    "gpt-5.6-terra": (2.50, 0.25, 15.00),
+    "gpt-5.6-luna": (1.00, 0.10, 6.00),
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4.1": (2.00, 8.00),
@@ -477,7 +485,9 @@ class OpenAIProvider(Provider):
         # Handle pricing (can be tuple or list from JSON). Tracked separately as
         # well: an explicitly configured price is a user decision and must beat
         # the LiteLLM lookup, whereas the built-in table is only a fallback.
-        self._pricing_overrides: dict[str, tuple[float, float]] = {}
+        self._pricing_overrides: dict[
+            str, tuple[float, float] | tuple[float, float, float]
+        ] = {}
         for model, pricing in custom_config["pricing"].items():
             if isinstance(pricing, list | tuple) and len(pricing) >= 2:
                 self._pricing[model] = (float(pricing[0]), float(pricing[1]))
@@ -664,12 +674,29 @@ class OpenAIProvider(Provider):
         if pricing is None:
             return None
 
-        input_price, cached_input_price, output_price = pricing
+        # Pricing sources disagree on arity. The _PRICING table, LiteLLM's
+        # pricing_per_1m and the config overrides all yield (input, output),
+        # while _UNKNOWN_OPENAI_DEFAULT carries an explicit cached rate as
+        # (input, cached, output). Unpacking three names unconditionally
+        # raised ValueError on every model that resolved through a 2-tuple,
+        # which is all of them but the unknown default. Normalise here and
+        # let effective_cached_price fall back to the input rate when no
+        # cached rate is published.
+        if len(pricing) == 3:
+            input_price, cached_input_price, output_price = pricing
+        else:
+            input_price, output_price = pricing
+            cached_input_price = None
         input_count = max(0, input_tokens)
         cached_count = min(max(0, cached_tokens), input_count)
         uncached_count = input_count - cached_count
+        # A model with no published cached-input rate is estimated at half the
+        # input rate. That is the convention _UNKNOWN_OPENAI_DEFAULT already
+        # encodes as (2.50, 1.25, 10.00), and it matches the discount the
+        # original implementation applied before its branch was stranded
+        # behind an early return.
         effective_cached_price = (
-            input_price if cached_input_price is None else cached_input_price
+            input_price * 0.5 if cached_input_price is None else cached_input_price
         )
         return (
             uncached_count * input_price
@@ -686,7 +713,9 @@ class OpenAIProvider(Provider):
 
         return cached_cost + regular_cost + output_cost
 
-    def _get_pricing(self, model: str) -> tuple[float, float] | None:
+    def _get_pricing(
+        self, model: str
+    ) -> tuple[float, float] | tuple[float, float | None, float] | None:
         """Get pricing for a model, preferring LiteLLM over the built-in table.
 
         Resolution order, mirroring ``get_context_limit`` so the two agree:
@@ -731,12 +760,11 @@ class OpenAIProvider(Provider):
 
         family = _infer_model_family(model)
         if family and family in _PATTERN_DEFAULTS:
-            return cast(
-                tuple[float, float | None, float],
-                _PATTERN_DEFAULTS[family]["pricing"],
-            )
+            return cast(tuple[float, float], _PATTERN_DEFAULTS[family]["pricing"])
 
-        return cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
+        return cast(
+            tuple[float, float | None, float], _UNKNOWN_OPENAI_DEFAULT["pricing"]
+        )
 
     def _warn_pricing_fallback(self, model: str) -> None:
         """Warn once per model that pricing came from the built-in table."""
