@@ -737,6 +737,17 @@ class OpenAIProvider(Provider):
         if override is not None:
             return override
 
+        # 1b. A built-in entry carrying an explicit cached-input rate outranks
+        #     LiteLLM. pricing_per_1m returns (input, output) and has no way to
+        #     express a cached rate, so resolving such a model through LiteLLM
+        #     silently drops a published price and, for the gpt-5.6 family, also
+        #     disagrees on input and output because LiteLLM is quoting a
+        #     different processing tier. Two-value entries keep LiteLLM first,
+        #     which is what demoted this table to a fallback in the first place.
+        builtin = self._pricing.get(model)
+        if builtin is not None and len(builtin) == 3:
+            return builtin
+
         # 2. LiteLLM.
         from headroom.pricing.litellm_pricing import pricing_per_1m
 
