@@ -4,7 +4,7 @@ A full-featured LLM proxy with optimization, caching, rate limiting,
 and observability.
 
 Features:
-- Context optimization (SmartCrusher, CacheAligner — live-zone-only after Phase B)
+- Context optimization (ContentRouter/SmartCrusher — live-zone-only after Phase B)
 - Semantic caching (save costs on repeated queries)
 - Rate limiting (token bucket)
 - Retry with exponential backoff
@@ -46,6 +46,7 @@ from urllib.parse import urlsplit
 if TYPE_CHECKING:
     from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
+    from ..cache.token_count_memo import TokenCountMemo
     from ..memory.tracker import MemoryTracker
     from .outcome import RequestOutcome
 
@@ -81,7 +82,6 @@ from headroom.ccr import (
 )
 from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
-    CacheAlignerConfig,
     ReadLifecycleConfig,
 )
 from headroom.dashboard import get_dashboard_html
@@ -184,7 +184,6 @@ from headroom.telemetry import get_telemetry_collector
 from headroom.telemetry.beacon import is_telemetry_enabled
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
-    CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
     CompressionStrategy,
@@ -994,7 +993,6 @@ class HeadroomProxy(
                 return router_config
             return replace(router_config, enable_kompress=not kompress_disabled)
 
-        cache_aligner = CacheAligner(CacheAlignerConfig(enabled=False))
         anthropic_router = ContentRouter(
             _router_config_for(anthropic_kompress_disabled), observer=self.metrics
         )
@@ -1012,11 +1010,11 @@ class HeadroomProxy(
             _intercept_prefix = [ToolResultInterceptorTransform()]
 
         self.anthropic_pipeline = TransformPipeline(
-            transforms=[*_intercept_prefix, cache_aligner, anthropic_router],
+            transforms=[*_intercept_prefix, anthropic_router],
             provider=self.anthropic_provider,
         )
         self.openai_pipeline = TransformPipeline(
-            transforms=[*_intercept_prefix, cache_aligner, openai_router],
+            transforms=[*_intercept_prefix, openai_router],
             provider=self.openai_provider,
         )
         # Build the DEFAULT /v1/compress pipeline now, not on first request.
@@ -1143,10 +1141,16 @@ class HeadroomProxy(
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
         # `CompressionCache` instances have their own internal lock guarding
-        # `_cache`/`_stable_hashes`/`_first_seen` against concurrent
+        # `_cache`/`_stable_hashes` against concurrent
         # async-dispatched requests for the same session.
         self._compression_caches: dict[str, CompressionCache] = {}
         self._compression_caches_lock = threading.RLock()
+
+        # Per-session memoized message token counts (perf review F2). Same
+        # session-scoped-dict + eviction pattern as `_compression_caches`;
+        # each `TokenCountMemo` has its own internal lock guarding `_counts`.
+        self._token_count_memos: dict[str, TokenCountMemo] = {}
+        self._token_count_memos_lock = threading.RLock()
 
         self.logger = (
             RequestLogger(
@@ -1683,6 +1687,30 @@ class HeadroomProxy(
 
                 self._compression_caches[session_id] = CompressionCache()
             return self._compression_caches[session_id]
+
+    def _get_token_count_memo(self, session_id: str) -> TokenCountMemo:
+        """Get or create a TokenCountMemo for a session (perf review F2).
+
+        Same thread-safety and eviction contract as `_get_compression_cache`.
+        """
+        with self._token_count_memos_lock:
+            if session_id not in self._token_count_memos:
+                from headroom.cache.token_count_memo import TokenCountMemo
+
+                if len(self._token_count_memos) >= MAX_COMPRESSION_CACHE_SESSIONS:
+                    oldest_keys = list(self._token_count_memos.keys())[
+                        : MAX_COMPRESSION_CACHE_SESSIONS // 4
+                    ]
+                    for key in oldest_keys:
+                        del self._token_count_memos[key]
+                    logger.info(
+                        "Evicted %d token-count memos (exceeded %d max sessions)",
+                        len(oldest_keys),
+                        MAX_COMPRESSION_CACHE_SESSIONS,
+                    )
+
+                self._token_count_memos[session_id] = TokenCountMemo()
+            return self._token_count_memos[session_id]
 
     def _setup_code_aware(self, config: ProxyConfig, transforms: list) -> str:
         """Set up code-aware compression if enabled.

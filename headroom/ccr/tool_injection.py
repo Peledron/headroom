@@ -144,6 +144,42 @@ in tool results to find the hash for each compressed output.
 """
 
 
+def create_stable_system_instructions(
+    retrieval_endpoint: str = "/v1/retrieve",
+) -> str:
+    """Create session-stable CCR retrieval instructions (no hash list).
+
+    Same purpose as ``create_system_instructions`` but WITHOUT the per-turn
+    ``**Available hashes:**`` list. Once a session injects this text, it must
+    stay byte-identical every subsequent turn or the segment it lives in
+    busts the provider's prompt cache each time the enumerated hashes change.
+    The model can always find a compressed output's hash from the marker
+    already present in that tool result (``[N items compressed to M.
+    Retrieve more: hash=abc123]``), so the separate list was redundant, not
+    load-bearing.
+
+    Args:
+        retrieval_endpoint: The endpoint path for retrieval (unused in the
+            text today, kept for signature parity with
+            ``create_system_instructions``).
+
+    Returns:
+        Static instruction text to append to the system prompt.
+    """
+    return f"""
+## Compressed Context Available
+
+Some tool outputs have been compressed to reduce context size. If you need
+the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
+
+**How to retrieve:**
+- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
+
+Look for markers like `[N items compressed to M. Retrieve more: hash=abc123]`
+in tool results to find the hash for each compressed output.
+"""
+
+
 @dataclass
 class CCRToolInjector:
     """Manages CCR tool injection into LLM requests.
@@ -362,8 +398,12 @@ class CCRToolInjector:
         if not self.inject_system_instructions or not self.has_compressed_content:
             return messages
 
-        instructions = create_system_instructions(
-            self._detected_hashes,
+        # Use the hash-free stable variant. create_system_instructions embeds
+        # an "Available hashes" list that changes every turn as new content is
+        # compressed, which busts the provider's prompt cache on the system
+        # segment. The list is redundant — each compressed tool result carries
+        # its own retrievable hash in its marker — so drop it here.
+        instructions = create_stable_system_instructions(
             self.retrieval_endpoint,
         )
 

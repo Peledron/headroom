@@ -6,12 +6,10 @@ Maps original content hashes to their compressed versions.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import logging
 import threading
-import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -77,16 +75,22 @@ def _extract_tool_result_content(msg: dict) -> str | None:
 
 
 def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
-    """Deep copy msg and replace tool result content with new_content."""
-    new_msg = copy.deepcopy(msg)
+    """Shallow-copy msg and replace tool result content with new_content.
+
+    Only the message dict, its content list, and the swapped tool_result
+    block are copied; sibling blocks stay shared refs with the input. Safe
+    because nothing downstream mutates message/block dicts in place (Phase 2
+    mutation audit) — a deepcopy here bought no safety, only cost, and ran
+    inside the cache lock (perf review F4).
+    """
     # OpenAI format
-    if new_msg.get("role") == "tool":
-        new_msg["content"] = new_content
-        return new_msg
+    if msg.get("role") == "tool":
+        return {**msg, "content": new_content}
     # Anthropic format
-    content = new_msg.get("content")
+    content = msg.get("content")
     if isinstance(content, list):
-        for block in content:
+        new_content_list = list(content)
+        for i, block in enumerate(new_content_list):
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 inner = block.get("content")
                 if isinstance(inner, list):
@@ -95,11 +99,13 @@ def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
                     # multiple text blocks would produce a different joined
                     # output on re-extraction (first text block replaced,
                     # remaining text blocks still joined).
-                    block["content"] = [{"type": "text", "text": new_content}]
+                    new_block_content: str | list = [{"type": "text", "text": new_content}]
                 else:
-                    block["content"] = new_content
+                    new_block_content = new_content
+                new_content_list[i] = {**block, "content": new_block_content}
                 break
-    return new_msg
+        return {**msg, "content": new_content_list}
+    return dict(msg)
 
 
 class CompressionCache:
@@ -116,7 +122,7 @@ class CompressionCache:
         # session (Claude Code background tools, parallel agents, etc.) into
         # `asyncio.to_thread` workers — without this, two concurrent
         # requests for the same `session_id` race on `_cache`,
-        # `_stable_hashes`, `_first_seen`, and `_total_tokens_saved`. The
+        # `_stable_hashes`, and `_total_tokens_saved`. The
         # observable failures are (a) lost-update on `_total_tokens_saved`,
         # (b) `OrderedDict mutated during iteration` in `apply_cached`, and
         # (c) lost stable-hash records that drop the next-turn cache lookup.
@@ -136,7 +142,6 @@ class CompressionCache:
         # `proxy/handlers/anthropic.py`) and `update_from_result`'s
         # "unchanged content" tracking.
         self._stable_hashes: set[str] = set()
-        self._first_seen: dict[str, float] = {}
         self._hits: int = 0
         self._misses: int = 0
         self._total_tokens_saved: int = 0
@@ -190,40 +195,6 @@ class CompressionCache:
                     content = _extract_tool_result_content(msg)
                     if content is not None:
                         self._stable_hashes.add(self.content_hash(content))
-
-    def should_defer_compression(
-        self,
-        content_hash: str,
-        ttl_seconds: float = 300.0,
-        batch_window: float = 30.0,
-    ) -> bool:
-        """Whether to defer compressing this content to avoid mid-TTL busts.
-
-        Returns True if we have evidence this content has been re-sent
-        within the cache TTL window — recompressing it now would bust an
-        existing prefix-cache entry without TTL-amortizing the bust over
-        future turns. Returns False otherwise:
-
-        - **First sight** of the content. Compress now: there is no
-          prefix-cache entry to preserve yet (this byte range was not in
-          a prior request), so compression carries no bust cost. Issue
-          #327: a previous version returned True here, which marked the
-          freshest tool_result on every turn as "stable" and effectively
-          disabled compression for typical Claude Code workloads where
-          each tool_result is unique-per-turn.
-        - **Near the TTL boundary**: compress now and amortize the bust
-          across future turns (batched recompression).
-        """
-        with self._lock:
-            now = time.time()
-            first_seen = self._first_seen.get(content_hash)
-            if first_seen is None:
-                self._first_seen[content_hash] = now
-                return False  # First time — compress now (no cache entry to preserve)
-            age = now - first_seen
-            if age >= ttl_seconds - batch_window:
-                return False  # Near TTL boundary — compress now (batch window)
-            return True  # Seen recently within TTL — defer to preserve cache
 
     def get_stats(self) -> dict:
         """Return cache statistics."""
@@ -310,6 +281,78 @@ class CompressionCache:
                             continue
                 result.append(msg)
             return result
+
+    def prepare_turn(
+        self, messages: list[dict], tracker_frozen_count: int
+    ) -> tuple[int, list[dict]]:
+        """Single-pass replacement for compute_frozen_count + mark_stable_from_messages + apply_cached.
+
+        Extracts and hashes each tool_result exactly ONCE instead of 3-4
+        times per request (perf review F4). Returns ``(frozen_count,
+        working_messages)``:
+
+        - ``frozen_count``: identical semantics to ``compute_frozen_count``
+          plus the caller's ``min(frozen_message_count, cache_frozen_count)``
+          clamp (including the trailing-message live-zone cap) — pass in
+          the provider-confirmed ``tracker_frozen_count`` and get the final
+          clamped value back directly.
+        - ``working_messages``: identical to ``apply_cached(messages)`` —
+          cached compressions swapped in where available. Computing this is
+          free here (same walk); callers that skip compression this turn
+          (e.g. deferred tool injection) may simply ignore it and use
+          ``messages`` directly. Note: because the skip decision depends on
+          the frozen count this method returns, the swap lookup runs before
+          the caller can know it will skip — so hit/miss stats and the LRU
+          recency touch fire on skip turns too (the old ``apply_cached``
+          wasn't called there). Telemetry-only drift; the touched entries
+          are genuinely in active use, so the recency signal stays honest.
+
+        Content extraction + hashing happen BEFORE the lock is acquired —
+        the lock only needs to guard ``_cache``/``_stable_hashes`` access
+        (perf review F4 lock-hygiene note).
+        """
+        # `hashes[i]` is None for non-tool_result messages or tool_results
+        # with non-string/unextractable content (mirrors the "treat as
+        # unstable" branch in the old `compute_frozen_count`).
+        hashes: list[str | None] = [None] * len(messages)
+        for i, msg in enumerate(messages):
+            if _is_tool_result_message(msg):
+                content = _extract_tool_result_content(msg)
+                if content is not None:
+                    hashes[i] = self.content_hash(content)
+
+        with self._lock:
+            # (a) compute_frozen_count equivalent, using pre-mark state —
+            # matches the original call order (frozen count computed BEFORE
+            # mark_stable_from_messages runs).
+            count = 0
+            for i, msg in enumerate(messages):
+                if _is_tool_result_message(msg):
+                    h = hashes[i]
+                    if h is None or (h not in self._cache and h not in self._stable_hashes):
+                        break
+                count += 1
+            local_frozen_count = min(count, max(0, len(messages) - 1))
+            frozen_count = min(tracker_frozen_count, local_frozen_count)
+
+            # (b) mark_stable_from_messages(messages, frozen_count) equivalent.
+            for i in range(frozen_count):
+                h = hashes[i]
+                if h is not None:
+                    self._stable_hashes.add(h)
+
+            # (c) apply_cached equivalent.
+            working_messages: list[dict] = []
+            for i, msg in enumerate(messages):
+                h = hashes[i]
+                if h is not None:
+                    compressed = self.get_compressed(h)
+                    if compressed is not None:
+                        working_messages.append(_swap_tool_result_content(msg, compressed))
+                        continue
+                working_messages.append(msg)
+
+        return frozen_count, working_messages
 
     def update_from_result(self, originals: list[dict], compressed: list[dict]) -> None:
         """Cache new compressions by comparing original and compressed messages.

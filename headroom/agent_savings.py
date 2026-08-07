@@ -279,6 +279,12 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
     compression knobs should be consistent across Claude, Codex, and Cursor.
     """
 
+    # NOTE: defer_waste_signals is intentionally NOT set here. This dict feeds
+    # every provider handler (Anthropic, OpenAI, Gemini, batch endpoints), but
+    # only the Anthropic messages route has the off-path background task that
+    # compensates for deferral; deferring everywhere silently dropped
+    # waste-signal telemetry on the other routes. The Anthropic handler passes
+    # defer_waste_signals=True explicitly at its covered call sites.
     kwargs: dict[str, object] = {}
     # Hybrid owns cache-safe mutation economics. Passing the mode into the
     # content router makes its per-message net-cost gate part of that subsystem

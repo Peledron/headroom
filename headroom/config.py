@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -807,6 +807,13 @@ class TransformResult:
     cache_metrics: CachePrefixMetrics | None = None  # Populated by CacheAligner
     timing: dict[str, float] = field(default_factory=dict)  # transform_name → ms
     waste_signals: WasteSignals | None = None  # Detected waste in original messages
+    # Deferred-mode escape hatch: when the pipeline ran with
+    # defer_waste_signals=True and the inline gate would have parsed, this
+    # zero-arg closure performs that exact parse (same message refs, same
+    # tokenizer, same token gate already applied). Callers run it off the
+    # request path and feed the result into the outcome funnel. None when the
+    # gate declined or deferral was off.
+    waste_signals_provider: Callable[[], WasteSignals | None] | None = None
 
     @property
     def transforms_summary(self) -> dict[str, int]:

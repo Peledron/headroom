@@ -3884,6 +3884,7 @@ class OpenAIHandlerMixin:
                         prefix_tracker=openai_prefix_tracker,
                         optimized_messages=optimized_messages,
                         backend=request_backend,
+                        original_messages=original_client_messages,
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
@@ -4100,6 +4101,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=optimized_messages,
+                        original_messages=original_client_messages,
                     )
 
                     await self._record_request_outcome(
@@ -4429,6 +4431,7 @@ class OpenAIHandlerMixin:
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                     messages=optimized_messages,
+                    original_messages=original_client_messages,
                 )
 
                 # OpenAI has no write penalty — uncached = total - cached
@@ -4772,7 +4775,9 @@ class OpenAIHandlerMixin:
         # chat handler uses so multi-endpoint clients within one
         # conversation share the sticky-token set.
         _responses_session_id = self.session_tracker_store.compute_session_id(
-            request, model, messages
+            request,
+            model,
+            messages,
         )
         from headroom.proxy.helpers import (
             get_session_beta_tracker as _get_session_beta_tracker_resp,
