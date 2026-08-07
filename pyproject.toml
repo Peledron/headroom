@@ -343,6 +343,7 @@ headroom = "headroom.cli:main"
 headroom-bootstrap-agent-tools = "headroom.cli.bootstrap_agent_tools:main"
 headroom-codex-tool-budget = "headroom.cli.codex_tool_budget:main"
 headroom-claude-tool-budget = "headroom.cli.claude_tool_budget:main"
+headroom-cache-ttl = "headroom.cache.ttl_estimator:main"
 
 [project.urls]
 Homepage = "https://headroom-docs.vercel.app"
