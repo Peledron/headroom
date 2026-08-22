@@ -16,6 +16,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
 
 from .base import Provider, TokenCounter
@@ -34,12 +35,7 @@ _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 # Models whose price came from the built-in table rather than LiteLLM.
 _PRICING_FALLBACK_WARNINGS: set[str] = set()
 
-try:
-    import tiktoken
-
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
+TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
@@ -225,6 +221,11 @@ def _load_custom_model_config() -> dict[str, Any]:
                 # Try to parse as JSON string
                 loaded = json.loads(env_config)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
+                )
+
             openai_config = loaded.get("openai", loaded)
             if "context_limits" in openai_config:
                 config["context_limits"].update(openai_config["context_limits"])
@@ -234,7 +235,10 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["encodings"].update(openai_config["encodings"])
 
             logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            # ValueError covers json.JSONDecodeError (a subclass) and the
+            # non-object guard above, so a malformed value warns and falls back
+            # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
     # Check config file. Prefer the canonical config-dir location, then fall
@@ -248,6 +252,9 @@ def _load_custom_model_config() -> dict[str, Any]:
         try:
             with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
+
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{config_file} must contain a JSON object")
 
             openai_config = loaded.get("openai", {})
             if "context_limits" in openai_config:
@@ -264,7 +271,7 @@ def _load_custom_model_config() -> dict[str, Any]:
                         config["encodings"][model] = encoding
 
             logger.debug(f"Loaded custom OpenAI model config from {config_file}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config
@@ -306,12 +313,21 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get tiktoken encoding, cached."""
+    """Get tiktoken encoding, cached.
+
+    Routes through the bounded loader so a stalled vocab download raises
+    :class:`~headroom.tokenizers.tiktoken_counter.TiktokenLoadError` after a
+    timeout instead of hanging the caller indefinitely — ``tiktoken`` fetches
+    vocabularies with no network timeout, and this runs on whatever thread
+    first counts tokens for a model, including proxy startup (GH #956).
+    """
     if not TIKTOKEN_AVAILABLE:
         raise RuntimeError(
             "tiktoken is required for OpenAI provider. Install with: pip install tiktoken"
         )
-    return tiktoken.get_encoding(encoding_name)
+    from ..tokenizers.tiktoken_counter import load_encoding
+
+    return load_encoding(encoding_name)
 
 
 def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = None) -> str | None:
@@ -364,6 +380,8 @@ class OpenAITokenCounter:
 
         Raises:
             RuntimeError: If tiktoken is not installed.
+            TiktokenLoadError: If the encoding's vocabulary can't be loaded
+                within the bounded timeout (e.g. stalled download).
         """
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
@@ -530,7 +548,9 @@ class OpenAIProvider(Provider):
         the proxy pipeline resolves its tokenizer through this provider while
         handlers resolve through the tokenizer registry, the two disagree about
         the same request — savings become a difference of two rulers. Defer to
-        the registry so each model has exactly one tokenizer.
+        the registry so each model has exactly one tokenizer. For OpenAI models,
+        fall back to estimation when a vocabulary cannot load within the bounded
+        timeout; the cached fallback prevents subsequent requests from blocking.
         """
         if model not in self._token_counters:
             if _lookup_encoding_name(model, self._encodings) is None:
@@ -538,9 +558,19 @@ class OpenAIProvider(Provider):
 
                 self._token_counters[model] = cast(Any, get_tokenizer(model))
             else:
-                self._token_counters[model] = OpenAITokenCounter(
-                    model=model, custom_encodings=self._encodings
-                )
+                from ..tokenizers.tiktoken_counter import TiktokenLoadError
+
+                try:
+                    self._token_counters[model] = OpenAITokenCounter(
+                        model=model, custom_encodings=self._encodings
+                    )
+                except TiktokenLoadError as exc:
+                    logger.warning(
+                        "tiktoken unavailable for %s (%s); using estimation.", model, exc
+                    )
+                    from ..tokenizers.estimator import EstimatingTokenCounter
+
+                    self._token_counters[model] = EstimatingTokenCounter()
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
@@ -632,6 +662,8 @@ class OpenAIProvider(Provider):
         module.  Unknown compatible models fall back to LiteLLM when possible.
         ``input_tokens`` includes ``cached_tokens``.
         """
+        # A published manual or pattern rate outranks the LiteLLM lookup: the
+        # manual table carries the cached-input rates we have verified.
         has_manual_price = any(
             model == model_name or model.startswith(f"{model_name}-")
             for model_name in self._pricing
@@ -641,18 +673,16 @@ class OpenAIProvider(Provider):
                 input_tokens, output_tokens, model, cached_tokens
             )
 
-        litellm = _get_litellm_module()
-        if litellm is not None and cached_tokens <= 0:
-            try:
-                cost = litellm.completion_cost(
-                    model=model,
-                    prompt_tokens=input_tokens,
-                    completion_tokens=output_tokens,
-                )
-                if cost is not None and cost > 0:
-                    return float(cost)
-            except Exception:
-                pass
+        # LiteLLM fallback via estimate_cost_from_tokens, which applies each
+        # model's real cached-input rate rather than a flat estimate.
+        cost = estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        if cost is not None and cost > 0:
+            return float(cost)
 
         return self._estimate_cost_manual(
             input_tokens, output_tokens, model, cached_tokens

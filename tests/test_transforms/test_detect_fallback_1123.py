@@ -7,6 +7,7 @@ import asyncio
 
 import pytest
 
+import headroom._ort as ort_runtime
 from headroom.transforms import content_router as cr
 
 # Patch the native detector via its string target ("headroom._core.detect_content_type")
@@ -27,7 +28,11 @@ def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     correct in production and fatal here, because these tests need the native
     branch reachable to observe what it raises. Without the reset they pass
     alone and fail in-suite, which is how they were found.
+
+    Upstream additionally mocks ``rust_ort_runtime_compatible`` to keep the
+    native branch reachable regardless of the runtime probe result.
     """
+    monkeypatch.setattr(ort_runtime, "rust_ort_runtime_compatible", lambda: True)
     monkeypatch.setattr(cr, "_detect_native_unhealthy", False)
     monkeypatch.setattr(cr, "_detect_native_wedged", False)
     monkeypatch.setattr(cr, "_detect_backend_warned", False)

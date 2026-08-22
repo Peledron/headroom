@@ -134,14 +134,26 @@ def compute_window_tokens(start_ts: float, end_ts: float) -> WindowTokens:
     totals = WindowTokens()
     by_model: dict[str, WindowTokens] = {}
     unattributed = WindowTokens()
-    # Claude Code writes one assistant response across several transcript
-    # lines, one per content block, each carrying the same request-level
-    # message.usage. Summing per line multiplies a response by its block
-    # count and inflates the window by millions of phantom input tokens.
-    # Count each response once, keyed by the Anthropic message id.
+    # Claude Code can store one assistant response across multiple transcript
+    # lines (e.g. one entry per content block), each carrying the SAME
+    # request-level ``message.usage``. Summing per line therefore multiplies a
+    # single response's tokens by its block count (observed 19x for one 420K
+    # response, #2340). Count each response's usage once, keyed by the unique
+    # Anthropic ``message.id``. Entries without an id keep the per-line
+    # behavior, so this only ever removes true duplicates.
     seen_message_ids: set[str] = set()
 
     for path in find_transcript_files():
+        # Skip transcripts that cannot contain entries inside the window.
+        # Transcripts are append-only and chronological, so a file whose mtime is
+        # older than the window start has no entry within [start_ts, end_ts).
+        # Without this guard every poll json.loads()es every line of every
+        # transcript under ~/.claude/projects.
+        try:
+            if path.stat().st_mtime < start_ts:
+                continue
+        except OSError:
+            continue
         for line in _read_transcript_lines(path):
             try:
                 entry: dict[str, Any] = json.loads(line)
@@ -167,13 +179,11 @@ def compute_window_tokens(start_ts: float, end_ts: float) -> WindowTokens:
             if not usage:
                 continue
 
-            # Lines that carry a message id are deduped so each response is
-            # counted once. Lines without an id keep per-line behavior.
-            message_id = msg.get("id")
-            if message_id is not None:
-                if message_id in seen_message_ids:
+            msg_id = msg.get("id")
+            if isinstance(msg_id, str) and msg_id:
+                if msg_id in seen_message_ids:
                     continue
-                seen_message_ids.add(message_id)
+                seen_message_ids.add(msg_id)
 
             _add_usage_to_tokens(totals, usage)
 

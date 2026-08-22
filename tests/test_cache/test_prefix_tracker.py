@@ -790,12 +790,12 @@ class TestConversationLineageResolution:
         from headroom.cache.prefix_tracker import overlay_cached_prefix
 
         previous_original = [
-            {"role": "user", "content": [{"type": "text", "text": "A"}]},
-            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": [{"type": "text", "text": "A" * 64}]},
+            {"role": "assistant", "content": "old original text"},
         ]
         previous_forwarded = [
-            {"role": "user", "content": [{"type": "text", "text": "A_compressed"}]},
-            {"role": "assistant", "content": "old_compressed"},
+            {"role": "user", "content": [{"type": "text", "text": "Ac"}]},
+            {"role": "assistant", "content": "old_c"},
         ]
         current = [
             previous_original[0],
